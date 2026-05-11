@@ -64,18 +64,24 @@ async def auth_callback(request: Request):
     if not code:
         return HTMLResponse("<h2>Error: no code in callback</h2>", status_code=400)
 
-    # Exchange code for user access token
+    # Step 1 — get app_access_token
+    r0 = urllib.request.Request(
+        "https://open.larksuite.com/open-apis/auth/v3/app_access_token/internal",
+        data=json.dumps({"app_id": LARK_APP_ID, "app_secret": LARK_APP_SECRET}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    app_token = json.loads(urllib.request.urlopen(r0).read())["app_access_token"]
+
+    # Step 2 — exchange auth code for user access token
     req = urllib.request.Request(
-        "https://open.larksuite.com/open-apis/authen/v1/oidc/access_token",
+        "https://open.larksuite.com/open-apis/authen/v1/access_token",
         data=json.dumps({"grant_type": "authorization_code", "code": code}).encode(),
-        headers={
-            "Content-Type":  "application/json",
-            "Authorization": f"Basic {_b64(LARK_APP_ID + ':' + LARK_APP_SECRET)}",
-        },
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {app_token}"},
         method="POST",
     )
     token_resp = json.loads(urllib.request.urlopen(req).read())
-    user_token = token_resp.get("data", {}).get("access_token") or token_resp.get("access_token")
+    user_token = token_resp.get("data", {}).get("access_token")
     if not user_token:
         return HTMLResponse(f"<h2>Token exchange failed</h2><pre>{json.dumps(token_resp, indent=2)}</pre>", status_code=400)
 
