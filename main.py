@@ -285,6 +285,28 @@ async def recv_lark(request: Request, bg: BackgroundTasks):
     return {"ok": True}
 
 
+@app.post("/webhook/lark-auto")
+async def recv_lark_auto(request: Request, bg: BackgroundTasks):
+    """Receives webhooks from Lark Base Automation (no bot file-access needed).
+    Body: {"action": "record_added|record_edited|record_deleted", "record_id": "...", "table_id": "..."}
+    """
+    body = await request.json()
+    _raw_payloads.appendleft({"source": "lark-auto", "body": body})
+    logging.getLogger(__name__).info(f"Lark-auto webhook: {body}")
+
+    if not _sync_enabled:
+        return {"ok": True, "note": "sync disabled"}
+
+    action = {
+        "action":    body.get("action", "record_edited"),
+        "record_id": body.get("record_id", ""),
+    }
+    table_id = body.get("table_id", get_cfg().get("LARK_TABLE_ID", ""))
+    cfg = get_cfg()
+    bg.add_task(lark_handler.process, action, table_id, cfg)
+    return {"ok": True}
+
+
 @app.post("/webhook/jira")
 async def recv_jira(request: Request, bg: BackgroundTasks):
     body = await request.json()
