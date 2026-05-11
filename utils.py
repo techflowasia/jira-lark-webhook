@@ -1,6 +1,10 @@
 """Field parse helpers — copied from jira-lark-sync/sync_engine.py."""
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+# Lark stores date-field timestamps as midnight in Bangkok time (UTC+7).
+# All date conversions must use this offset to get the correct calendar date.
+_BKK = timezone(timedelta(hours=7))
 
 
 def _norm(text: str) -> str:
@@ -61,6 +65,6 @@ def _lark_ts_to_jira_date(ts_ms) -> "str | None":
     if not ts_ms:
         return None
     try:
-        return datetime.utcfromtimestamp(int(ts_ms) / 1000).strftime("%Y-%m-%d")
+        return datetime.fromtimestamp(int(ts_ms) / 1000, tz=_BKK).strftime("%Y-%m-%d")
     except Exception:
         return None
