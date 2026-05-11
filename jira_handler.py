@@ -1,6 +1,6 @@
 """Jira webhook events → Lark actions."""
 import logging
-import lark_api, index, dedup
+import lark_api, index, dedup, history
 from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END, F_PARENT,
                     JIRA_TO_LARK_ASSIGNEE)
@@ -17,6 +17,7 @@ RELEVANT_CHANGELOG_FIELDS = {
 
 def process(event: str, issue: dict, changelog: dict, cfg: dict) -> None:
     key = issue.get("key", "")
+    log.info(f"jira_handler: event={event} key={key}")
     try:
         if event == "jira:issue_created":
             _handle_create(issue, cfg)
@@ -25,7 +26,9 @@ def process(event: str, issue: dict, changelog: dict, cfg: dict) -> None:
         elif event == "jira:issue_deleted":
             _handle_delete(key, cfg)
     except Exception as e:
-        log.error(f"jira_handler.{event} key={key}: {e}")
+        log.error(f"jira_handler.{event} key={key}: {e}", exc_info=True)
+        history.record(direction="jira→lark", event=event, jira_key=key,
+                       description=str(e), status="error", error=str(e))
 
 
 def _handle_create(issue: dict, cfg: dict) -> None:
@@ -67,7 +70,9 @@ def _handle_create(issue: dict, cfg: dict) -> None:
     rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], fields)
     dedup.mark(f"lark:{rid}")
     index.add(key, rid)
-    log.info(f"Created Lark {rid} from Jira {key}")
+    log.info(f"jira_handler: created Lark {rid} from Jira {key}")
+    history.record(direction="jira→lark", event="created", jira_key=key, lark_id=rid,
+                   description=f"Created {itype}: \"{jf.get('summary', '')}\"" )
 
 
 def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
@@ -127,7 +132,12 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"],
                            record_id, updates)
-    log.info(f"Updated Lark {record_id} from Jira {key}")
+    changed_fields = [item.get("field") for item in items if item.get("field") in RELEVANT_CHANGELOG_FIELDS]
+    desc = ", ".join(f"{f}: {item.get('toString','')}" for item in items
+                     if item.get("field") in RELEVANT_CHANGELOG_FIELDS)
+    log.info(f"jira_handler: updated Lark {record_id} from Jira {key} — {desc}")
+    history.record(direction="jira→lark", event="updated", jira_key=key, lark_id=record_id,
+                   description=desc or "updated")
 
 
 def _handle_delete(key: str, cfg: dict) -> None:
@@ -141,7 +151,9 @@ def _handle_delete(key: str, cfg: dict) -> None:
     except Exception as e:
         log.error(f"Delete Lark {record_id}: {e}")
     index.remove_by_jira(key)
-    log.info(f"Deleted Lark {record_id} (Jira {key} deleted)")
+    log.info(f"jira_handler: deleted Lark {record_id} (Jira {key} deleted)")
+    history.record(direction="jira→lark", event="deleted", jira_key=key, lark_id=record_id,
+                   description=f"Deleted Lark record for {key}")
 
 
 def _sp_to_str(val) -> "str | None":

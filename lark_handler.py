@@ -1,7 +1,7 @@
 """Lark Base events → Jira actions."""
 import time
 import logging
-import lark_api, jira_api, index, dedup
+import lark_api, jira_api, index, dedup, history
 from config import (F_TITLE, F_START, F_END, F_ASSIGNEE, F_JIRA_KEY, F_JIRA_URL,
                     F_TYPE, F_PARENT, F_RELEASE, LARK_TO_JIRA_ASSIGNEE)
 from utils import _lark_text, _lark_select, _lark_ts_to_jira_date, _norm
@@ -51,7 +51,6 @@ def _get_sprint_map(cfg: dict) -> dict:
 
 
 def _resolve_parent(rec: dict) -> "str | None":
-    """Resolve Lark Parent items field → Jira key of the parent issue."""
     parent_data = rec["fields"].get(F_PARENT) or []
     for item in parent_data:
         if isinstance(item, dict):
@@ -66,6 +65,7 @@ def _resolve_parent(rec: dict) -> "str | None":
 def process(action: dict, table_id: str, cfg: dict) -> None:
     act = action.get("action")
     rid = action.get("record_id", "")
+    log.info(f"lark_handler: action={act} record_id={rid} table_id={table_id} raw={action}")
     try:
         if act == "record_added":
             _handle_create(rid, table_id, cfg)
@@ -73,22 +73,34 @@ def process(action: dict, table_id: str, cfg: dict) -> None:
             _handle_update(rid, table_id, cfg)
         elif act == "record_deleted":
             _handle_delete(rid, cfg)
+        else:
+            log.warning(f"lark_handler: unknown action '{act}' — full payload: {action}")
     except Exception as e:
-        log.error(f"lark_handler.{act} rid={rid}: {e}")
+        log.error(f"lark_handler.{act} rid={rid}: {e}", exc_info=True)
+        history.record(direction="lark→jira", event=act or "unknown",
+                       lark_id=rid, description=str(action),
+                       status="error", error=str(e))
 
 
 def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
     if dedup.is_ours(f"lark:{rid}"):
+        log.info(f"lark_handler: skipping create {rid} — dedup")
         return
 
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
+    log.info(f"lark_handler: record fields keys={list(rec['fields'].keys())}")
 
     if _lark_text(rec["fields"].get(F_JIRA_KEY)):
-        return  # already linked — our write-back triggered this
+        log.info(f"lark_handler: skipping create {rid} — Jira Key already set")
+        return
 
     itype = _lark_select(rec["fields"].get(F_TYPE))
     if itype not in ALLOWED_TYPES:
+        log.info(f"lark_handler: skipping create {rid} — type '{itype}' not in {ALLOWED_TYPES}")
+        history.record(direction="lark→jira", event="created", lark_id=rid,
+                       description=f"Skipped: type '{itype}' not Epic/Story/Task",
+                       status="skipped")
         return
 
     title = _lark_text(rec["fields"].get(F_TITLE)) or f"[Lark] {rid}"
@@ -112,33 +124,41 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
         F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{new_key}",
     })
     index.add(new_key, rid)
-    log.info(f"Created Jira {new_key} from Lark {rid}")
+    log.info(f"lark_handler: created Jira {new_key} from Lark {rid}")
+    history.record(direction="lark→jira", event="created", lark_id=rid,
+                   jira_key=new_key, description=f"Created {itype}: \"{title}\"")
 
 
 def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
     if dedup.is_ours(f"lark:{rid}"):
+        log.info(f"lark_handler: skipping update {rid} — dedup")
         return
 
     jira_key = index._lark_to_jira.get(rid)
     if not jira_key:
-        return  # not linked yet
+        log.info(f"lark_handler: skipping update {rid} — not in index")
+        return
 
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
 
     updates: dict = {}
+    changed: list = []
 
     title = _lark_text(rec["fields"].get(F_TITLE))
     if title:
         updates["summary"] = title
+        changed.append(f"Title: \"{title}\"")
 
     start = _lark_ts_to_jira_date(rec["fields"].get(F_START))
     if start:
         updates["customfield_10015"] = start
+        changed.append(f"Start: {start}")
 
     end = _lark_ts_to_jira_date(rec["fields"].get(F_END))
     if end:
         updates["duedate"] = end
+        changed.append(f"Due: {end}")
 
     assignee_lark = _lark_select(rec["fields"].get(F_ASSIGNEE))
     if assignee_lark:
@@ -146,6 +166,7 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
         account_id = _get_account_ids(cfg).get(jira_name)
         if account_id:
             updates["assignee"] = {"id": account_id}
+            changed.append(f"Assignee: {assignee_lark}")
 
     release_raw = (_lark_text(rec["fields"].get(F_RELEASE))
                    or _lark_select(rec["fields"].get(F_RELEASE)))
@@ -153,12 +174,15 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
         vid = _get_version_map(cfg).get(_norm(release_raw))
         if vid:
             updates["fixVersions"] = [{"id": vid}]
+            changed.append(f"Release: {release_raw}")
 
     parent_jira_key = _resolve_parent(rec)
     if parent_jira_key:
         updates["parent"] = {"key": parent_jira_key}
+        changed.append(f"Parent: {parent_jira_key}")
 
     if not updates:
+        log.info(f"lark_handler: no relevant updates for {jira_key}")
         return
 
     dedup.mark(f"jira:{jira_key}")
@@ -172,7 +196,10 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
             except Exception as e:
                 log.warning(f"Sprint move {jira_key}: {e}")
 
-    log.info(f"Updated Jira {jira_key} from Lark {rid}")
+    desc = ", ".join(changed)
+    log.info(f"lark_handler: updated Jira {jira_key} — {desc}")
+    history.record(direction="lark→jira", event="updated", lark_id=rid,
+                   jira_key=jira_key, description=desc)
 
 
 def _handle_delete(rid: str, cfg: dict) -> None:
@@ -182,7 +209,12 @@ def _handle_delete(rid: str, cfg: dict) -> None:
     dedup.mark(f"jira:{jira_key}")
     try:
         jira_api.delete_issue(cfg, jira_key)
+        log.info(f"lark_handler: deleted Jira {jira_key} (Lark {rid} deleted)")
+        history.record(direction="lark→jira", event="deleted", lark_id=rid,
+                       jira_key=jira_key, description=f"Deleted {jira_key}")
     except Exception as e:
         log.error(f"Delete Jira {jira_key}: {e}")
+        history.record(direction="lark→jira", event="deleted", lark_id=rid,
+                       jira_key=jira_key, description=f"Delete {jira_key} failed",
+                       status="error", error=str(e))
     index.remove_by_jira(jira_key)
-    log.info(f"Deleted Jira {jira_key} (Lark {rid} deleted)")

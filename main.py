@@ -1,8 +1,11 @@
-"""FastAPI entry point: /health + /webhook/lark + /webhook/jira + reconcile loop."""
+"""FastAPI entry point: / dashboard + /health + /webhook/lark + /webhook/jira + reconcile loop."""
 import asyncio
+import json
 import logging
+from collections import deque
 from fastapi import FastAPI, Request, BackgroundTasks
-import lark_api, index, reconcile
+from fastapi.responses import HTMLResponse
+import lark_api, index, reconcile, history
 import lark_handler, jira_handler
 from config import get_cfg
 
@@ -10,6 +13,9 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 app = FastAPI()
+
+# Store last 20 raw payloads for debugging
+_raw_payloads: deque = deque(maxlen=20)
 
 
 @app.on_event("startup")
@@ -24,24 +30,191 @@ async def startup() -> None:
 
 async def _reconcile_loop() -> None:
     while True:
-        await asyncio.sleep(1800)  # 30 min
+        await asyncio.sleep(1800)
         await asyncio.to_thread(reconcile.run, get_cfg())
 
 
 @app.get("/health")
 async def health():
-    """Pinged by cron-job.org every 10 min to prevent Render free-tier sleep."""
     return {"ok": True}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    cfg = get_cfg()
+    linked = len(index._jira_to_lark)
+    logs = history.recent(200)
+
+    def row_class(status):
+        if status == "error":   return "error"
+        if status == "skipped": return "skip"
+        return ""
+
+    def direction_badge(d):
+        if "lark" in d.split("→")[0]:
+            return f'<span class="badge lark">Lark → Jira</span>'
+        return f'<span class="badge jira">Jira → Lark</span>'
+
+    def event_badge(e):
+        colors = {"created": "#22c55e", "updated": "#3b82f6", "deleted": "#ef4444"}
+        c = colors.get(e, "#888")
+        return f'<span class="evbadge" style="background:{c}">{e}</span>'
+
+    rows = ""
+    for entry in logs:
+        rc = row_class(entry["status"])
+        err = f'<div class="errmsg">{entry["error"]}</div>' if entry["error"] else ""
+        rows += f"""
+        <tr class="{rc}">
+          <td class="ts">{entry["ts"]}</td>
+          <td>{direction_badge(entry["direction"])}</td>
+          <td>{event_badge(entry["event"])}</td>
+          <td><code>{entry["jira_key"] or "—"}</code></td>
+          <td><code class="small">{entry["lark_id"] or "—"}</code></td>
+          <td>{entry["description"]}{err}</td>
+        </tr>"""
+
+    if not rows:
+        rows = '<tr><td colspan="6" class="empty">No events recorded yet.</td></tr>'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jira ↔ Lark Webhook</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #f1f5f9; color: #1e293b; }}
+  .header {{ background: #0f172a; color: #f8fafc; padding: 20px 32px;
+             display: flex; align-items: center; gap: 12px; }}
+  .header h1 {{ font-size: 20px; font-weight: 600; }}
+  .dot {{ width: 10px; height: 10px; border-radius: 50%; background: #22c55e;
+          box-shadow: 0 0 0 3px rgba(34,197,94,.3); }}
+  .main {{ padding: 24px 32px; }}
+  .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr));
+            gap: 16px; margin-bottom: 24px; }}
+  .card {{ background: #fff; border-radius: 10px; padding: 18px 20px;
+           box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
+  .card .label {{ font-size: 11px; font-weight: 600; text-transform: uppercase;
+                  letter-spacing: .05em; color: #64748b; margin-bottom: 4px; }}
+  .card .value {{ font-size: 22px; font-weight: 700; color: #0f172a; }}
+  .card .sub {{ font-size: 12px; color: #64748b; margin-top: 2px;
+                word-break: break-all; }}
+  .section {{ background: #fff; border-radius: 10px;
+              box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow: hidden;
+              margin-bottom: 24px; }}
+  .section-header {{ padding: 14px 20px; border-bottom: 1px solid #e2e8f0;
+                     font-weight: 600; font-size: 14px; background: #f8fafc; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+  th {{ padding: 10px 14px; text-align: left; font-size: 11px; font-weight: 600;
+        text-transform: uppercase; letter-spacing: .04em; color: #64748b;
+        border-bottom: 1px solid #e2e8f0; background: #f8fafc; }}
+  td {{ padding: 10px 14px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }}
+  tr:last-child td {{ border-bottom: none; }}
+  tr.error td {{ background: #fff5f5; }}
+  tr.skip td {{ background: #fafaf0; color: #888; }}
+  .ts {{ color: #64748b; font-size: 11px; white-space: nowrap; }}
+  .badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px;
+            font-size: 11px; font-weight: 600; white-space: nowrap; }}
+  .badge.lark {{ background: #eff6ff; color: #1d4ed8; }}
+  .badge.jira {{ background: #f0fdf4; color: #15803d; }}
+  .evbadge {{ display: inline-block; padding: 2px 8px; border-radius: 4px;
+              font-size: 11px; font-weight: 600; color: #fff; }}
+  code {{ background: #f1f5f9; padding: 1px 5px; border-radius: 3px;
+          font-size: 12px; font-family: monospace; }}
+  code.small {{ font-size: 10px; }}
+  .errmsg {{ color: #dc2626; font-size: 11px; margin-top: 3px; font-family: monospace; }}
+  .empty {{ text-align: center; color: #94a3b8; padding: 40px !important; }}
+  .cfg-key {{ color: #64748b; font-size: 12px; }}
+  .cfg-val {{ font-family: monospace; font-size: 12px; }}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="dot"></div>
+  <h1>Jira ↔ Lark Webhook Sync</h1>
+</div>
+<div class="main">
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">Status</div>
+      <div class="value" style="color:#22c55e">Live</div>
+      <div class="sub">Service running</div>
+    </div>
+    <div class="card">
+      <div class="label">Linked Records</div>
+      <div class="value">{linked}</div>
+      <div class="sub">Jira ↔ Lark pairs in index</div>
+    </div>
+    <div class="card">
+      <div class="label">Events Logged</div>
+      <div class="value">{len(logs)}</div>
+      <div class="sub">Since last restart</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">Configuration</div>
+    <table>
+      <tr><td class="cfg-key">Jira Domain</td><td class="cfg-val">{cfg["JIRA_DOMAIN"]}</td></tr>
+      <tr><td class="cfg-key">Jira Project</td><td class="cfg-val">{cfg["JIRA_PROJECT"]}</td></tr>
+      <tr><td class="cfg-key">Lark Base Token</td><td class="cfg-val">{cfg["LARK_BASE_TOKEN"]}</td></tr>
+      <tr><td class="cfg-key">Lark Table ID</td><td class="cfg-val">{cfg["LARK_TABLE_ID"]}</td></tr>
+      <tr><td class="cfg-key">Jira Webhook URL</td>
+          <td class="cfg-val">https://jira-lark-webhook.onrender.com/webhook/jira</td></tr>
+      <tr><td class="cfg-key">Lark Webhook URL</td>
+          <td class="cfg-val">https://jira-lark-webhook.onrender.com/webhook/lark</td></tr>
+    </table>
+  </div>
+
+  <div class="section">
+    <div class="section-header">Sync History (last {len(logs)} events)</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Direction</th>
+          <th>Event</th>
+          <th>Jira Key</th>
+          <th>Lark Record</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>{rows}</tbody>
+    </table>
+  </div>
+
+</div>
+</body>
+</html>"""
+    return html
+
+
+@app.get("/debug/payloads")
+async def debug_payloads():
+    """Last raw webhook payloads received — use this to diagnose field name issues."""
+    return list(_raw_payloads)
 
 
 @app.post("/webhook/lark")
 async def recv_lark(request: Request, bg: BackgroundTasks):
     body = await request.json()
+    _raw_payloads.appendleft({"source": "lark", "body": body})
+    logging.getLogger(__name__).info(f"Lark webhook received: {json.dumps(body)[:500]}")
+
     if body.get("type") == "url_verification":
         return {"challenge": body["challenge"]}
+
     event = body.get("event", {})
     cfg = get_cfg()
-    for action in event.get("action_list", []):
+    action_list = event.get("action_list", [])
+    logging.getLogger(__name__).info(
+        f"Lark event: table_id={event.get('table_id')} actions={len(action_list)}"
+    )
+    for action in action_list:
         bg.add_task(lark_handler.process, action, event.get("table_id"), cfg)
     return {"ok": True}
 
@@ -49,6 +222,10 @@ async def recv_lark(request: Request, bg: BackgroundTasks):
 @app.post("/webhook/jira")
 async def recv_jira(request: Request, bg: BackgroundTasks):
     body = await request.json()
+    _raw_payloads.appendleft({"source": "jira", "body": body})
+    logging.getLogger(__name__).info(
+        f"Jira webhook received: event={body.get('webhookEvent')} key={body.get('issue',{}).get('key')}"
+    )
     cfg = get_cfg()
     bg.add_task(jira_handler.process,
                 body.get("webhookEvent"),
