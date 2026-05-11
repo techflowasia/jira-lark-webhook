@@ -86,3 +86,16 @@ def delete_record(token: str, base_token: str, table_id: str, record_id: str) ->
     data = resp.json()
     if data.get("code") != 0:
         raise RuntimeError(f"Lark delete error: {data.get('msg')}")
+
+
+def list_tables(token: str, base_token: str) -> list:
+    """Return [{table_id, name}, ...] for all tables in the Base."""
+    resp = requests.get(
+        f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables",
+        headers=_headers(token), params={"page_size": 100})
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"Lark list_tables error: {data.get('msg')}")
+    return [{"table_id": t["table_id"], "name": t["name"]}
+            for t in data.get("data", {}).get("items", [])]

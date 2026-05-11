@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
 import lark_api, index, reconcile, history
 import lark_handler, jira_handler
-from config import get_cfg
+from config import get_cfg, set_active_table
 
 LARK_APP_ID     = "cli_a9772fc461e1de15"
 LARK_APP_SECRET = "c8umFVp63U25n9USaljMjeKOOAp0uenw"
@@ -32,6 +32,9 @@ _raw_payloads: deque = deque(maxlen=20)
 
 @app.on_event("startup")
 async def startup() -> None:
+    # Load active table from Supabase settings (fallback to env var)
+    _load_active_table_from_db()
+
     cfg = get_cfg()
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     records = lark_api.fetch_all_records(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
@@ -39,6 +42,24 @@ async def startup() -> None:
     logging.getLogger(__name__).info(f"Index built: {len(index._jira_to_lark)} linked records")
     asyncio.create_task(_reconcile_loop())
     asyncio.create_task(_keepalive_loop())
+
+
+def _load_active_table_from_db() -> None:
+    """Seed the active table from Supabase settings, falling back to env var."""
+    import os as _os
+    client = history._get_client()
+    if client:
+        try:
+            rows = client.table("settings").select("key,value").in_("key", ["active_table_id", "active_table_name"]).execute()
+            kv = {r["key"]: r["value"] for r in (rows.data or [])}
+            tid  = kv.get("active_table_id")  or _os.environ.get("LARK_TABLE_ID", "")
+            name = kv.get("active_table_name") or ""
+            set_active_table(tid, name)
+            return
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not load active table from DB: {e}")
+    import os as _os
+    set_active_table(_os.environ.get("LARK_TABLE_ID", ""))
 
 
 async def _keepalive_loop() -> None:
@@ -158,6 +179,49 @@ def _b64(s: str) -> str:
 @app.get("/health")
 async def health():
     return {"ok": True, "sync_enabled": _sync_enabled}
+
+
+@app.get("/api/tables")
+async def api_tables():
+    """List all tables in the Lark Base."""
+    try:
+        cfg = get_cfg()
+        token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+        tables = lark_api.list_tables(token, cfg["LARK_BASE_TOKEN"])
+        return {"tables": tables, "active_table_id": cfg["LARK_TABLE_ID"]}
+    except Exception as e:
+        return {"error": str(e), "tables": []}
+
+
+@app.post("/settings/table")
+async def set_table(request: Request):
+    """Switch the active Lark table and rebuild the index."""
+    body = await request.json()
+    table_id   = body.get("table_id", "").strip()
+    table_name = body.get("name", "").strip()
+    if not table_id:
+        return {"ok": False, "error": "table_id required"}
+
+    set_active_table(table_id, table_name)
+
+    # Persist to Supabase settings
+    client = history._get_client()
+    if client:
+        try:
+            client.table("settings").upsert({"key": "active_table_id",   "value": table_id}).execute()
+            client.table("settings").upsert({"key": "active_table_name", "value": table_name}).execute()
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not persist table setting: {e}")
+
+    # Rebuild index for the new table
+    cfg = get_cfg()
+    token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+    records = lark_api.fetch_all_records(token, cfg["LARK_BASE_TOKEN"], table_id)
+    index.rebuild(records)
+    logging.getLogger(__name__).info(f"Switched to table '{table_name}' ({table_id}), index rebuilt: {len(index._jira_to_lark)} records")
+    history.record(direction="system", event="config",
+                   description=f"Switched Lark table to '{table_name}' ({table_id})")
+    return {"ok": True, "table_id": table_id, "name": table_name, "linked": len(index._jira_to_lark)}
 
 
 @app.post("/toggle")
@@ -367,6 +431,19 @@ async def dashboard(request: Request):
              text-decoration: none; background: #0f172a; color: #fff; }}
   .pg-btn.disabled {{ background: #e2e8f0; color: #94a3b8; cursor: not-allowed; pointer-events: none; }}
   .pg-info {{ font-size: 13px; color: #64748b; }}
+  /* Table picker */
+  .change-btn {{ margin-left: 10px; padding: 3px 10px; font-size: 11px; font-weight: 600;
+                 background: #e2e8f0; border: none; border-radius: 4px; cursor: pointer; color: #1e293b; }}
+  .change-btn:hover {{ background: #cbd5e1; }}
+  .table-list {{ display: flex; flex-direction: column; gap: 6px; max-width: 420px; }}
+  .table-item {{ display: flex; align-items: center; justify-content: space-between;
+                 padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px;
+                 background: #f8fafc; font-size: 13px; }}
+  .table-item.active-tbl {{ border-color: #0f172a; background: #f0f9ff; font-weight: 600; }}
+  .table-item button {{ padding: 3px 10px; font-size: 11px; font-weight: 600; border: none;
+                        border-radius: 4px; cursor: pointer; background: #0f172a; color: #fff; }}
+  .table-item button:disabled {{ background: #94a3b8; cursor: not-allowed; }}
+  .tbl-id {{ font-size: 10px; color: #94a3b8; font-family: monospace; }}
 </style>
 </head>
 <body>
@@ -410,8 +487,12 @@ async def dashboard(request: Request):
           <td class="cfg-val">{cfg["JIRA_PROJECT"]}</td></tr>
       <tr><td class="cfg-key">Lark Base Token</td>
           <td class="cfg-val">{cfg["LARK_BASE_TOKEN"]}</td></tr>
-      <tr><td class="cfg-key">Lark Table ID</td>
-          <td class="cfg-val">{cfg["LARK_TABLE_ID"]}</td></tr>
+      <tr><td class="cfg-key">Lark Table</td>
+          <td class="cfg-val">
+            <span id="active-table-label">{cfg["LARK_TABLE_ID"]}</span>
+            <button class="change-btn" onclick="loadTables()">Change Table</button>
+            <div id="table-picker" style="display:none;margin-top:8px"></div>
+          </td></tr>
       <tr><td class="cfg-key">Jira Webhook URL</td>
           <td class="cfg-val">https://jira-lark-webhook.onrender.com/webhook/jira</td></tr>
       <tr><td class="cfg-key">Lark Webhook URL</td>
@@ -474,6 +555,45 @@ function toggleCustom(e) {{
   e.preventDefault();
   var f = document.getElementById('custom-form');
   f.style.display = f.style.display === 'none' ? 'flex' : 'none';
+}}
+
+async function loadTables() {{
+  var picker = document.getElementById('table-picker');
+  picker.style.display = 'block';
+  picker.innerHTML = '<span style="color:#64748b;font-size:12px">Loading tables…</span>';
+  try {{
+    var res = await fetch('/api/tables');
+    var data = await res.json();
+    if (data.error) {{ picker.innerHTML = '<span style="color:#ef4444">Error: ' + data.error + '</span>'; return; }}
+    var html = '<div class="table-list">';
+    data.tables.forEach(function(t) {{
+      var active = t.table_id === data.active_table_id;
+      html += '<div class="table-item' + (active ? ' active-tbl' : '') + '">';
+      html += '<div><div>' + t.name + (active ? ' ✓' : '') + '</div>';
+      html += '<div class="tbl-id">' + t.table_id + '</div></div>';
+      html += '<button ' + (active ? 'disabled' : '') + ' onclick="switchTable(\'' + t.table_id + '\',\'' + t.name.replace(/'/g,"\\'") + '\')">Select</button>';
+      html += '</div>';
+    }});
+    html += '</div>';
+    picker.innerHTML = html;
+  }} catch(e) {{ picker.innerHTML = '<span style="color:#ef4444">Failed to load tables.</span>'; }}
+}}
+
+async function switchTable(id, name) {{
+  if (!confirm('Switch sync to table "' + name + '"?\\nThis will rebuild the index.')) return;
+  var res = await fetch('/settings/table', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{table_id: id, name: name}})
+  }});
+  var data = await res.json();
+  if (data.ok) {{
+    document.getElementById('active-table-label').textContent = name + ' (' + id + ')';
+    document.getElementById('table-picker').style.display = 'none';
+    alert('Switched to "' + name + '". ' + data.linked + ' records indexed.');
+  }} else {{
+    alert('Error: ' + (data.error || 'unknown'));
+  }}
 }}
 </script>
 </body>

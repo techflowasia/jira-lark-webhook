@@ -29,6 +29,16 @@ JIRA_TO_LARK_ASSIGNEE = {
 LARK_TO_JIRA_ASSIGNEE = {v: k for k, v in JIRA_TO_LARK_ASSIGNEE.items()}
 
 
+_active_table_id:   str = ""
+_active_table_name: str = ""
+
+
+def set_active_table(table_id: str, table_name: str = "") -> None:
+    global _active_table_id, _active_table_name
+    _active_table_id   = table_id
+    _active_table_name = table_name
+
+
 def get_cfg() -> dict:
     return {
         "JIRA_EMAIL":      os.environ["JIRA_EMAIL"],
@@ -38,5 +48,5 @@ def get_cfg() -> dict:
         "LARK_APP_ID":     os.environ["LARK_APP_ID"],
         "LARK_APP_SECRET": os.environ["LARK_APP_SECRET"],
         "LARK_BASE_TOKEN": os.environ["LARK_BASE_TOKEN"],
-        "LARK_TABLE_ID":   os.environ["LARK_TABLE_ID"],
+        "LARK_TABLE_ID":   _active_table_id or os.environ["LARK_TABLE_ID"],
     }
