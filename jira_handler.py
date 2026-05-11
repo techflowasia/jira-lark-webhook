@@ -1,6 +1,6 @@
 """Jira webhook events → Lark actions."""
 import logging
-import lark_api, index, dedup, history
+import lark_api, index, dedup, history, field_mappings
 from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END, F_PARENT,
                     JIRA_TO_LARK_ASSIGNEE)
@@ -124,6 +124,16 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
             parent_record_id = index._jira_to_lark.get(to_str) if to_str else None
             if parent_record_id:
                 updates[F_PARENT] = [parent_record_id]
+
+    # Apply custom (non-system) Jira → Lark mappings from changelog
+    custom_j2l = {m["jira_field"]: m for m in field_mappings.get_custom_jira_to_lark()}
+    for item in items:
+        jf = item.get("field")
+        if jf in custom_j2l and jf not in RELEVANT_CHANGELOG_FIELDS:
+            m = custom_j2l[jf]
+            to_str = item.get("toString")
+            if to_str is not None:
+                updates[m["lark_field"]] = to_str
 
     if not updates:
         return

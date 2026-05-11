@@ -1,7 +1,7 @@
 """Lark Base events → Jira actions."""
 import time
 import logging
-import lark_api, jira_api, index, dedup, history
+import lark_api, jira_api, index, dedup, history, field_mappings
 from config import (F_TITLE, F_START, F_END, F_ASSIGNEE, F_JIRA_KEY, F_JIRA_URL,
                     F_TYPE, F_PARENT, F_RELEASE, LARK_TO_JIRA_ASSIGNEE)
 from utils import _lark_text, _lark_select, _lark_ts_to_jira_date, _norm
@@ -186,6 +186,25 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
     if parent_jira_key:
         updates["parent"] = {"key": parent_jira_key}
         changed.append(f"Parent: {parent_jira_key}")
+
+    # Apply custom (non-system) Lark → Jira mappings
+    for m in field_mappings.get_custom_lark_to_jira():
+        raw = rec["fields"].get(m["lark_field"])
+        if raw is None:
+            continue
+        ft = m.get("field_type", "text")
+        if ft == "date":
+            val = _lark_ts_to_jira_date(raw)
+        elif ft == "number":
+            try:
+                val = float(raw) if raw else None
+            except (TypeError, ValueError):
+                val = None
+        else:
+            val = _lark_text(raw) or _lark_select(raw)
+        if val:
+            updates[m["jira_field"]] = val
+            changed.append(f"{m['jira_label'] or m['lark_field']}: {val}")
 
     if not updates:
         log.info(f"lark_handler: no relevant updates for {jira_key}")

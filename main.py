@@ -8,7 +8,7 @@ from collections import deque
 from datetime import datetime
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
-import lark_api, index, reconcile, history
+import lark_api, index, reconcile, history, field_mappings
 import lark_handler, jira_handler
 from config import get_cfg, set_active_table
 
@@ -39,8 +39,8 @@ async def startup() -> None:
     logging.getLogger(__name__).info(f"Index built: {len(index._jira_to_lark)} linked records")
     asyncio.create_task(_reconcile_loop())
     asyncio.create_task(_keepalive_loop())
-    # Load active table from Supabase in background (non-blocking)
     asyncio.create_task(_load_active_table_async())
+    asyncio.create_task(asyncio.to_thread(field_mappings.load))
 
 
 async def _load_active_table_async() -> None:
@@ -207,7 +207,7 @@ async def api_tables():
 
 @app.post("/settings/table")
 async def set_table(request: Request):
-    """Switch the active Lark table and rebuild the index."""
+    """Switch the active Lark table; index rebuild runs in background."""
     body = await request.json()
     table_id   = body.get("table_id", "").strip()
     table_name = body.get("name", "").strip()
@@ -216,7 +216,7 @@ async def set_table(request: Request):
 
     set_active_table(table_id, table_name)
 
-    # Persist to Supabase settings
+    # Persist to Supabase
     client = history._get_client()
     if client:
         try:
@@ -225,15 +225,44 @@ async def set_table(request: Request):
         except Exception as e:
             logging.getLogger(__name__).warning(f"Could not persist table setting: {e}")
 
-    # Rebuild index for the new table
-    cfg = get_cfg()
-    token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
-    records = lark_api.fetch_all_records(token, cfg["LARK_BASE_TOKEN"], table_id)
-    index.rebuild(records)
-    logging.getLogger(__name__).info(f"Switched to table '{table_name}' ({table_id}), index rebuilt: {len(index._jira_to_lark)} records")
-    history.record(direction="system", event="config",
-                   description=f"Switched Lark table to '{table_name}' ({table_id})")
-    return {"ok": True, "table_id": table_id, "name": table_name, "linked": len(index._jira_to_lark)}
+    # Rebuild index in background so the response returns immediately
+    async def _rebuild():
+        cfg = get_cfg()
+        token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+        records = await asyncio.to_thread(
+            lark_api.fetch_all_records, token, cfg["LARK_BASE_TOKEN"], table_id)
+        index.rebuild(records)
+        logging.getLogger(__name__).info(
+            f"Switched to table '{table_name}' ({table_id}), {len(index._jira_to_lark)} records indexed")
+        history.record(direction="system", event="config",
+                       description=f"Switched Lark table to '{table_name}' ({table_id})")
+
+    asyncio.create_task(_rebuild())
+    return {"ok": True, "table_id": table_id, "name": table_name, "rebuilding": True}
+
+
+@app.get("/api/fields")
+async def api_fields():
+    return {"mappings": field_mappings.get_all()}
+
+
+@app.post("/settings/fields")
+async def save_field(request: Request):
+    body = await request.json()
+    try:
+        saved = await asyncio.to_thread(field_mappings.upsert, body)
+        return {"ok": True, "mapping": saved}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.delete("/settings/fields/{mapping_id}")
+async def delete_field(mapping_id: int):
+    try:
+        await asyncio.to_thread(field_mappings.delete, mapping_id)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.post("/toggle")
@@ -443,10 +472,20 @@ async def dashboard(request: Request):
              text-decoration: none; background: #0f172a; color: #fff; }}
   .pg-btn.disabled {{ background: #e2e8f0; color: #94a3b8; cursor: not-allowed; pointer-events: none; }}
   .pg-info {{ font-size: 13px; color: #64748b; }}
-  /* Table picker */
+  /* Table picker + field table */
   .change-btn {{ margin-left: 10px; padding: 3px 10px; font-size: 11px; font-weight: 600;
                  background: #e2e8f0; border: none; border-radius: 4px; cursor: pointer; color: #1e293b; }}
   .change-btn:hover {{ background: #cbd5e1; }}
+  #field-table input, #field-table select {{ padding: 3px 6px; border: 1px solid #cbd5e1;
+    border-radius: 4px; font-size: 12px; width: 100%; box-sizing: border-box; }}
+  .fm-edit-btn {{ padding: 3px 8px; font-size: 11px; border: none; border-radius: 4px;
+    cursor: pointer; margin-right: 3px; }}
+  .fm-save {{ background: #22c55e; color: #fff; }}
+  .fm-cancel {{ background: #e2e8f0; color: #1e293b; }}
+  .fm-delete {{ background: #ef4444; color: #fff; }}
+  .fm-edit {{ background: #3b82f6; color: #fff; }}
+  tr.sys-row td {{ background: #f8fafc; }}
+  tr.new-row td {{ background: #f0fdf4; }}
   .table-list {{ display: flex; flex-direction: column; gap: 6px; max-width: 420px; }}
   .table-item {{ display: flex; align-items: center; justify-content: space-between;
                  padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 6px;
@@ -509,6 +548,29 @@ async def dashboard(request: Request):
           <td class="cfg-val">https://jira-lark-webhook.onrender.com/webhook/jira</td></tr>
       <tr><td class="cfg-key">Lark Webhook URL</td>
           <td class="cfg-val">https://jira-lark-webhook.onrender.com/webhook/lark</td></tr>
+    </table>
+  </div>
+
+  <div class="section" id="field-mappings-section">
+    <div class="section-header" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Field Mappings</span>
+      <button class="change-btn" onclick="addFieldRow()">+ Add Field</button>
+    </div>
+    <table id="field-table">
+      <thead>
+        <tr>
+          <th>Lark Field</th>
+          <th>Jira Field</th>
+          <th>Label</th>
+          <th>Direction</th>
+          <th>Type</th>
+          <th>Active</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="field-tbody">
+        <tr><td colspan="7" class="empty">Loading…</td></tr>
+      </tbody>
     </table>
   </div>
 
@@ -590,6 +652,159 @@ async function loadTables() {{
     picker.innerHTML = html;
   }} catch(e) {{ picker.innerHTML = '<span style="color:#ef4444">Failed to load tables.</span>'; }}
 }}
+
+// ── Field Mappings ──────────────────────────────────────────────
+var _fmData = [];
+var DIRECTIONS = {{'both':'Both','lark_to_jira':'Lark → Jira','jira_to_lark':'Jira → Lark'}};
+var TYPES = {{'text':'Text','date':'Date','number':'Number','select':'Select','user':'User'}};
+
+async function loadFields() {{
+  var res = await fetch('/api/fields');
+  var data = await res.json();
+  _fmData = data.mappings || [];
+  renderFields();
+}}
+
+function renderFields() {{
+  var tbody = document.getElementById('field-tbody');
+  if (!_fmData.length) {{ tbody.innerHTML = '<tr><td colspan="7" class="empty">No mappings found.</td></tr>'; return; }}
+  var html = '';
+  _fmData.forEach(function(m) {{
+    var sys = m.is_system;
+    html += '<tr class="' + (sys ? 'sys-row' : '') + '" id="fm-row-' + m.id + '">';
+    html += '<td><span class="fm-val-lark">' + m.lark_field + '</span></td>';
+    html += '<td>' + m.jira_field + (sys ? '' : '') + '</td>';
+    html += '<td>' + (m.jira_label || '') + '</td>';
+    html += '<td>' + (DIRECTIONS[m.direction] || m.direction) + '</td>';
+    html += '<td>' + (TYPES[m.field_type] || m.field_type) + '</td>';
+    html += '<td>' + (m.active ? '✓' : '—') + '</td>';
+    html += '<td>';
+    if (sys) {{
+      html += '<button class="fm-edit-btn fm-edit" onclick="editLarkField(' + m.id + ',\'' + m.lark_field.replace(/'/g,"\\'") + '\')">Rename</button>';
+    }} else {{
+      html += '<button class="fm-edit-btn fm-edit" onclick="editRow(' + m.id + ')">Edit</button>';
+      html += '<button class="fm-edit-btn fm-delete" onclick="deleteField(' + m.id + ')">Delete</button>';
+    }}
+    html += '</td></tr>';
+  }});
+  tbody.innerHTML = html;
+}}
+
+function editLarkField(id, current) {{
+  var row = document.getElementById('fm-row-' + id);
+  var span = row.querySelector('.fm-val-lark');
+  var orig = span.textContent;
+  span.innerHTML = '<input type="text" value="' + orig + '" style="width:140px">';
+  var acts = row.querySelector('td:last-child');
+  acts.innerHTML = '<button class="fm-edit-btn fm-save" onclick="saveLarkField(' + id + ')">Save</button>'
+    + '<button class="fm-edit-btn fm-cancel" onclick="renderFields()">Cancel</button>';
+}}
+
+async function saveLarkField(id) {{
+  var row = document.getElementById('fm-row-' + id);
+  var val = row.querySelector('input').value.trim();
+  if (!val) return;
+  var m = _fmData.find(function(x) {{ return x.id === id; }});
+  if (!m) return;
+  await fetch('/settings/fields', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(Object.assign({{}}, m, {{lark_field: val}}))
+  }});
+  loadFields();
+}}
+
+function editRow(id) {{
+  var m = _fmData.find(function(x) {{ return x.id === id; }});
+  if (!m) return;
+  var row = document.getElementById('fm-row-' + id);
+  row.innerHTML =
+    '<td><input type="text" value="' + m.lark_field + '"></td>' +
+    '<td><input type="text" value="' + m.jira_field + '"></td>' +
+    '<td><input type="text" value="' + (m.jira_label||'') + '"></td>' +
+    '<td>' + dirSelect(m.direction) + '</td>' +
+    '<td>' + typeSelect(m.field_type) + '</td>' +
+    '<td><input type="checkbox"' + (m.active?' checked':'') + '></td>' +
+    '<td><button class="fm-edit-btn fm-save" onclick="saveRow(' + id + ')">Save</button>' +
+    '<button class="fm-edit-btn fm-cancel" onclick="renderFields()">Cancel</button></td>';
+}}
+
+async function saveRow(id) {{
+  var row = document.getElementById('fm-row-' + id);
+  var inputs = row.querySelectorAll('input, select');
+  var m = _fmData.find(function(x) {{ return x.id === id; }});
+  var payload = Object.assign({{}}, m, {{
+    lark_field: inputs[0].value.trim(),
+    jira_field: inputs[1].value.trim(),
+    jira_label: inputs[2].value.trim(),
+    direction: inputs[3].value,
+    field_type: inputs[4].value,
+    active: inputs[5].checked
+  }});
+  await fetch('/settings/fields', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(payload)
+  }});
+  loadFields();
+}}
+
+async function deleteField(id) {{
+  if (!confirm('Delete this field mapping?')) return;
+  await fetch('/settings/fields/' + id, {{method: 'DELETE'}});
+  loadFields();
+}}
+
+function addFieldRow() {{
+  var tbody = document.getElementById('field-tbody');
+  var tr = document.createElement('tr');
+  tr.className = 'new-row';
+  tr.id = 'fm-row-new';
+  tr.innerHTML =
+    '<td><input type="text" placeholder="Lark column name"></td>' +
+    '<td><input type="text" placeholder="Jira field ID"></td>' +
+    '<td><input type="text" placeholder="Label"></td>' +
+    '<td>' + dirSelect('both') + '</td>' +
+    '<td>' + typeSelect('text') + '</td>' +
+    '<td><input type="checkbox" checked></td>' +
+    '<td><button class="fm-edit-btn fm-save" onclick="saveNewRow()">Save</button>' +
+    '<button class="fm-edit-btn fm-cancel" onclick="this.closest(\'tr\').remove()">Cancel</button></td>';
+  tbody.insertBefore(tr, tbody.firstChild);
+}}
+
+async function saveNewRow() {{
+  var row = document.getElementById('fm-row-new');
+  var inputs = row.querySelectorAll('input, select');
+  var lf = inputs[0].value.trim(), jf = inputs[1].value.trim();
+  if (!lf || !jf) {{ alert('Lark field and Jira field are required.'); return; }}
+  var payload = {{
+    lark_field: lf, jira_field: jf, jira_label: inputs[2].value.trim(),
+    direction: inputs[3].value, field_type: inputs[4].value,
+    active: inputs[5].checked, is_system: false
+  }};
+  await fetch('/settings/fields', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(payload)
+  }});
+  loadFields();
+}}
+
+function dirSelect(cur) {{
+  var opts = Object.keys(DIRECTIONS).map(function(k) {{
+    return '<option value="' + k + '"' + (k===cur?' selected':'') + '>' + DIRECTIONS[k] + '</option>';
+  }}).join('');
+  return '<select>' + opts + '</select>';
+}}
+function typeSelect(cur) {{
+  var opts = Object.keys(TYPES).map(function(k) {{
+    return '<option value="' + k + '"' + (k===cur?' selected':'') + '>' + TYPES[k] + '</option>';
+  }}).join('');
+  return '<select>' + opts + '</select>';
+}}
+
+document.addEventListener('DOMContentLoaded', loadFields);
+// ── end Field Mappings ───────────────────────────────────────────
 
 async function switchTable(id, name) {{
   if (!confirm('Switch sync to table "' + name + '"?\\nThis will rebuild the index.')) return;
