@@ -242,6 +242,25 @@ async def debug_payloads():
     return list(_raw_payloads)
 
 
+@app.get("/debug/index")
+async def debug_index():
+    """Current in-memory index of linked Jira ↔ Lark records."""
+    return {
+        "linked_count": len(index._jira_to_lark),
+        "jira_to_lark": index._jira_to_lark,
+    }
+
+
+@app.post("/debug/rebuild")
+async def debug_rebuild():
+    """Force-rebuild the index from all current Lark records."""
+    cfg = get_cfg()
+    token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+    records = lark_api.fetch_all_records(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
+    index.rebuild(records)
+    return {"rebuilt": True, "linked_count": len(index._jira_to_lark)}
+
+
 @app.post("/webhook/lark")
 async def recv_lark(request: Request, bg: BackgroundTasks):
     body = await request.json()

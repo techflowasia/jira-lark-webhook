@@ -132,8 +132,7 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"],
                            record_id, updates)
-    changed_fields = [item.get("field") for item in items if item.get("field") in RELEVANT_CHANGELOG_FIELDS]
-    desc = ", ".join(f"{f}: {item.get('toString','')}" for item in items
+    desc = ", ".join(f"{item.get('field')}: {item.get('toString','')}" for item in items
                      if item.get("field") in RELEVANT_CHANGELOG_FIELDS)
     log.info(f"jira_handler: updated Lark {record_id} from Jira {key} — {desc}")
     history.record(direction="jira→lark", event="updated", jira_key=key, lark_id=record_id,

@@ -134,13 +134,19 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
         log.info(f"lark_handler: skipping update {rid} — dedup")
         return
 
-    jira_key = index._lark_to_jira.get(rid)
-    if not jira_key:
-        log.info(f"lark_handler: skipping update {rid} — not in index")
-        return
-
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
+
+    jira_key = index._lark_to_jira.get(rid)
+    if not jira_key:
+        # Not in index — check if the record itself has a Jira Key (auto-discover)
+        jira_key = _lark_text(rec["fields"].get(F_JIRA_KEY))
+        if jira_key:
+            index.add(jira_key, rid)
+            log.info(f"lark_handler: auto-discovered link {rid} → {jira_key}")
+        else:
+            log.info(f"lark_handler: skipping update {rid} — not linked to Jira")
+            return
 
     updates: dict = {}
     changed: list = []
