@@ -112,3 +112,19 @@ def list_fields(token: str, base_token: str, table_id: str) -> list:
         raise RuntimeError(f"Lark list_fields error: {data.get('msg')}")
     return [{"field_name": f["field_name"], "field_id": f["field_id"]}
             for f in data.get("data", {}).get("items", [])]
+
+
+def get_select_options(token: str, base_token: str, table_id: str, field_name: str) -> list:
+    """Return option names for a select field."""
+    resp = requests.get(
+        f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
+        headers=_headers(token), params={"page_size": 300})
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"Lark get_select_options error: {data.get('msg')}")
+    for f in data.get("data", {}).get("items", []):
+        if f["field_name"] == field_name:
+            options = (f.get("property") or {}).get("options", [])
+            return [opt["name"] for opt in options]
+    return []

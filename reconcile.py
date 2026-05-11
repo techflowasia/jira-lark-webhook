@@ -1,14 +1,12 @@
 """30-min safety-net cron: full diff Jira <-> Lark."""
 import logging
-import lark_api, jira_api, index, dedup
+import lark_api, jira_api, index, dedup, config
 from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END,
                     JIRA_TO_LARK_ASSIGNEE)
 from utils import _lark_text, _lark_select, _jira_datetime_to_lark_ts
 
 log = logging.getLogger(__name__)
-
-ALLOWED_TYPES = {"Epic", "Story", "Task"}
 
 
 def run(cfg: dict) -> None:
@@ -52,7 +50,7 @@ def run(cfg: dict) -> None:
         key = issue["key"]
         jf = issue["fields"]
         itype = jf["issuetype"]["name"]
-        if itype not in ALLOWED_TYPES:
+        if itype not in config.get_allowed_jira_types():
             continue
 
         assignee_name = (jf.get("assignee") or {}).get("displayName")

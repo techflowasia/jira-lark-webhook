@@ -1,6 +1,6 @@
 """Jira webhook events → Lark actions."""
 import logging
-import lark_api, index, dedup, history, field_mappings
+import lark_api, index, dedup, history, field_mappings, config
 from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END, F_PARENT,
                     JIRA_TO_LARK_ASSIGNEE)
@@ -8,7 +8,6 @@ from utils import _jira_datetime_to_lark_ts
 
 log = logging.getLogger(__name__)
 
-ALLOWED_TYPES = {"Epic", "Story", "Task"}
 RELEVANT_CHANGELOG_FIELDS = {
     "summary", "assignee", "customfield_10016",
     "customfield_10175", "customfield_10176", "status", "parent",
@@ -40,7 +39,7 @@ def _handle_create(issue: dict, cfg: dict) -> None:
 
     jf = issue["fields"]
     itype = jf["issuetype"]["name"]
-    if itype not in ALLOWED_TYPES:
+    if itype not in config.get_allowed_jira_types():
         return
 
     assignee_name = (jf.get("assignee") or {}).get("displayName")

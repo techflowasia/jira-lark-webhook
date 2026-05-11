@@ -132,3 +132,11 @@ def get_all_fields(cfg: dict) -> list:
     resp.raise_for_status()
     return [{"id": f["id"], "name": f["name"], "custom": f.get("custom", False)}
             for f in resp.json()]
+
+
+def get_project_issue_types(cfg: dict) -> list:
+    """Return list of issue type names for the project."""
+    resp = requests.get(_url(cfg, f"/rest/api/3/project/{cfg['JIRA_PROJECT']}"),
+                        auth=_auth(cfg))
+    resp.raise_for_status()
+    return [t["name"] for t in resp.json().get("issueTypes", [])]

@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
 import lark_api, jira_api, index, reconcile, history, field_mappings
 import lark_handler, jira_handler
+import config as _cfg_mod
 from config import get_cfg, set_active_table
 
 LARK_APP_ID     = "cli_a9772fc461e1de15"
@@ -41,6 +42,7 @@ async def startup() -> None:
     asyncio.create_task(_keepalive_loop())
     asyncio.create_task(_load_active_table_async())
     asyncio.create_task(asyncio.to_thread(field_mappings.load))
+    asyncio.create_task(asyncio.to_thread(_cfg_mod.load_sync_types))
 
 
 async def _load_active_table_async() -> None:
@@ -297,6 +299,48 @@ async def delete_field(mapping_id: int):
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/jira-issue-types")
+async def api_jira_issue_types():
+    try:
+        cfg = get_cfg()
+        types = await asyncio.to_thread(jira_api.get_project_issue_types, cfg)
+        return {"types": types}
+    except Exception as e:
+        return {"types": [], "error": str(e)}
+
+
+@app.get("/api/lark-type-options")
+async def api_lark_type_options():
+    try:
+        cfg = get_cfg()
+        token = await asyncio.to_thread(lark_api.get_token, cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+        options = await asyncio.to_thread(
+            lark_api.get_select_options, token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], "Type")
+        return {"options": options}
+    except Exception as e:
+        return {"options": [], "error": str(e)}
+
+
+@app.get("/api/sync-types")
+async def api_sync_types():
+    return {
+        "allowed_jira": sorted(_cfg_mod.get_allowed_jira_types()),
+        "allowed_lark": sorted(_cfg_mod.get_allowed_lark_types()),
+    }
+
+
+@app.post("/settings/sync-types")
+async def save_sync_types_endpoint(request: Request):
+    body = await request.json()
+    jira_types = body.get("jira_types", [])
+    lark_types = body.get("lark_types", [])
+    try:
+        await asyncio.to_thread(_cfg_mod.save_sync_types, jira_types, lark_types)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/toggle")
 async def toggle_sync():
     global _sync_enabled
@@ -529,6 +573,19 @@ async def dashboard(request: Request):
                         border-radius: 4px; cursor: pointer; background: #0f172a; color: #fff; }}
   .table-item button:disabled {{ background: #94a3b8; cursor: not-allowed; }}
   .tbl-id {{ font-size: 10px; color: #94a3b8; font-family: monospace; }}
+  /* Sync Types */
+  .sync-types-panels {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 16px 20px; }}
+  .sync-panel {{ background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 16px; }}
+  .sync-panel h3 {{ font-size: 13px; font-weight: 600; color: #0f172a; margin-bottom: 10px; }}
+  .sync-panel label {{ display: flex; align-items: center; gap: 8px; font-size: 13px;
+                       padding: 4px 0; cursor: pointer; color: #1e293b; }}
+  .sync-panel label input[type=checkbox] {{ width: 15px; height: 15px; cursor: pointer; }}
+  .sync-save-row {{ padding: 12px 20px; border-top: 1px solid #e2e8f0; display: flex;
+                    align-items: center; gap: 12px; }}
+  .sync-save-btn {{ padding: 6px 18px; background: #0f172a; color: #fff; border: none;
+                    border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }}
+  .sync-save-btn:hover {{ opacity: 0.88; }}
+  .sync-msg {{ font-size: 12px; color: #22c55e; }}
 </style>
 </head>
 <body>
@@ -606,6 +663,24 @@ async def dashboard(request: Request):
         <tr><td colspan="7" class="empty">Loading…</td></tr>
       </tbody>
     </table>
+  </div>
+
+  <div class="section" id="sync-types-section">
+    <div class="section-header">Sync Types</div>
+    <div class="sync-types-panels">
+      <div class="sync-panel">
+        <h3>Jira Issue Types</h3>
+        <div id="jira-types-list"><span style="color:#94a3b8;font-size:12px">Loading…</span></div>
+      </div>
+      <div class="sync-panel">
+        <h3>Lark Type Field Values</h3>
+        <div id="lark-types-list"><span style="color:#94a3b8;font-size:12px">Loading…</span></div>
+      </div>
+    </div>
+    <div class="sync-save-row">
+      <button class="sync-save-btn" onclick="saveSyncTypes()">Save Sync Types</button>
+      <span class="sync-msg" id="sync-save-msg"></span>
+    </div>
   </div>
 
   <div class="section">
@@ -879,8 +954,72 @@ function typeSelect(cur) {{
 document.addEventListener('DOMContentLoaded', function() {{
   loadFields();
   loadAvailableFields();
+  loadSyncTypes();
 }});
 // ── end Field Mappings ───────────────────────────────────────────
+
+// ── Sync Types ───────────────────────────────────────────────────
+async function loadSyncTypes() {{
+  try {{
+    var results = await Promise.all([
+      fetch('/api/sync-types').then(function(r) {{ return r.json(); }}),
+      fetch('/api/jira-issue-types').then(function(r) {{ return r.json(); }}),
+      fetch('/api/lark-type-options').then(function(r) {{ return r.json(); }}),
+    ]);
+    var cfg = results[0];
+    var jira = results[1];
+    var lark = results[2];
+    renderTypeCheckboxes('jira-types-list', jira.types || [], cfg.allowed_jira || []);
+    renderTypeCheckboxes('lark-types-list', lark.options || [], cfg.allowed_lark || []);
+  }} catch(e) {{
+    document.getElementById('jira-types-list').innerHTML = '<span style="color:#ef4444">Failed to load</span>';
+    document.getElementById('lark-types-list').innerHTML = '<span style="color:#ef4444">Failed to load</span>';
+  }}
+}}
+
+function renderTypeCheckboxes(containerId, allOptions, checked) {{
+  var el = document.getElementById(containerId);
+  if (!allOptions.length) {{
+    el.innerHTML = '<span style="color:#94a3b8;font-size:12px">No options found.</span>';
+    return;
+  }}
+  var html = '';
+  allOptions.forEach(function(opt) {{
+    var isChecked = checked.indexOf(opt) !== -1 ? ' checked' : '';
+    html += '<label><input type="checkbox" data-val="' + opt + '"' + isChecked + '> ' + opt + '</label>';
+  }});
+  el.innerHTML = html;
+}}
+
+async function saveSyncTypes() {{
+  var jiraChecked = Array.from(document.querySelectorAll('#jira-types-list input[type=checkbox]:checked'))
+    .map(function(cb) {{ return cb.dataset.val; }});
+  var larkChecked = Array.from(document.querySelectorAll('#lark-types-list input[type=checkbox]:checked'))
+    .map(function(cb) {{ return cb.dataset.val; }});
+  var msg = document.getElementById('sync-save-msg');
+  msg.textContent = 'Saving…';
+  msg.style.color = '#64748b';
+  try {{
+    var res = await fetch('/settings/sync-types', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{jira_types: jiraChecked, lark_types: larkChecked}})
+    }});
+    var data = await res.json();
+    if (data.ok) {{
+      msg.textContent = 'Saved!';
+      msg.style.color = '#22c55e';
+    }} else {{
+      msg.textContent = 'Error: ' + (data.error || 'unknown');
+      msg.style.color = '#ef4444';
+    }}
+  }} catch(e) {{
+    msg.textContent = 'Request failed';
+    msg.style.color = '#ef4444';
+  }}
+  setTimeout(function() {{ msg.textContent = ''; }}, 3000);
+}}
+// ── end Sync Types ────────────────────────────────────────────────
 
 async function switchTable(id, name) {{
   if (!confirm('Switch sync to table "' + name + '"?\\nThis will rebuild the index.')) return;

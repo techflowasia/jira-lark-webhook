@@ -1,7 +1,7 @@
 """Lark Base events → Jira actions."""
 import time
 import logging
-import lark_api, jira_api, index, dedup, history, field_mappings
+import lark_api, jira_api, index, dedup, history, field_mappings, config
 from config import (F_TITLE, F_START, F_END, F_ASSIGNEE, F_JIRA_KEY, F_JIRA_URL,
                     F_TYPE, F_PARENT, F_RELEASE, LARK_TO_JIRA_ASSIGNEE)
 from utils import _lark_text, _lark_select, _lark_ts_to_jira_date, _norm
@@ -11,8 +11,6 @@ log = logging.getLogger(__name__)
 _account_ids_cache: dict = {"data": None, "expires_at": 0}
 _version_cache: dict = {"data": {}, "expires_at": 0}
 _sprint_cache: dict = {"data": {}, "expires_at": 0}
-
-ALLOWED_TYPES = {"Epic", "Story", "Task"}
 
 
 def _get_account_ids(cfg: dict) -> dict:
@@ -96,10 +94,11 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
         return
 
     itype = _lark_select(rec["fields"].get(F_TYPE))
-    if itype not in ALLOWED_TYPES:
-        log.info(f"lark_handler: skipping create {rid} — type '{itype}' not in {ALLOWED_TYPES}")
+    allowed = config.get_allowed_lark_types()
+    if itype not in allowed:
+        log.info(f"lark_handler: skipping create {rid} — type '{itype}' not in {allowed}")
         history.record(direction="lark→jira", event="created", lark_id=rid,
-                       description=f"Skipped: type '{itype}' not Epic/Story/Task",
+                       description=f"Skipped: type '{itype}' not in allowed types",
                        status="skipped")
         return
 
