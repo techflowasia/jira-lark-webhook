@@ -2,12 +2,20 @@
 import asyncio
 import json
 import logging
+import urllib.request
+import urllib.parse
 from collections import deque
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
 import lark_api, index, reconcile, history
 import lark_handler, jira_handler
 from config import get_cfg
+
+LARK_APP_ID     = "cli_a9772fc461e1de15"
+LARK_APP_SECRET = "c8umFVp63U25n9USaljMjeKOOAp0uenw"
+LARK_BASE_TOKEN = "DdwQbYcA3aMpeKs6gTcjk7n2pnf"
+BOT_OPEN_ID     = "ou_6c4fb657f0b844228990210a8fc789b5"
+REDIRECT_URI    = "https://jira-lark-webhook.onrender.com/auth/callback"
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -35,6 +43,76 @@ async def _reconcile_loop() -> None:
     while True:
         await asyncio.sleep(1800)
         await asyncio.to_thread(reconcile.run, get_cfg())
+
+
+@app.get("/auth/start")
+async def auth_start():
+    """Step 1 — redirect user to Lark OAuth to get a user access token."""
+    params = urllib.parse.urlencode({
+        "app_id":       LARK_APP_ID,
+        "redirect_uri": REDIRECT_URI,
+        "scope":        "drive:drive",
+        "state":        "add_bot",
+    })
+    return RedirectResponse(f"https://open.larksuite.com/open-apis/authen/v1/authorize?{params}")
+
+
+@app.get("/auth/callback", response_class=HTMLResponse)
+async def auth_callback(request: Request):
+    """Step 2 — exchange code for user token, add bot as editor on the Base."""
+    code = request.query_params.get("code")
+    if not code:
+        return HTMLResponse("<h2>Error: no code in callback</h2>", status_code=400)
+
+    # Exchange code for user access token
+    req = urllib.request.Request(
+        "https://open.larksuite.com/open-apis/authen/v1/oidc/access_token",
+        data=json.dumps({"grant_type": "authorization_code", "code": code}).encode(),
+        headers={
+            "Content-Type":  "application/json",
+            "Authorization": f"Basic {_b64(LARK_APP_ID + ':' + LARK_APP_SECRET)}",
+        },
+        method="POST",
+    )
+    token_resp = json.loads(urllib.request.urlopen(req).read())
+    user_token = token_resp.get("data", {}).get("access_token") or token_resp.get("access_token")
+    if not user_token:
+        return HTMLResponse(f"<h2>Token exchange failed</h2><pre>{json.dumps(token_resp, indent=2)}</pre>", status_code=400)
+
+    # Add bot as editor on the Base using the user's token
+    req2 = urllib.request.Request(
+        f"https://open.larksuite.com/open-apis/drive/v1/permissions/{LARK_BASE_TOKEN}/members?type=bitable",
+        data=json.dumps({
+            "member_type": "openid",
+            "member_id":   BOT_OPEN_ID,
+            "perm":        "edit",
+            "perm_type":   "container",
+            "notify_lark": False,
+        }).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {user_token}"},
+        method="POST",
+    )
+    try:
+        perm_resp = json.loads(urllib.request.urlopen(req2).read())
+        ok = perm_resp.get("code") == 0
+        msg = "Bot added as editor on the Base!" if ok else f"Permission API error: {perm_resp.get('msg')}"
+    except Exception as e:
+        ok = False
+        msg = str(e)
+
+    color = "#22c55e" if ok else "#ef4444"
+    return HTMLResponse(f"""
+    <html><body style="font-family:sans-serif;padding:40px;max-width:500px;margin:auto">
+    <h2 style="color:{color}">{"✅ " if ok else "❌ "}{msg}</h2>
+    <p>{"The Lark bot now has edit access to the Base. Webhook events should start flowing within a few seconds." if ok else "Try again or check the Lark app permissions."}</p>
+    <p><a href="/">← Back to dashboard</a></p>
+    </body></html>
+    """)
+
+
+def _b64(s: str) -> str:
+    import base64
+    return base64.b64encode(s.encode()).decode()
 
 
 @app.get("/health")
