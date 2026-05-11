@@ -680,7 +680,7 @@ function renderFields() {{
     html += '<td>' + (m.active ? '✓' : '—') + '</td>';
     html += '<td>';
     if (sys) {{
-      html += '<button class="fm-edit-btn fm-edit" onclick="editLarkField(' + m.id + ',\'' + m.lark_field.replace(/'/g,"\\'") + '\')">Rename</button>';
+      html += '<button class="fm-edit-btn fm-edit" onclick="editLarkField(' + m.id + ')">Rename</button>';
     }} else {{
       html += '<button class="fm-edit-btn fm-edit" onclick="editRow(' + m.id + ')">Edit</button>';
       html += '<button class="fm-edit-btn fm-delete" onclick="deleteField(' + m.id + ')">Delete</button>';
@@ -768,7 +768,7 @@ function addFieldRow() {{
     '<td>' + typeSelect('text') + '</td>' +
     '<td><input type="checkbox" checked></td>' +
     '<td><button class="fm-edit-btn fm-save" onclick="saveNewRow()">Save</button>' +
-    '<button class="fm-edit-btn fm-cancel" onclick="this.closest(\'tr\').remove()">Cancel</button></td>';
+    '<button class="fm-edit-btn fm-cancel" onclick="this.closest(\\'tr\\').remove()">Cancel</button></td>';
   tbody.insertBefore(tr, tbody.firstChild);
 }}
 
