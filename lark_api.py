@@ -99,3 +99,16 @@ def list_tables(token: str, base_token: str) -> list:
         raise RuntimeError(f"Lark list_tables error: {data.get('msg')}")
     return [{"table_id": t["table_id"], "name": t["name"]}
             for t in data.get("data", {}).get("items", [])]
+
+
+def list_fields(token: str, base_token: str, table_id: str) -> list:
+    """Return [{field_name, field_id, type}, ...] for the active table."""
+    resp = requests.get(
+        f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
+        headers=_headers(token), params={"page_size": 300})
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"Lark list_fields error: {data.get('msg')}")
+    return [{"field_name": f["field_name"], "field_id": f["field_id"]}
+            for f in data.get("data", {}).get("items", [])]

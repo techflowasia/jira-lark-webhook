@@ -124,3 +124,11 @@ def move_to_sprint(cfg: dict, sprint_id: int, issue_key: str) -> None:
     resp = requests.post(_url(cfg, f"/rest/agile/1.0/sprint/{sprint_id}/issue"),
                          json={"issues": [issue_key]}, auth=_auth(cfg))
     resp.raise_for_status()
+
+
+def get_all_fields(cfg: dict) -> list:
+    """Return [{id, name, custom}, ...] for every Jira field."""
+    resp = requests.get(_url(cfg, "/rest/api/3/field"), auth=_auth(cfg))
+    resp.raise_for_status()
+    return [{"id": f["id"], "name": f["name"], "custom": f.get("custom", False)}
+            for f in resp.json()]

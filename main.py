@@ -246,6 +246,28 @@ async def api_fields():
     return {"mappings": field_mappings.get_all()}
 
 
+@app.get("/api/lark-fields")
+async def api_lark_fields():
+    try:
+        cfg = get_cfg()
+        token = await asyncio.to_thread(lark_api.get_token, cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+        fields = await asyncio.to_thread(lark_api.list_fields, token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
+        return {"fields": fields}
+    except Exception as e:
+        return {"fields": [], "error": str(e)}
+
+
+@app.get("/api/jira-fields")
+async def api_jira_fields():
+    try:
+        cfg = get_cfg()
+        fields = await asyncio.to_thread(jira_api.get_all_fields, cfg)
+        fields.sort(key=lambda f: (f["custom"], f["name"].lower()))
+        return {"fields": fields}
+    except Exception as e:
+        return {"fields": [], "error": str(e)}
+
+
 @app.post("/settings/fields")
 async def save_field(request: Request):
     body = await request.json()
@@ -478,6 +500,8 @@ async def dashboard(request: Request):
   .change-btn:hover {{ background: #cbd5e1; }}
   #field-table input, #field-table select {{ padding: 3px 6px; border: 1px solid #cbd5e1;
     border-radius: 4px; font-size: 12px; width: 100%; box-sizing: border-box; }}
+  .fm-field-sel {{ min-width: 160px; max-width: 240px; }}
+  .fm-label-inp {{ max-width: 120px; }}
   .fm-edit-btn {{ padding: 3px 8px; font-size: 11px; border: none; border-radius: 4px;
     cursor: pointer; margin-right: 3px; }}
   .fm-save {{ background: #22c55e; color: #fff; }}
@@ -655,6 +679,8 @@ async function loadTables() {{
 
 // ── Field Mappings ──────────────────────────────────────────────
 var _fmData = [];
+var _larkFields = [];   // [{{field_name, field_id}}, ...]
+var _jiraFields = [];   // [{{id, name, custom}}, ...]
 var DIRECTIONS = {{'both':'Both','lark_to_jira':'Lark → Jira','jira_to_lark':'Jira → Lark'}};
 var TYPES = {{'text':'Text','date':'Date','number':'Number','select':'Select','user':'User'}};
 
@@ -665,6 +691,19 @@ async function loadFields() {{
   renderFields();
 }}
 
+async function loadAvailableFields() {{
+  try {{
+    var lr = await fetch('/api/lark-fields');
+    var ld = await lr.json();
+    _larkFields = ld.fields || [];
+  }} catch(e) {{ _larkFields = []; }}
+  try {{
+    var jr = await fetch('/api/jira-fields');
+    var jd = await jr.json();
+    _jiraFields = jd.fields || [];
+  }} catch(e) {{ _jiraFields = []; }}
+}}
+
 function renderFields() {{
   var tbody = document.getElementById('field-tbody');
   if (!_fmData.length) {{ tbody.innerHTML = '<tr><td colspan="7" class="empty">No mappings found.</td></tr>'; return; }}
@@ -673,7 +712,7 @@ function renderFields() {{
     var sys = m.is_system;
     html += '<tr class="' + (sys ? 'sys-row' : '') + '" id="fm-row-' + m.id + '">';
     html += '<td><span class="fm-val-lark">' + m.lark_field + '</span></td>';
-    html += '<td>' + m.jira_field + (sys ? '' : '') + '</td>';
+    html += '<td>' + m.jira_field + '</td>';
     html += '<td>' + (m.jira_label || '') + '</td>';
     html += '<td>' + (DIRECTIONS[m.direction] || m.direction) + '</td>';
     html += '<td>' + (TYPES[m.field_type] || m.field_type) + '</td>';
@@ -690,7 +729,40 @@ function renderFields() {{
   tbody.innerHTML = html;
 }}
 
-function editLarkField(id, current) {{
+function larkFieldSelect(cur) {{
+  var opts = '<option value="">— choose Lark field —</option>';
+  _larkFields.forEach(function(f) {{
+    var sel = f.field_name === cur ? ' selected' : '';
+    opts += '<option value="' + f.field_name + '"' + sel + '>' + f.field_name + '</option>';
+  }});
+  if (_larkFields.length === 0) {{
+    opts += '<option value="' + cur + '" selected>' + (cur || 'Loading…') + '</option>';
+  }}
+  return '<select class="fm-field-sel">' + opts + '</select>';
+}}
+
+function jiraFieldSelect(cur) {{
+  var opts = '<option value="">— choose Jira field —</option>';
+  var system = _jiraFields.filter(function(f) {{ return !f.custom; }});
+  var custom  = _jiraFields.filter(function(f) {{ return  f.custom; }});
+  function addGroup(label, arr) {{
+    if (!arr.length) return;
+    opts += '<optgroup label="' + label + '">';
+    arr.forEach(function(f) {{
+      var sel = f.id === cur ? ' selected' : '';
+      opts += '<option value="' + f.id + '"' + sel + '>' + f.name + ' (' + f.id + ')</option>';
+    }});
+    opts += '</optgroup>';
+  }}
+  addGroup('System fields', system);
+  addGroup('Custom fields', custom);
+  if (_jiraFields.length === 0) {{
+    opts += '<option value="' + cur + '" selected>' + (cur || 'Loading…') + '</option>';
+  }}
+  return '<select class="fm-field-sel">' + opts + '</select>';
+}}
+
+function editLarkField(id) {{
   var row = document.getElementById('fm-row-' + id);
   var span = row.querySelector('.fm-val-lark');
   var orig = span.textContent;
@@ -719,9 +791,9 @@ function editRow(id) {{
   if (!m) return;
   var row = document.getElementById('fm-row-' + id);
   row.innerHTML =
-    '<td><input type="text" value="' + m.lark_field + '"></td>' +
-    '<td><input type="text" value="' + m.jira_field + '"></td>' +
-    '<td><input type="text" value="' + (m.jira_label||'') + '"></td>' +
+    '<td>' + larkFieldSelect(m.lark_field) + '</td>' +
+    '<td>' + jiraFieldSelect(m.jira_field) + '</td>' +
+    '<td><input type="text" class="fm-label-inp" value="' + (m.jira_label||'') + '" placeholder="Label"></td>' +
     '<td>' + dirSelect(m.direction) + '</td>' +
     '<td>' + typeSelect(m.field_type) + '</td>' +
     '<td><input type="checkbox"' + (m.active?' checked':'') + '></td>' +
@@ -731,15 +803,19 @@ function editRow(id) {{
 
 async function saveRow(id) {{
   var row = document.getElementById('fm-row-' + id);
-  var inputs = row.querySelectorAll('input, select');
+  var lf  = row.querySelector('.fm-field-sel').value;
+  var selects = row.querySelectorAll('.fm-field-sel');
+  var jf  = selects[1] ? selects[1].value : '';
+  var lbl = row.querySelector('.fm-label-inp') ? row.querySelector('.fm-label-inp').value.trim() : '';
+  var allSel = row.querySelectorAll('select');
+  var dir = allSel[2] ? allSel[2].value : 'both';
+  var typ = allSel[3] ? allSel[3].value : 'text';
+  var chk = row.querySelector('input[type=checkbox]');
   var m = _fmData.find(function(x) {{ return x.id === id; }});
+  if (!lf || !jf) {{ alert('Lark field and Jira field are required.'); return; }}
   var payload = Object.assign({{}}, m, {{
-    lark_field: inputs[0].value.trim(),
-    jira_field: inputs[1].value.trim(),
-    jira_label: inputs[2].value.trim(),
-    direction: inputs[3].value,
-    field_type: inputs[4].value,
-    active: inputs[5].checked
+    lark_field: lf, jira_field: jf, jira_label: lbl,
+    direction: dir, field_type: typ, active: chk ? chk.checked : true
   }});
   await fetch('/settings/fields', {{
     method: 'POST',
@@ -756,14 +832,24 @@ async function deleteField(id) {{
 }}
 
 function addFieldRow() {{
+  if (_larkFields.length === 0 || _jiraFields.length === 0) {{
+    loadAvailableFields().then(function() {{ _insertNewRow(); }});
+  }} else {{
+    _insertNewRow();
+  }}
+}}
+
+function _insertNewRow() {{
+  var existing = document.getElementById('fm-row-new');
+  if (existing) existing.remove();
   var tbody = document.getElementById('field-tbody');
   var tr = document.createElement('tr');
   tr.className = 'new-row';
   tr.id = 'fm-row-new';
   tr.innerHTML =
-    '<td><input type="text" placeholder="Lark column name"></td>' +
-    '<td><input type="text" placeholder="Jira field ID"></td>' +
-    '<td><input type="text" placeholder="Label"></td>' +
+    '<td>' + larkFieldSelect('') + '</td>' +
+    '<td>' + jiraFieldSelect('') + '</td>' +
+    '<td><input type="text" class="fm-label-inp" placeholder="Label"></td>' +
     '<td>' + dirSelect('both') + '</td>' +
     '<td>' + typeSelect('text') + '</td>' +
     '<td><input type="checkbox" checked></td>' +
@@ -774,13 +860,18 @@ function addFieldRow() {{
 
 async function saveNewRow() {{
   var row = document.getElementById('fm-row-new');
-  var inputs = row.querySelectorAll('input, select');
-  var lf = inputs[0].value.trim(), jf = inputs[1].value.trim();
+  var selects = row.querySelectorAll('.fm-field-sel');
+  var lf = selects[0] ? selects[0].value.trim() : '';
+  var jf = selects[1] ? selects[1].value.trim() : '';
+  var lbl = row.querySelector('.fm-label-inp') ? row.querySelector('.fm-label-inp').value.trim() : '';
+  var allSel = row.querySelectorAll('select');
+  var dir = allSel[2] ? allSel[2].value : 'both';
+  var typ = allSel[3] ? allSel[3].value : 'text';
+  var chk = row.querySelector('input[type=checkbox]');
   if (!lf || !jf) {{ alert('Lark field and Jira field are required.'); return; }}
   var payload = {{
-    lark_field: lf, jira_field: jf, jira_label: inputs[2].value.trim(),
-    direction: inputs[3].value, field_type: inputs[4].value,
-    active: inputs[5].checked, is_system: false
+    lark_field: lf, jira_field: jf, jira_label: lbl,
+    direction: dir, field_type: typ, active: chk ? chk.checked : true, is_system: false
   }};
   await fetch('/settings/fields', {{
     method: 'POST',
@@ -803,7 +894,10 @@ function typeSelect(cur) {{
   return '<select>' + opts + '</select>';
 }}
 
-document.addEventListener('DOMContentLoaded', loadFields);
+document.addEventListener('DOMContentLoaded', function() {{
+  loadFields();
+  loadAvailableFields();
+}});
 // ── end Field Mappings ───────────────────────────────────────────
 
 async function switchTable(id, name) {{
