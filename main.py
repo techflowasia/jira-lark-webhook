@@ -8,7 +8,7 @@ from collections import deque
 from datetime import datetime
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
-import lark_api, index, reconcile, history, field_mappings
+import lark_api, jira_api, index, reconcile, history, field_mappings
 import lark_handler, jira_handler
 from config import get_cfg, set_active_table
 
