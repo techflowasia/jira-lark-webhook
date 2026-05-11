@@ -709,21 +709,16 @@ function renderFields() {{
   if (!_fmData.length) {{ tbody.innerHTML = '<tr><td colspan="7" class="empty">No mappings found.</td></tr>'; return; }}
   var html = '';
   _fmData.forEach(function(m) {{
-    var sys = m.is_system;
-    html += '<tr class="' + (sys ? 'sys-row' : '') + '" id="fm-row-' + m.id + '">';
-    html += '<td><span class="fm-val-lark">' + m.lark_field + '</span></td>';
+    html += '<tr id="fm-row-' + m.id + '">';
+    html += '<td>' + m.lark_field + '</td>';
     html += '<td>' + m.jira_field + '</td>';
     html += '<td>' + (m.jira_label || '') + '</td>';
     html += '<td>' + (DIRECTIONS[m.direction] || m.direction) + '</td>';
     html += '<td>' + (TYPES[m.field_type] || m.field_type) + '</td>';
     html += '<td>' + (m.active ? '✓' : '—') + '</td>';
     html += '<td>';
-    if (sys) {{
-      html += '<button class="fm-edit-btn fm-edit" onclick="editLarkField(' + m.id + ')">Rename</button>';
-    }} else {{
-      html += '<button class="fm-edit-btn fm-edit" onclick="editRow(' + m.id + ')">Edit</button>';
-      html += '<button class="fm-edit-btn fm-delete" onclick="deleteField(' + m.id + ')">Delete</button>';
-    }}
+    html += '<button class="fm-edit-btn fm-edit" onclick="editRow(' + m.id + ')">Edit</button>';
+    html += '<button class="fm-edit-btn fm-delete" onclick="deleteField(' + m.id + ')">Delete</button>';
     html += '</td></tr>';
   }});
   tbody.innerHTML = html;
@@ -762,29 +757,6 @@ function jiraFieldSelect(cur) {{
   return '<select class="fm-field-sel">' + opts + '</select>';
 }}
 
-function editLarkField(id) {{
-  var row = document.getElementById('fm-row-' + id);
-  var span = row.querySelector('.fm-val-lark');
-  var orig = span.textContent;
-  span.innerHTML = '<input type="text" value="' + orig + '" style="width:140px">';
-  var acts = row.querySelector('td:last-child');
-  acts.innerHTML = '<button class="fm-edit-btn fm-save" onclick="saveLarkField(' + id + ')">Save</button>'
-    + '<button class="fm-edit-btn fm-cancel" onclick="renderFields()">Cancel</button>';
-}}
-
-async function saveLarkField(id) {{
-  var row = document.getElementById('fm-row-' + id);
-  var val = row.querySelector('input').value.trim();
-  if (!val) return;
-  var m = _fmData.find(function(x) {{ return x.id === id; }});
-  if (!m) return;
-  await fetch('/settings/fields', {{
-    method: 'POST',
-    headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify(Object.assign({{}}, m, {{lark_field: val}}))
-  }});
-  loadFields();
-}}
 
 function editRow(id) {{
   var m = _fmData.find(function(x) {{ return x.id === id; }});

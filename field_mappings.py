@@ -73,11 +73,11 @@ def upsert(row: dict) -> dict:
 
 
 def delete(mapping_id: int) -> None:
-    """Delete a non-system mapping."""
+    """Delete any mapping by id."""
     client = history._get_client()
     if not client:
         raise RuntimeError("Supabase not configured")
-    client.table("field_mappings").delete().eq("id", mapping_id).eq("is_system", False).execute()
+    client.table("field_mappings").delete().eq("id", mapping_id).execute()
     load()
 
 
