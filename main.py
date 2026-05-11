@@ -98,19 +98,39 @@ async def auth_callback(request: Request):
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {user_token}"},
         method="POST",
     )
+    perm_ok = False
+    perm_msg = ""
     try:
         perm_resp = json.loads(urllib.request.urlopen(req2).read())
-        ok = perm_resp.get("code") == 0
-        msg = "Bot added as editor on the Base!" if ok else f"Permission API error: {perm_resp.get('msg')}"
+        perm_ok = perm_resp.get("code") == 0
+        perm_msg = "Bot added as editor" if perm_ok else f"Permission API: {perm_resp.get('msg')} (code {perm_resp.get('code')})"
     except Exception as e:
-        ok = False
-        msg = str(e)
+        perm_msg = f"Permission API exception: {e}"
 
-    color = "#22c55e" if ok else "#ef4444"
+    # Subscribe to bitable record-change events using the user token
+    sub_ok = False
+    sub_msg = ""
+    try:
+        req3 = urllib.request.Request(
+            f"https://open.larksuite.com/open-apis/drive/v1/files/{LARK_BASE_TOKEN}/subscribe?file_type=bitable",
+            data=json.dumps({"event_types": ["drive.file.bitable_record_changed_v1"]}).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {user_token}"},
+            method="POST",
+        )
+        sub_resp = json.loads(urllib.request.urlopen(req3).read())
+        sub_ok = sub_resp.get("code") == 0
+        sub_msg = "Subscribed to record-change events!" if sub_ok else f"Subscribe API: {sub_resp.get('msg')} (code {sub_resp.get('code')})"
+    except Exception as e:
+        sub_msg = f"Subscribe API exception: {e}"
+
+    ok = perm_ok and sub_ok
+    color = "#22c55e" if ok else ("#f59e0b" if (perm_ok or sub_ok) else "#ef4444")
     return HTMLResponse(f"""
     <html><body style="font-family:sans-serif;padding:40px;max-width:500px;margin:auto">
-    <h2 style="color:{color}">{"✅ " if ok else "❌ "}{msg}</h2>
-    <p>{"The Lark bot now has edit access to the Base. Webhook events should start flowing within a few seconds." if ok else "Try again or check the Lark app permissions."}</p>
+    <h2 style="color:{color}">{"✅ Setup complete!" if ok else "⚠️ Partial setup"}</h2>
+    <p>{"✅" if perm_ok else "❌"} {perm_msg}</p>
+    <p>{"✅" if sub_ok else "❌"} {sub_msg}</p>
+    <p>{"Lark → Jira sync is now active. Edit any Lark record to test." if ok else "Check errors above and try again."}</p>
     <p><a href="/">← Back to dashboard</a></p>
     </body></html>
     """)
