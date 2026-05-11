@@ -32,9 +32,6 @@ _raw_payloads: deque = deque(maxlen=20)
 
 @app.on_event("startup")
 async def startup() -> None:
-    # Load active table from Supabase settings (fallback to env var)
-    _load_active_table_from_db()
-
     cfg = get_cfg()
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     records = lark_api.fetch_all_records(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
@@ -42,24 +39,39 @@ async def startup() -> None:
     logging.getLogger(__name__).info(f"Index built: {len(index._jira_to_lark)} linked records")
     asyncio.create_task(_reconcile_loop())
     asyncio.create_task(_keepalive_loop())
+    # Load active table from Supabase in background (non-blocking)
+    asyncio.create_task(_load_active_table_async())
 
 
-def _load_active_table_from_db() -> None:
-    """Seed the active table from Supabase settings, falling back to env var."""
+async def _load_active_table_async() -> None:
+    """Load active table from Supabase settings in a background thread, re-index if changed."""
     import os as _os
-    client = history._get_client()
-    if client:
-        try:
-            rows = client.table("settings").select("key,value").in_("key", ["active_table_id", "active_table_name"]).execute()
+    try:
+        def _fetch():
+            client = history._get_client()
+            if not client:
+                return None, None
+            rows = client.table("settings").select("key,value") \
+                .in_("key", ["active_table_id", "active_table_name"]).execute()
             kv = {r["key"]: r["value"] for r in (rows.data or [])}
-            tid  = kv.get("active_table_id")  or _os.environ.get("LARK_TABLE_ID", "")
-            name = kv.get("active_table_name") or ""
+            return (kv.get("active_table_id") or _os.environ.get("LARK_TABLE_ID", ""),
+                    kv.get("active_table_name") or "")
+
+        tid, name = await asyncio.to_thread(_fetch)
+        if tid and tid != get_cfg()["LARK_TABLE_ID"]:
+            # Table differs from env var — switch and rebuild index
             set_active_table(tid, name)
-            return
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"Could not load active table from DB: {e}")
-    import os as _os
-    set_active_table(_os.environ.get("LARK_TABLE_ID", ""))
+            cfg = get_cfg()
+            token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+            records = await asyncio.to_thread(
+                lark_api.fetch_all_records, token, cfg["LARK_BASE_TOKEN"], tid)
+            index.rebuild(records)
+            logging.getLogger(__name__).info(
+                f"Active table loaded from DB: '{name}' ({tid}), {len(index._jira_to_lark)} records")
+        elif tid:
+            set_active_table(tid, name)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Could not load active table from DB: {e}")
 
 
 async def _keepalive_loop() -> None:
