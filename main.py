@@ -75,15 +75,25 @@ async def _load_active_table_async() -> None:
 
 
 async def _keepalive_loop() -> None:
-    """Ping own /health every 5 min to prevent Render free-tier spindown."""
+    """Ping own /health every 4.5 min to prevent Render free-tier spindown (15 min threshold).
+    Must hit the external URL so the request passes through Render's load balancer;
+    localhost pings are invisible to Render and don't reset the spindown timer."""
     import os as _os
-    port = int(_os.environ.get("PORT", 10000))
+    external = _os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if external:
+        url = f"{external}/health"
+    else:
+        port = int(_os.environ.get("PORT", 10000))
+        url = f"http://localhost:{port}/health"
+    log = logging.getLogger(__name__)
+    log.info(f"Keepalive targeting: {url}")
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(270)  # 4.5 min — safely under 15 min spindown threshold
         try:
-            urllib.request.urlopen(f"http://localhost:{port}/health", timeout=5)
-        except Exception:
-            pass
+            urllib.request.urlopen(url, timeout=10)
+            log.debug("Keepalive ping OK")
+        except Exception as e:
+            log.warning(f"Keepalive ping failed: {e}")
 
 
 async def _reconcile_loop() -> None:
