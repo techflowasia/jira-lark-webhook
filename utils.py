@@ -61,6 +61,6 @@ def _lark_ts_to_jira_date(ts_ms) -> "str | None":
     if not ts_ms:
         return None
     try:
-        return datetime.fromtimestamp(int(ts_ms) / 1000).strftime("%Y-%m-%d")
+        return datetime.utcfromtimestamp(int(ts_ms) / 1000).strftime("%Y-%m-%d")
     except Exception:
         return None
