@@ -1,0 +1,123 @@
+"""Tests for lark_handler: create/update/delete + loop prevention."""
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from unittest.mock import patch, MagicMock
+import dedup, index
+
+CFG = {
+    "JIRA_EMAIL": "x", "JIRA_TOKEN": "x", "JIRA_DOMAIN": "test.atlassian.net",
+    "JIRA_PROJECT": "PROJ", "LARK_APP_ID": "x", "LARK_APP_SECRET": "x",
+    "LARK_BASE_TOKEN": "base", "LARK_TABLE_ID": "tbl",
+}
+
+RECORD = {
+    "record_id": "rec001",
+    "fields": {
+        "Title": "My Story",
+        "Type": "Story",
+        "Jira Key": None,
+        "Assignee": None,
+        "Timeline - Start": None,
+        "Timeline - End": None,
+        "Parent items": [{"record_id": "recEpic", "link_record_title": "Epic 1"}],
+    }
+}
+
+
+def setup_function():
+    dedup._cache.clear()
+    index._jira_to_lark.clear()
+    index._lark_to_jira.clear()
+    index._jira_to_lark["PROJ-10"] = "recEpic"
+    index._lark_to_jira["recEpic"] = "PROJ-10"
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_create_makes_jira_issue(mock_lark, mock_jira):
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = RECORD
+    mock_jira.create_issue.return_value = "PROJ-42"
+    mock_jira.get_account_ids.return_value = {}
+
+    import lark_handler
+    lark_handler.process({"action": "record_added", "record_id": "rec001"}, "tbl", CFG)
+
+    mock_jira.create_issue.assert_called_once()
+    args = mock_jira.create_issue.call_args
+    assert args[0][1] == "Story"
+    assert args[0][2] == "My Story"
+
+    mock_lark.update_record.assert_called_once()
+    written = mock_lark.update_record.call_args[0][4]
+    assert written["Jira Key"] == "PROJ-42"
+    assert "PROJ-42" in written["Jira URL"]
+
+    assert index._jira_to_lark.get("PROJ-42") == "rec001"
+    assert dedup.is_ours("jira:PROJ-42")
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_create_skips_if_dedup_marked(mock_lark, mock_jira):
+    dedup.mark("lark:rec001")
+    import lark_handler
+    lark_handler.process({"action": "record_added", "record_id": "rec001"}, "tbl", CFG)
+    mock_jira.create_issue.assert_not_called()
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_create_skips_if_jira_key_already_set(mock_lark, mock_jira):
+    rec_with_key = {**RECORD, "fields": {**RECORD["fields"], "Jira Key": "PROJ-1"}}
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = rec_with_key
+    import lark_handler
+    lark_handler.process({"action": "record_added", "record_id": "rec001"}, "tbl", CFG)
+    mock_jira.create_issue.assert_not_called()
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_update_pushes_to_jira(mock_lark, mock_jira):
+    index._lark_to_jira["rec002"] = "PROJ-5"
+    index._jira_to_lark["PROJ-5"] = "rec002"
+    rec = {**RECORD, "record_id": "rec002",
+           "fields": {**RECORD["fields"], "Jira Key": "PROJ-5",
+                      "Title": "Updated title"}}
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = rec
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
+    import lark_handler
+    lark_handler.process({"action": "record_edited", "record_id": "rec002"}, "tbl", CFG)
+
+    mock_jira.update_issue.assert_called_once()
+    fields = mock_jira.update_issue.call_args[0][2]
+    assert fields["summary"] == "Updated title"
+    assert dedup.is_ours("jira:PROJ-5")
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_update_skips_loop(mock_lark, mock_jira):
+    dedup.mark("lark:rec003")
+    import lark_handler
+    lark_handler.process({"action": "record_edited", "record_id": "rec003"}, "tbl", CFG)
+    mock_jira.update_issue.assert_not_called()
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_delete_removes_jira_issue(mock_lark, mock_jira):
+    index._lark_to_jira["rec004"] = "PROJ-9"
+    index._jira_to_lark["PROJ-9"] = "rec004"
+
+    import lark_handler
+    lark_handler.process({"action": "record_deleted", "record_id": "rec004"}, "tbl", CFG)
+
+    mock_jira.delete_issue.assert_called_once_with(CFG, "PROJ-9")
+    assert "PROJ-9" not in index._jira_to_lark
+    assert dedup.is_ours("jira:PROJ-9")
