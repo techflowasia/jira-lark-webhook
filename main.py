@@ -4,7 +4,7 @@ import json
 import logging
 from collections import deque
 from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 import lark_api, index, reconcile, history
 import lark_handler, jira_handler
 from config import get_cfg
@@ -13,6 +13,9 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 app = FastAPI()
+
+# Global enable/disable flag
+_sync_enabled: bool = True
 
 # Store last 20 raw payloads for debugging
 _raw_payloads: deque = deque(maxlen=20)
@@ -36,7 +39,18 @@ async def _reconcile_loop() -> None:
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "sync_enabled": _sync_enabled}
+
+
+@app.post("/toggle")
+async def toggle_sync():
+    global _sync_enabled
+    _sync_enabled = not _sync_enabled
+    state = "enabled" if _sync_enabled else "disabled"
+    logging.getLogger(__name__).info(f"Sync {state} via dashboard toggle")
+    history.record(direction="system", event="config",
+                   description=f"Sync {state} via dashboard")
+    return RedirectResponse("/", status_code=303)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -48,21 +62,25 @@ async def dashboard():
     def row_class(status):
         if status == "error":   return "error"
         if status == "skipped": return "skip"
+        if status == "system":  return "sys"
         return ""
 
     def direction_badge(d):
+        if d == "system":
+            return '<span class="badge sys">System</span>'
         if "lark" in d.split("→")[0]:
-            return f'<span class="badge lark">Lark → Jira</span>'
-        return f'<span class="badge jira">Jira → Lark</span>'
+            return '<span class="badge lark">Lark → Jira</span>'
+        return '<span class="badge jira">Jira → Lark</span>'
 
     def event_badge(e):
-        colors = {"created": "#22c55e", "updated": "#3b82f6", "deleted": "#ef4444"}
+        colors = {"created": "#22c55e", "updated": "#3b82f6",
+                  "deleted": "#ef4444", "config": "#a855f7"}
         c = colors.get(e, "#888")
         return f'<span class="evbadge" style="background:{c}">{e}</span>'
 
     rows = ""
     for entry in logs:
-        rc = row_class(entry["status"])
+        rc = row_class(entry["status"] if entry["direction"] != "system" else "system")
         err = f'<div class="errmsg">{entry["error"]}</div>' if entry["error"] else ""
         rows += f"""
         <tr class="{rc}">
@@ -77,6 +95,12 @@ async def dashboard():
     if not rows:
         rows = '<tr><td colspan="6" class="empty">No events recorded yet.</td></tr>'
 
+    toggle_label = "Disable Sync" if _sync_enabled else "Enable Sync"
+    toggle_color = "#ef4444" if _sync_enabled else "#22c55e"
+    status_color = "#22c55e" if _sync_enabled else "#f59e0b"
+    status_text  = "Live" if _sync_enabled else "Paused"
+    status_sub   = "Sync active" if _sync_enabled else "Webhooks received but not processed"
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -88,10 +112,15 @@ async def dashboard():
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
          background: #f1f5f9; color: #1e293b; }}
   .header {{ background: #0f172a; color: #f8fafc; padding: 20px 32px;
-             display: flex; align-items: center; gap: 12px; }}
+             display: flex; align-items: center; justify-content: space-between; }}
+  .header-left {{ display: flex; align-items: center; gap: 12px; }}
   .header h1 {{ font-size: 20px; font-weight: 600; }}
-  .dot {{ width: 10px; height: 10px; border-radius: 50%; background: #22c55e;
-          box-shadow: 0 0 0 3px rgba(34,197,94,.3); }}
+  .dot {{ width: 10px; height: 10px; border-radius: 50%; background: {status_color};
+          box-shadow: 0 0 0 3px {status_color}44; }}
+  .toggle-btn {{ background: {toggle_color}; color: #fff; border: none; cursor: pointer;
+                 padding: 8px 18px; border-radius: 6px; font-size: 13px; font-weight: 600;
+                 text-decoration: none; display: inline-block; }}
+  .toggle-btn:hover {{ opacity: 0.88; }}
   .main {{ padding: 24px 32px; }}
   .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr));
             gap: 16px; margin-bottom: 24px; }}
@@ -100,11 +129,9 @@ async def dashboard():
   .card .label {{ font-size: 11px; font-weight: 600; text-transform: uppercase;
                   letter-spacing: .05em; color: #64748b; margin-bottom: 4px; }}
   .card .value {{ font-size: 22px; font-weight: 700; color: #0f172a; }}
-  .card .sub {{ font-size: 12px; color: #64748b; margin-top: 2px;
-                word-break: break-all; }}
+  .card .sub {{ font-size: 12px; color: #64748b; margin-top: 2px; word-break: break-all; }}
   .section {{ background: #fff; border-radius: 10px;
-              box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow: hidden;
-              margin-bottom: 24px; }}
+              box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow: hidden; margin-bottom: 24px; }}
   .section-header {{ padding: 14px 20px; border-bottom: 1px solid #e2e8f0;
                      font-weight: 600; font-size: 14px; background: #f8fafc; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
@@ -114,12 +141,14 @@ async def dashboard():
   td {{ padding: 10px 14px; border-bottom: 1px solid #f1f5f9; vertical-align: top; }}
   tr:last-child td {{ border-bottom: none; }}
   tr.error td {{ background: #fff5f5; }}
-  tr.skip td {{ background: #fafaf0; color: #888; }}
+  tr.skip  td {{ background: #fafaf0; color: #888; }}
+  tr.sys   td {{ background: #faf5ff; color: #7c3aed; }}
   .ts {{ color: #64748b; font-size: 11px; white-space: nowrap; }}
   .badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px;
             font-size: 11px; font-weight: 600; white-space: nowrap; }}
   .badge.lark {{ background: #eff6ff; color: #1d4ed8; }}
   .badge.jira {{ background: #f0fdf4; color: #15803d; }}
+  .badge.sys  {{ background: #faf5ff; color: #7c3aed; }}
   .evbadge {{ display: inline-block; padding: 2px 8px; border-radius: 4px;
               font-size: 11px; font-weight: 600; color: #fff; }}
   code {{ background: #f1f5f9; padding: 1px 5px; border-radius: 3px;
@@ -127,22 +156,32 @@ async def dashboard():
   code.small {{ font-size: 10px; }}
   .errmsg {{ color: #dc2626; font-size: 11px; margin-top: 3px; font-family: monospace; }}
   .empty {{ text-align: center; color: #94a3b8; padding: 40px !important; }}
-  .cfg-key {{ color: #64748b; font-size: 12px; }}
+  .cfg-key {{ color: #64748b; font-size: 12px; width: 160px; }}
   .cfg-val {{ font-family: monospace; font-size: 12px; }}
+  .paused-banner {{ background: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px;
+                    padding: 12px 18px; margin-bottom: 20px; color: #92400e;
+                    font-size: 13px; font-weight: 500; }}
 </style>
 </head>
 <body>
 <div class="header">
-  <div class="dot"></div>
-  <h1>Jira ↔ Lark Webhook Sync</h1>
+  <div class="header-left">
+    <div class="dot"></div>
+    <h1>Jira ↔ Lark Webhook Sync</h1>
+  </div>
+  <form method="post" action="/toggle">
+    <button class="toggle-btn" type="submit">{toggle_label}</button>
+  </form>
 </div>
 <div class="main">
+
+  {"<div class='paused-banner'>⚠ Sync is paused — webhooks are received but changes are NOT propagated.</div>" if not _sync_enabled else ""}
 
   <div class="cards">
     <div class="card">
       <div class="label">Status</div>
-      <div class="value" style="color:#22c55e">Live</div>
-      <div class="sub">Service running</div>
+      <div class="value" style="color:{status_color}">{status_text}</div>
+      <div class="sub">{status_sub}</div>
     </div>
     <div class="card">
       <div class="label">Linked Records</div>
@@ -159,10 +198,14 @@ async def dashboard():
   <div class="section">
     <div class="section-header">Configuration</div>
     <table>
-      <tr><td class="cfg-key">Jira Domain</td><td class="cfg-val">{cfg["JIRA_DOMAIN"]}</td></tr>
-      <tr><td class="cfg-key">Jira Project</td><td class="cfg-val">{cfg["JIRA_PROJECT"]}</td></tr>
-      <tr><td class="cfg-key">Lark Base Token</td><td class="cfg-val">{cfg["LARK_BASE_TOKEN"]}</td></tr>
-      <tr><td class="cfg-key">Lark Table ID</td><td class="cfg-val">{cfg["LARK_TABLE_ID"]}</td></tr>
+      <tr><td class="cfg-key">Jira Domain</td>
+          <td class="cfg-val">{cfg["JIRA_DOMAIN"]}</td></tr>
+      <tr><td class="cfg-key">Jira Project</td>
+          <td class="cfg-val">{cfg["JIRA_PROJECT"]}</td></tr>
+      <tr><td class="cfg-key">Lark Base Token</td>
+          <td class="cfg-val">{cfg["LARK_BASE_TOKEN"]}</td></tr>
+      <tr><td class="cfg-key">Lark Table ID</td>
+          <td class="cfg-val">{cfg["LARK_TABLE_ID"]}</td></tr>
       <tr><td class="cfg-key">Jira Webhook URL</td>
           <td class="cfg-val">https://jira-lark-webhook.onrender.com/webhook/jira</td></tr>
       <tr><td class="cfg-key">Lark Webhook URL</td>
@@ -195,7 +238,7 @@ async def dashboard():
 
 @app.get("/debug/payloads")
 async def debug_payloads():
-    """Last raw webhook payloads received — use this to diagnose field name issues."""
+    """Last raw webhook payloads received."""
     return list(_raw_payloads)
 
 
@@ -207,6 +250,10 @@ async def recv_lark(request: Request, bg: BackgroundTasks):
 
     if body.get("type") == "url_verification":
         return {"challenge": body["challenge"]}
+
+    if not _sync_enabled:
+        logging.getLogger(__name__).info("Lark webhook ignored — sync disabled")
+        return {"ok": True, "note": "sync disabled"}
 
     event = body.get("event", {})
     cfg = get_cfg()
@@ -226,6 +273,11 @@ async def recv_jira(request: Request, bg: BackgroundTasks):
     logging.getLogger(__name__).info(
         f"Jira webhook received: event={body.get('webhookEvent')} key={body.get('issue',{}).get('key')}"
     )
+
+    if not _sync_enabled:
+        logging.getLogger(__name__).info("Jira webhook ignored — sync disabled")
+        return {"ok": True, "note": "sync disabled"}
+
     cfg = get_cfg()
     bg.add_task(jira_handler.process,
                 body.get("webhookEvent"),
