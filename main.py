@@ -5,6 +5,7 @@ import logging
 import urllib.request
 import urllib.parse
 from collections import deque
+from datetime import datetime
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
 import lark_api, index, reconcile, history
@@ -37,6 +38,19 @@ async def startup() -> None:
     index.rebuild(records)
     logging.getLogger(__name__).info(f"Index built: {len(index._jira_to_lark)} linked records")
     asyncio.create_task(_reconcile_loop())
+    asyncio.create_task(_keepalive_loop())
+
+
+async def _keepalive_loop() -> None:
+    """Ping own /health every 5 min to prevent Render free-tier spindown."""
+    import os as _os
+    port = int(_os.environ.get("PORT", 10000))
+    while True:
+        await asyncio.sleep(300)
+        try:
+            urllib.request.urlopen(f"http://localhost:{port}/health", timeout=5)
+        except Exception:
+            pass
 
 
 async def _reconcile_loop() -> None:
@@ -158,22 +172,57 @@ async def toggle_sync():
 
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard():
+async def dashboard(request: Request):
+    from datetime import timezone, timedelta
     cfg = get_cfg()
     linked = len(index._jira_to_lark)
-    logs = history.recent(200)
 
-    def row_class(status):
-        if status == "error":   return "error"
-        if status == "skipped": return "skip"
-        if status == "system":  return "sys"
+    # --- Parse filter params ---
+    range_param  = request.query_params.get("range", "1d")
+    from_date_str = request.query_params.get("from_date", "")
+    to_date_str   = request.query_params.get("to_date", "")
+    q    = request.query_params.get("q", "").strip()
+    try:
+        page = max(1, int(request.query_params.get("page", "1") or "1"))
+    except ValueError:
+        page = 1
+
+    now = datetime.now(timezone.utc)
+    range_days = {"1d": 1, "3d": 3, "7d": 7, "1m": 30}
+
+    if range_param == "custom":
+        try:
+            from_dt = datetime.fromisoformat(from_date_str).replace(tzinfo=timezone.utc) if from_date_str else None
+        except ValueError:
+            from_dt = None
+        try:
+            to_dt = datetime.fromisoformat(to_date_str).replace(tzinfo=timezone.utc) if to_date_str else None
+        except ValueError:
+            to_dt = None
+    elif range_param in range_days:
+        from_dt = now - timedelta(days=range_days[range_param])
+        to_dt   = now
+    else:
+        range_param = "1d"
+        from_dt = now - timedelta(days=1)
+        to_dt   = now
+
+    result = history.query(from_dt=from_dt, to_dt=to_dt, jira_key=q, page=page)
+    logs   = result["rows"]
+    total  = result["total"]
+    pages  = result["pages"]
+
+    # --- Helper renderers ---
+    def row_class(entry):
+        if entry["direction"] == "system": return "sys"
+        s = entry["status"]
+        if s == "error":   return "error"
+        if s == "skipped": return "skip"
         return ""
 
     def direction_badge(d):
-        if d == "system":
-            return '<span class="badge sys">System</span>'
-        if "lark" in d.split("→")[0]:
-            return '<span class="badge lark">Lark → Jira</span>'
+        if d == "system": return '<span class="badge sys">System</span>'
+        if "lark" in d.split("→")[0]: return '<span class="badge lark">Lark → Jira</span>'
         return '<span class="badge jira">Jira → Lark</span>'
 
     def event_badge(e):
@@ -182,22 +231,51 @@ async def dashboard():
         c = colors.get(e, "#888")
         return f'<span class="evbadge" style="background:{c}">{e}</span>'
 
-    rows = ""
+    rows_html = ""
     for entry in logs:
-        rc = row_class(entry["status"] if entry["direction"] != "system" else "system")
-        err = f'<div class="errmsg">{entry["error"]}</div>' if entry["error"] else ""
-        rows += f"""
+        rc  = row_class(entry)
+        err = f'<div class="errmsg">{entry["error"]}</div>' if entry.get("error") else ""
+        rows_html += f"""
         <tr class="{rc}">
           <td class="ts">{entry["ts"]}</td>
           <td>{direction_badge(entry["direction"])}</td>
           <td>{event_badge(entry["event"])}</td>
-          <td><code>{entry["jira_key"] or "—"}</code></td>
-          <td><code class="small">{entry["lark_id"] or "—"}</code></td>
+          <td><code>{entry.get("jira_key") or "—"}</code></td>
+          <td><code class="small">{entry.get("lark_id") or "—"}</code></td>
           <td>{entry["description"]}{err}</td>
         </tr>"""
+    if not rows_html:
+        rows_html = '<tr><td colspan="6" class="empty">No events in this range.</td></tr>'
 
-    if not rows:
-        rows = '<tr><td colspan="6" class="empty">No events recorded yet.</td></tr>'
+    # --- Pagination links ---
+    def page_url(p):
+        params = dict(request.query_params)
+        params["page"] = str(p)
+        return "/?" + urllib.parse.urlencode(params)
+
+    prev_btn = (f'<a class="pg-btn" href="{page_url(page-1)}">← Prev</a>'
+                if page > 1 else '<span class="pg-btn disabled">← Prev</span>')
+    next_btn = (f'<a class="pg-btn" href="{page_url(page+1)}">Next →</a>'
+                if page < pages else '<span class="pg-btn disabled">Next →</span>')
+    pagination = f"""
+    <div class="pagination">
+      {prev_btn}
+      <span class="pg-info">Page {page} of {pages} &nbsp;·&nbsp; {total} events</span>
+      {next_btn}
+    </div>"""
+
+    # --- Range button helper ---
+    def range_url(r):
+        params = {"range": r, "q": q, "page": "1"}
+        return "/?" + urllib.parse.urlencode({k: v for k, v in params.items() if v})
+
+    def rbtn(r, label):
+        active = "active" if range_param == r else ""
+        return f'<a class="rbtn {active}" href="{range_url(r)}">{label}</a>'
+
+    custom_style = "display:flex" if range_param == "custom" else "display:none"
+    custom_from  = from_date_str or (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    custom_to    = to_date_str   or now.strftime("%Y-%m-%d")
 
     toggle_label = "Disable Sync" if _sync_enabled else "Enable Sync"
     toggle_color = "#ef4444" if _sync_enabled else "#22c55e"
@@ -265,6 +343,30 @@ async def dashboard():
   .paused-banner {{ background: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px;
                     padding: 12px 18px; margin-bottom: 20px; color: #92400e;
                     font-size: 13px; font-weight: 500; }}
+  /* Filter bar */
+  .filter-bar {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+                 padding: 12px 20px; border-bottom: 1px solid #e2e8f0; background: #f8fafc; }}
+  .rbtn {{ padding: 5px 14px; border-radius: 20px; font-size: 12px; font-weight: 600;
+           text-decoration: none; color: #64748b; background: #e2e8f0; border: none; cursor: pointer; }}
+  .rbtn:hover {{ background: #cbd5e1; }}
+  .rbtn.active {{ background: #0f172a; color: #fff; }}
+  .custom-range {{ align-items: center; gap: 6px; font-size: 12px; color: #64748b; }}
+  .custom-range input[type=date] {{ padding: 4px 8px; border: 1px solid #cbd5e1;
+    border-radius: 6px; font-size: 12px; color: #1e293b; }}
+  .custom-range button {{ padding: 5px 12px; background: #0f172a; color: #fff;
+    border: none; border-radius: 6px; font-size: 12px; cursor: pointer; }}
+  .search-box {{ margin-left: auto; display: flex; gap: 6px; }}
+  .search-box input {{ padding: 5px 10px; border: 1px solid #cbd5e1; border-radius: 6px;
+    font-size: 12px; width: 180px; }}
+  .search-box button {{ padding: 5px 12px; background: #0f172a; color: #fff;
+    border: none; border-radius: 6px; font-size: 12px; cursor: pointer; }}
+  /* Pagination */
+  .pagination {{ display: flex; align-items: center; justify-content: center; gap: 12px;
+                 padding: 16px 20px; border-top: 1px solid #e2e8f0; }}
+  .pg-btn {{ padding: 6px 16px; border-radius: 6px; font-size: 13px; font-weight: 600;
+             text-decoration: none; background: #0f172a; color: #fff; }}
+  .pg-btn.disabled {{ background: #e2e8f0; color: #94a3b8; cursor: not-allowed; pointer-events: none; }}
+  .pg-info {{ font-size: 13px; color: #64748b; }}
 </style>
 </head>
 <body>
@@ -293,9 +395,9 @@ async def dashboard():
       <div class="sub">Jira ↔ Lark pairs in index</div>
     </div>
     <div class="card">
-      <div class="label">Events Logged</div>
-      <div class="value">{len(logs)}</div>
-      <div class="sub">Since last restart</div>
+      <div class="label">Total Events</div>
+      <div class="value">{total}</div>
+      <div class="sub">Matching current filter</div>
     </div>
   </div>
 
@@ -318,7 +420,36 @@ async def dashboard():
   </div>
 
   <div class="section">
-    <div class="section-header">Sync History (last {len(logs)} events)</div>
+    <!-- Filter bar -->
+    <div class="filter-bar">
+      {rbtn("1d", "1d")}
+      {rbtn("3d", "3d")}
+      {rbtn("7d", "7d")}
+      {rbtn("1m", "1 month")}
+      <a class="rbtn {'active' if range_param == 'custom' else ''}"
+         href="#" onclick="toggleCustom(event)">Custom ▾</a>
+
+      <form class="custom-range" id="custom-form" style="{custom_style}"
+            method="get" action="/">
+        <input type="hidden" name="range" value="custom">
+        <input type="hidden" name="q" value="{q}">
+        <span>From</span>
+        <input type="date" name="from_date" value="{custom_from}">
+        <span>To</span>
+        <input type="date" name="to_date" value="{custom_to}">
+        <button type="submit">Apply</button>
+      </form>
+
+      <form class="search-box" method="get" action="/">
+        <input type="hidden" name="range" value="{range_param}">
+        {'<input type="hidden" name="from_date" value="' + from_date_str + '">' if from_date_str else ''}
+        {'<input type="hidden" name="to_date" value="' + to_date_str + '">' if to_date_str else ''}
+        <input type="text" name="q" placeholder="Search Jira key…" value="{q}">
+        <button type="submit">Search</button>
+      </form>
+    </div>
+
+    <!-- History table -->
     <table>
       <thead>
         <tr>
@@ -330,11 +461,21 @@ async def dashboard():
           <th>Description</th>
         </tr>
       </thead>
-      <tbody>{rows}</tbody>
+      <tbody>{rows_html}</tbody>
     </table>
+
+    {pagination}
   </div>
 
 </div>
+
+<script>
+function toggleCustom(e) {{
+  e.preventDefault();
+  var f = document.getElementById('custom-form');
+  f.style.display = f.style.display === 'none' ? 'flex' : 'none';
+}}
+</script>
 </body>
 </html>"""
     return html
