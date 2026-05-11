@@ -645,7 +645,7 @@ async function loadTables() {{
       html += '<div class="table-item' + (active ? ' active-tbl' : '') + '">';
       html += '<div><div>' + t.name + (active ? ' ✓' : '') + '</div>';
       html += '<div class="tbl-id">' + t.table_id + '</div></div>';
-      html += '<button ' + (active ? 'disabled' : '') + ' onclick="switchTable(\'' + t.table_id + '\',\'' + t.name.replace(/'/g,"\\'") + '\')">Select</button>';
+      html += '<button ' + (active ? 'disabled' : '') + ' data-id="' + t.table_id + '" data-name="' + t.name.replace(/"/g, '&quot;') + '" onclick="switchTable(this.dataset.id,this.dataset.name)">Select</button>';
       html += '</div>';
     }});
     html += '</div>';
