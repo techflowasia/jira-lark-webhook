@@ -341,14 +341,15 @@ async def save_sync_types_endpoint(request: Request):
         return {"ok": False, "error": str(e)}
 
 
-@app.post("/api/match-by-title")
-async def api_match_by_title():
+@app.post("/api/backfill")
+async def api_backfill():
     cfg = get_cfg()
     try:
-        result = await asyncio.to_thread(reconcile.match_by_title, cfg)
+        result = await asyncio.to_thread(reconcile.backfill, cfg)
         return result
     except Exception as e:
-        return {"matched": 0, "skipped_ambiguous": 0, "pairs": [], "error": str(e)}
+        return {"removed_duplicates": 0, "matched": 0, "skipped_ambiguous": 0,
+                "created_lark": 0, "created_jira": 0, "synced": 0, "pairs": [], "error": str(e)}
 
 
 @app.post("/toggle")
@@ -693,17 +694,18 @@ async def dashboard(request: Request):
     </div>
   </div>
 
-  <div class="section" id="match-by-title-section">
-    <div class="section-header">Match Unlinked Records by Title</div>
+  <div class="section" id="backfill-section">
+    <div class="section-header">Backfill Pre-existing Records</div>
     <div style="padding:12px 20px 4px;color:#94a3b8;font-size:13px">
-      Links existing Lark records to Jira issues by exact title match — useful for records created before the webhook was registered.
-      Ambiguous titles (duplicates on either side) are skipped.
+      For records/issues that existed before the webhook was set up.
+      Removes duplicate Lark records, matches by title, creates missing records on both sides, and syncs field values.
+      Only processes types configured above.
     </div>
     <div class="sync-save-row">
-      <button class="sync-save-btn" id="match-btn" onclick="runMatchByTitle()">Match Unlinked by Title</button>
-      <span class="sync-msg" id="match-msg"></span>
+      <button class="sync-save-btn" id="backfill-btn" onclick="runBackfill()">Run Backfill</button>
+      <span class="sync-msg" id="backfill-msg"></span>
     </div>
-    <div id="match-results" style="display:none;padding:0 20px 16px"></div>
+    <div id="backfill-results" style="display:none;padding:0 20px 16px"></div>
   </div>
 
   <div class="section">
@@ -1044,34 +1046,42 @@ async function saveSyncTypes() {{
 }}
 // ── end Sync Types ────────────────────────────────────────────────
 
-// ── Match by Title ────────────────────────────────────────────────
-async function runMatchByTitle() {{
-  var btn = document.getElementById('match-btn');
-  var msg = document.getElementById('match-msg');
-  var results = document.getElementById('match-results');
+// ── Backfill ──────────────────────────────────────────────────────
+async function runBackfill() {{
+  var btn = document.getElementById('backfill-btn');
+  var msg = document.getElementById('backfill-msg');
+  var results = document.getElementById('backfill-results');
   btn.disabled = true;
-  msg.textContent = 'Running…';
+  msg.textContent = 'Running… (this may take a moment)';
+  msg.style.color = '#94a3b8';
   results.style.display = 'none';
   results.innerHTML = '';
   try {{
-    var res = await fetch('/api/match-by-title', {{ method: 'POST' }});
+    var res = await fetch('/api/backfill', {{ method: 'POST' }});
     var data = await res.json();
     if (data.error) {{
       msg.textContent = 'Error: ' + data.error;
       msg.style.color = '#f87171';
     }} else {{
-      var parts = [];
-      if (data.matched > 0) parts.push(data.matched + ' matched');
-      else parts.push('No matches found');
-      if (data.skipped_ambiguous > 0) parts.push(data.skipped_ambiguous + ' skipped (ambiguous title)');
-      msg.textContent = parts.join(' · ');
-      msg.style.color = data.matched > 0 ? '#4ade80' : '#94a3b8';
+      var stats = [];
+      if (data.removed_duplicates > 0) stats.push(data.removed_duplicates + ' duplicates removed');
+      if (data.matched > 0)            stats.push(data.matched + ' matched by title');
+      if (data.created_lark > 0)       stats.push(data.created_lark + ' Lark records created');
+      if (data.created_jira > 0)       stats.push(data.created_jira + ' Jira issues created');
+      if (data.synced > 0)             stats.push(data.synced + ' records synced');
+      if (data.skipped_ambiguous > 0)  stats.push(data.skipped_ambiguous + ' skipped (ambiguous title)');
+      var anyAction = data.removed_duplicates + data.matched + data.created_lark + data.created_jira + data.synced;
+      msg.textContent = anyAction > 0 ? stats.join(' · ') : 'Nothing to do — all records already in sync';
+      msg.style.color = anyAction > 0 ? '#4ade80' : '#94a3b8';
       if (data.pairs && data.pairs.length > 0) {{
         var rows = data.pairs.map(function(p) {{
-          return '<tr><td style="padding:4px 12px 4px 0;font-family:monospace;color:#60a5fa">' + p.jira_key + '</td>'
-               + '<td style="padding:4px 0;color:#e2e8f0">' + p.title + '</td></tr>';
+          return '<tr>'
+            + '<td style="padding:3px 12px 3px 0;font-family:monospace;color:#60a5fa;font-size:12px">' + p.jira_key + '</td>'
+            + '<td style="padding:3px 0;color:#e2e8f0;font-size:12px">' + p.title + '</td>'
+            + '</tr>';
         }}).join('');
-        results.innerHTML = '<table style="font-size:12px;margin-top:8px">' + rows + '</table>';
+        results.innerHTML = '<div style="color:#94a3b8;font-size:11px;margin-bottom:4px">Matched by title:</div>'
+          + '<table>' + rows + '</table>';
         results.style.display = 'block';
       }}
     }}
@@ -1081,7 +1091,7 @@ async function runMatchByTitle() {{
   }}
   btn.disabled = false;
 }}
-// ── end Match by Title ────────────────────────────────────────────
+// ── end Backfill ──────────────────────────────────────────────────
 
 async function switchTable(id, name) {{
   if (!confirm('Switch sync to table "' + name + '"?\\nThis will rebuild the index.')) return;
