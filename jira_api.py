@@ -16,7 +16,7 @@ def fetch_all_issues(cfg: dict, types: "list | None" = None) -> list:
     type_list = ", ".join(types) if types else "Epic, Story, Task"
     fields = ["summary", "issuetype", "assignee", "customfield_10015",
               "duedate", "customfield_10016", "parent", "status",
-              "customfield_10175", "customfield_10176"]
+              "customfield_10175", "customfield_10176", "customfield_10020"]
     while True:
         payload = {
             "jql": f"project={cfg['JIRA_PROJECT']} AND issuetype in ({type_list}) ORDER BY key ASC",
