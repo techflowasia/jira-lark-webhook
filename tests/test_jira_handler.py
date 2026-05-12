@@ -71,6 +71,7 @@ def test_update_pushes_summary_to_lark(mock_lark):
     index._jira_to_lark["PROJ-1"] = "recABC"
     index._lark_to_jira["recABC"] = "PROJ-1"
     mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {"Title": "Old title"}}
 
     changelog = {"items": [{"field": "summary", "toString": "New title", "to": None}]}
     import jira_handler
@@ -79,13 +80,14 @@ def test_update_pushes_summary_to_lark(mock_lark):
     mock_lark.update_record.assert_called_once()
     fields = mock_lark.update_record.call_args[0][4]
     assert fields["Title"] == "New title"
-    assert dedup.is_ours("lark:recABC")
 
 
 @patch("jira_handler.lark_api")
-def test_update_skips_loop(mock_lark):
+def test_update_skips_when_value_matches(mock_lark):
+    """Value-comparison loop prevention: if Lark already has the new value, no write."""
     index._jira_to_lark["PROJ-1"] = "recABC"
-    dedup.mark("jira:PROJ-1")
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {"Title": "X"}}
     changelog = {"items": [{"field": "summary", "toString": "X", "to": None}]}
     import jira_handler
     jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)

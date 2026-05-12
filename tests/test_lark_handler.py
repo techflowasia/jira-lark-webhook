@@ -97,7 +97,6 @@ def test_update_pushes_to_jira(mock_lark, mock_jira):
     mock_jira.update_issue.assert_called_once()
     fields = mock_jira.update_issue.call_args[0][2]
     assert fields["summary"] == "Updated title"
-    assert dedup.is_ours("jira:PROJ-5")
 
 
 @patch("lark_handler.jira_api")
@@ -139,8 +138,20 @@ def test_update_syncs_parent_with_record_ids_shape(mock_lark, mock_jira):
 
 @patch("lark_handler.jira_api")
 @patch("lark_handler.lark_api")
-def test_update_skips_loop(mock_lark, mock_jira):
-    dedup.mark("lark:rec003")
+def test_update_skips_when_value_matches(mock_lark, mock_jira):
+    """Value-comparison loop prevention: if Jira already matches Lark, no write."""
+    index._lark_to_jira["rec003"] = "PROJ-7"
+    index._jira_to_lark["PROJ-7"] = "rec003"
+    rec = {"record_id": "rec003",
+           "fields": {"Title": "Same title", "Type": "Story",
+                      "Jira Key": "PROJ-7"}}
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = rec
+    mock_jira.get_issue.return_value = {"fields": {"summary": "Same title"}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
     import lark_handler
     lark_handler.process({"action": "record_edited", "record_id": "rec003"}, "tbl", CFG)
     mock_jira.update_issue.assert_not_called()
