@@ -67,7 +67,7 @@ def _handle_create(issue: dict, cfg: dict) -> None:
     if actual_start:     fields[F_ACTUAL_START] = actual_start
     if actual_end:       fields[F_ACTUAL_END]   = actual_end
     if parent_record_id: fields[F_PARENT]       = [parent_record_id]
-    if sprint_name:      fields[F_RELEASE]      = sprint_name
+    if sprint_name:      fields[F_RELEASE]      = [sprint_name]
 
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], fields)
@@ -131,7 +131,7 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
 
         elif field == "customfield_10020":
             if to_str:
-                updates[F_RELEASE] = to_str
+                updates[F_RELEASE] = [to_str]
 
     # Apply custom (non-system) Jira → Lark mappings from changelog
     custom_j2l = {m["jira_field"]: m for m in field_mappings.get_custom_jira_to_lark()}
