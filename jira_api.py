@@ -76,7 +76,12 @@ def update_issue(cfg: dict, key: str, fields: dict) -> None:
         return
     resp = requests.put(_url(cfg, f"/rest/api/3/issue/{key}"),
                         json={"fields": fields}, auth=_auth(cfg))
-    resp.raise_for_status()
+    if not resp.ok:
+        raise requests.HTTPError(
+            f"{resp.status_code} {resp.reason} updating {key} "
+            f"fields={list(fields.keys())}: {resp.text[:600]}",
+            response=resp,
+        )
 
 
 def delete_issue(cfg: dict, key: str) -> None:

@@ -63,7 +63,7 @@ def _resolve_parent(rec: dict) -> "str | None":
 def process(action: dict, table_id: str, cfg: dict) -> None:
     act = action.get("action")
     rid = action.get("record_id", "")
-    log.info(f"lark_handler: action={act} record_id={rid} table_id={table_id} raw={action}")
+    log.info(f"lark_handler: action={act} record_id={rid} table_id={table_id}")
     try:
         if act == "record_added":
             _handle_create(rid, table_id, cfg)
@@ -72,11 +72,13 @@ def process(action: dict, table_id: str, cfg: dict) -> None:
         elif act == "record_deleted":
             _handle_delete(rid, cfg)
         else:
-            log.warning(f"lark_handler: unknown action '{act}' — full payload: {action}")
+            log.warning(f"lark_handler: unknown action '{act}' for {rid}")
     except Exception as e:
         log.error(f"lark_handler.{act} rid={rid}: {e}", exc_info=True)
+        jira_key = index._lark_to_jira.get(rid, "")
         history.record(direction="lark→jira", event=act or "unknown",
-                       lark_id=rid, description=str(action),
+                       lark_id=rid, jira_key=jira_key,
+                       description=f"Lark update error: {e}",
                        status="error", error=str(e))
 
 
@@ -210,6 +212,7 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
         return
 
     dedup.mark(f"jira:{jira_key}")
+    log.info(f"lark_handler: sending to Jira {jira_key} fields={list(updates.keys())}")
     jira_api.update_issue(cfg, jira_key, updates)
 
     if release_raw:
