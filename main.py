@@ -597,6 +597,55 @@ async def dashboard(request: Request):
                     border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }}
   .sync-save-btn:hover {{ opacity: 0.88; }}
   .sync-msg {{ font-size: 12px; color: #22c55e; }}
+
+  /* ── Mobile responsive ─────────────────────────────────────────── */
+  @media (max-width: 640px) {{
+    .header {{ padding: 12px 16px; flex-wrap: wrap; gap: 10px; }}
+    .header h1 {{ font-size: 16px; }}
+    .toggle-btn {{ padding: 6px 12px; font-size: 12px; }}
+    .main {{ padding: 12px 16px; }}
+
+    /* Sections: switch to horizontal scroll so tables don't clip */
+    .section {{ overflow-x: auto; border-radius: 8px; }}
+
+    /* Tables */
+    table {{ font-size: 12px; min-width: 480px; }}
+    th, td {{ padding: 8px 10px; }}
+
+    /* History table: hide Lark Record ID column (cols 5) */
+    #history-table th:nth-child(5),
+    #history-table td:nth-child(5) {{ display: none; }}
+
+    /* Field mapping table: hide Label + Type columns (cols 3, 5) */
+    #field-table th:nth-child(3),
+    #field-table td:nth-child(3),
+    #field-table th:nth-child(5),
+    #field-table td:nth-child(5) {{ display: none; }}
+
+    /* Filter bar */
+    .filter-bar {{ gap: 6px; padding: 10px 12px; }}
+    .search-box {{ margin-left: 0; width: 100%; }}
+    .search-box input {{ flex: 1; width: auto; min-width: 0; }}
+
+    /* Sync types: stack panels vertically */
+    .sync-types-panels {{ grid-template-columns: 1fr; gap: 12px; padding: 12px; }}
+
+    /* Sync/backfill save row */
+    .sync-save-row {{ flex-wrap: wrap; padding: 10px 12px; }}
+
+    /* Config table: shrink key column */
+    .cfg-key {{ width: 110px; font-size: 11px; }}
+    .cfg-val {{ font-size: 11px; word-break: break-all; }}
+
+    /* Cards */
+    .cards {{ gap: 10px; margin-bottom: 16px; }}
+    .card {{ padding: 14px 16px; }}
+    .card .value {{ font-size: 20px; }}
+
+    /* Pagination */
+    .pagination {{ gap: 8px; padding: 12px; }}
+    .pg-info {{ font-size: 12px; }}
+  }}
 </style>
 </head>
 <body>
@@ -739,7 +788,7 @@ async def dashboard(request: Request):
     </div>
 
     <!-- History table -->
-    <table>
+    <table id="history-table">
       <thead>
         <tr>
           <th>Time</th>
