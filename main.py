@@ -24,11 +24,29 @@ logging.basicConfig(level=logging.INFO,
 
 app = FastAPI()
 
-# Global enable/disable flag
+# Global enable/disable flags
 _sync_enabled: bool = True
+_reconcile_enabled: bool = True
 
 # Store last 20 raw payloads for debugging
 _raw_payloads: deque = deque(maxlen=20)
+
+
+def _load_toggle_states() -> None:
+    global _sync_enabled, _reconcile_enabled
+    try:
+        client = history._get_client()
+        if not client:
+            return
+        rows = client.table("settings").select("key,value") \
+            .in_("key", ["sync_enabled", "reconcile_enabled"]).execute()
+        for r in (rows.data or []):
+            if r["key"] == "sync_enabled":
+                _sync_enabled = r["value"].lower() != "false"
+            elif r["key"] == "reconcile_enabled":
+                _reconcile_enabled = r["value"].lower() != "false"
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Could not load toggle states: {e}")
 
 
 @app.on_event("startup")
@@ -43,6 +61,7 @@ async def startup() -> None:
     asyncio.create_task(_load_active_table_async())
     asyncio.create_task(asyncio.to_thread(field_mappings.load))
     asyncio.create_task(asyncio.to_thread(_cfg_mod.load_sync_types))
+    asyncio.create_task(asyncio.to_thread(_load_toggle_states))
 
 
 async def _load_active_table_async() -> None:
@@ -99,9 +118,13 @@ async def _keepalive_loop() -> None:
 
 
 async def _reconcile_loop() -> None:
+    log = logging.getLogger(__name__)
     while True:
         await asyncio.sleep(1800)
-        await asyncio.to_thread(reconcile.run, get_cfg())
+        if _reconcile_enabled:
+            await asyncio.to_thread(reconcile.run, get_cfg())
+        else:
+            log.info("Reconcile skipped — disabled")
 
 
 @app.get("/auth/start")
@@ -360,6 +383,31 @@ async def toggle_sync():
     logging.getLogger(__name__).info(f"Sync {state} via dashboard toggle")
     history.record(direction="system", event="config",
                    description=f"Sync {state} via dashboard")
+    client = history._get_client()
+    if client:
+        try:
+            client.table("settings").upsert(
+                {"key": "sync_enabled", "value": str(_sync_enabled).lower()}).execute()
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not persist sync_enabled: {e}")
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/toggle/reconcile")
+async def toggle_reconcile():
+    global _reconcile_enabled
+    _reconcile_enabled = not _reconcile_enabled
+    state = "enabled" if _reconcile_enabled else "disabled"
+    logging.getLogger(__name__).info(f"Reconcile {state} via dashboard toggle")
+    history.record(direction="system", event="config",
+                   description=f"Reconcile {state} via dashboard")
+    client = history._get_client()
+    if client:
+        try:
+            client.table("settings").upsert(
+                {"key": "reconcile_enabled", "value": str(_reconcile_enabled).lower()}).execute()
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not persist reconcile_enabled: {e}")
     return RedirectResponse("/", status_code=303)
 
 
@@ -474,6 +522,8 @@ async def dashboard(request: Request):
     status_color = "#22c55e" if _sync_enabled else "#f59e0b"
     status_text  = "Live" if _sync_enabled else "Paused"
     status_sub   = "Sync active" if _sync_enabled else "Webhooks received but not processed"
+    reconcile_label = "Disable Reconcile" if _reconcile_enabled else "Enable Reconcile"
+    reconcile_color = "#f59e0b" if _reconcile_enabled else "#22c55e"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -654,9 +704,14 @@ async def dashboard(request: Request):
     <div class="dot"></div>
     <h1>Jira ↔ Lark Webhook Sync</h1>
   </div>
-  <form method="post" action="/toggle">
-    <button class="toggle-btn" type="submit">{toggle_label}</button>
-  </form>
+  <div style="display:flex;gap:8px">
+    <form method="post" action="/toggle">
+      <button class="toggle-btn" type="submit">{toggle_label}</button>
+    </form>
+    <form method="post" action="/toggle/reconcile">
+      <button class="toggle-btn" style="background:{reconcile_color}" type="submit">{reconcile_label}</button>
+    </form>
+  </div>
 </div>
 <div class="main">
 

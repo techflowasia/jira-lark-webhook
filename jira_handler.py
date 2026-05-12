@@ -3,7 +3,7 @@ import logging
 import lark_api, index, dedup, history, field_mappings, config
 from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END, F_PARENT,
-                    JIRA_TO_LARK_ASSIGNEE)
+                    F_RELEASE, JIRA_TO_LARK_ASSIGNEE)
 from utils import _jira_datetime_to_lark_ts
 
 log = logging.getLogger(__name__)
@@ -11,6 +11,7 @@ log = logging.getLogger(__name__)
 RELEVANT_CHANGELOG_FIELDS = {
     "summary", "assignee", "customfield_10016",
     "customfield_10175", "customfield_10176", "status", "parent",
+    "customfield_10020",  # Sprint → Release
 }
 
 
@@ -51,6 +52,8 @@ def _handle_create(issue: dict, cfg: dict) -> None:
     actual_end = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
     parent_jira_key = (jf.get("parent") or {}).get("key")
     parent_record_id = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
+    sprint_data = jf.get("customfield_10020") or []
+    sprint_name = sprint_data[0].get("name") if sprint_data else None
 
     fields = {
         F_TITLE:    jf.get("summary", ""),
@@ -64,6 +67,7 @@ def _handle_create(issue: dict, cfg: dict) -> None:
     if actual_start:     fields[F_ACTUAL_START] = actual_start
     if actual_end:       fields[F_ACTUAL_END]   = actual_end
     if parent_record_id: fields[F_PARENT]       = [parent_record_id]
+    if sprint_name:      fields[F_RELEASE]      = sprint_name
 
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], fields)
@@ -83,12 +87,12 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
         return
 
     items = changelog.get("items", [])
-    if not any(item.get("field") in RELEVANT_CHANGELOG_FIELDS for item in items):
+    if not any((item.get("fieldId") or item.get("field")) in RELEVANT_CHANGELOG_FIELDS for item in items):
         return
 
     updates: dict = {}
     for item in items:
-        field = item.get("field")
+        field = item.get("fieldId") or item.get("field")
         to_str = item.get("toString")
         to_raw = item.get("to")
 
@@ -125,10 +129,14 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
             if parent_record_id:
                 updates[F_PARENT] = [parent_record_id]
 
+        elif field == "customfield_10020":
+            if to_str:
+                updates[F_RELEASE] = to_str
+
     # Apply custom (non-system) Jira → Lark mappings from changelog
     custom_j2l = {m["jira_field"]: m for m in field_mappings.get_custom_jira_to_lark()}
     for item in items:
-        jf = item.get("field")
+        jf = item.get("fieldId") or item.get("field")
         if jf in custom_j2l and jf not in RELEVANT_CHANGELOG_FIELDS:
             m = custom_j2l[jf]
             to_str = item.get("toString")
@@ -143,7 +151,7 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"],
                            record_id, updates)
     desc = ", ".join(f"{item.get('field')}: {item.get('toString','')}" for item in items
-                     if item.get("field") in RELEVANT_CHANGELOG_FIELDS)
+                     if (item.get("fieldId") or item.get("field")) in RELEVANT_CHANGELOG_FIELDS)
     log.info(f"jira_handler: updated Lark {record_id} from Jira {key} — {desc}")
     history.record(direction="jira→lark", event="updated", jira_key=key, lark_id=record_id,
                    description=desc or "updated")
