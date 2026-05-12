@@ -191,7 +191,7 @@ def _handle_delete(key: str, itype: str, cfg: dict) -> None:
             itype = _lark_select(rec["fields"].get(F_TYPE)) or ""
     except Exception:
         pass
-    dedup.mark(f"lark:{record_id}")
+    dedup.mark(f"lark_delete:{record_id}")
     try:
         lark_api.delete_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], record_id)
     except Exception as e:

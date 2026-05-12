@@ -114,7 +114,7 @@ def test_delete_removes_lark_record(mock_lark):
 
     mock_lark.delete_record.assert_called_once()
     assert "PROJ-1" not in index._jira_to_lark
-    assert dedup.is_ours("lark:recDEL")
+    assert dedup.is_ours("lark_delete:recDEL")
 
 
 @patch("jira_handler.lark_api")

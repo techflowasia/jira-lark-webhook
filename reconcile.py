@@ -44,7 +44,7 @@ def run(cfg: dict) -> None:
             if rec["record_id"] == keeper["record_id"]:
                 continue
             rid = rec["record_id"]
-            dedup.mark(f"lark:{rid}")
+            dedup.mark(f"lark_delete:{rid}")
             try:
                 lark_api.delete_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
                 log.warning(f'Reconcile: deleted duplicate Lark {rid} (kept {keeper["record_id"]} for {jk}) — "{_lark_text(rec["fields"].get(F_TITLE))}"')
@@ -61,7 +61,7 @@ def run(cfg: dict) -> None:
         for jk, rec in to_delete:
             rid = rec["record_id"]
             title = _lark_text(rec["fields"].get(F_TITLE)) or ""
-            dedup.mark(f"lark:{rid}")
+            dedup.mark(f"lark_delete:{rid}")
             try:
                 lark_api.delete_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
                 index.remove_by_jira(jk)
@@ -189,7 +189,7 @@ def backfill(cfg: dict) -> dict:
             if rec["record_id"] == keeper["record_id"]:
                 continue
             rid = rec["record_id"]
-            dedup.mark(f"lark:{rid}")
+            dedup.mark(f"lark_delete:{rid}")
             try:
                 lark_api.delete_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
                 removed_duplicates += 1

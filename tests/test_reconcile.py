@@ -110,7 +110,7 @@ def test_delete_orphaned_lark_record(mock_lark, mock_jira):
     mock_lark.delete_record.assert_called_once()
     deleted_rid = mock_lark.delete_record.call_args[0][3]
     assert deleted_rid == "recABC"
-    assert dedup.is_ours("lark:recABC")
+    assert dedup.is_ours("lark_delete:recABC")
 
 
 @patch("reconcile.jira_api")

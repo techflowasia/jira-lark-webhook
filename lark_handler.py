@@ -280,8 +280,12 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
 
 
 def _handle_delete(rid: str, cfg: dict) -> None:
-    if dedup.is_ours(f"lark:{rid}"):
-        log.info(f"lark_handler: skipping delete {rid} — dedup (triggered by our own reconcile)")
+    # `lark_delete:{rid}` is marked only when our code deletes a Lark record
+    # (jira_handler cascade, reconcile cleanup). We must NOT use `lark:{rid}`
+    # here — that key is also marked when we write/update a record, which would
+    # cause user-initiated deletes within 120 s of a write to be silently dropped.
+    if dedup.is_ours(f"lark_delete:{rid}"):
+        log.info(f"lark_handler: skipping delete {rid} — dedup (delete originated from our code)")
         return
 
     jira_key = index._lark_to_jira.get(rid)

@@ -241,6 +241,40 @@ def test_create_defers_silently_when_type_missing(mock_lark, mock_jira):
 
 @patch("lark_handler.jira_api")
 @patch("lark_handler.lark_api")
+def test_delete_proceeds_when_lark_write_dedup_marked(mock_lark, mock_jira):
+    """Regression: user deletes a Lark record shortly after our code wrote to it.
+    The `lark:{rid}` write-loopback mark must NOT silence the delete — only the
+    `lark_delete:{rid}` mark should do that."""
+    index._lark_to_jira["recDel"] = "PROJ-30"
+    index._jira_to_lark["PROJ-30"] = "recDel"
+    # Simulate our recent write to the record (e.g. just wrote Jira Key back)
+    dedup.mark("lark:recDel")
+    mock_lark.get_record.side_effect = Exception("not found")  # truly gone
+    mock_jira.get_issue.return_value = {"fields": {"issuetype": {"name": "Task"}}}
+
+    import lark_handler
+    lark_handler.process({"action": "record_deleted", "record_id": "recDel"}, "tbl", CFG)
+
+    mock_jira.delete_issue.assert_called_once_with(CFG, "PROJ-30")
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_delete_skipped_when_delete_dedup_marked(mock_lark, mock_jira):
+    """The `lark_delete:{rid}` mark (set when our code deleted the record itself,
+    e.g. reconcile or Jira-cascade) must skip the delete handler."""
+    index._lark_to_jira["recDel2"] = "PROJ-31"
+    index._jira_to_lark["PROJ-31"] = "recDel2"
+    dedup.mark("lark_delete:recDel2")
+
+    import lark_handler
+    lark_handler.process({"action": "record_deleted", "record_id": "recDel2"}, "tbl", CFG)
+
+    mock_jira.delete_issue.assert_not_called()
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
 def test_delete_cascades_to_jira(mock_lark, mock_jira):
     """Lark record deletion cascades to delete the linked Jira issue."""
     index._lark_to_jira["rec004"] = "PROJ-9"
