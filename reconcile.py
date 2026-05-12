@@ -79,8 +79,7 @@ def run(cfg: dict) -> None:
 
         assignee_name = (jf.get("assignee") or {}).get("displayName")
         lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
-        sp = jf.get("customfield_10016")
-        sp_str = _sp_to_str(sp)
+        sp_num = _sp_to_num(jf.get("customfield_10016"))
         jira_status = (jf.get("status") or {}).get("name")
         actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
         actual_end = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
@@ -95,8 +94,10 @@ def run(cfg: dict) -> None:
 
             if lark_assignee and _lark_select(rec["fields"].get(F_ASSIGNEE)) != lark_assignee:
                 updates[F_ASSIGNEE] = [lark_assignee]
-            if sp_str is not None and str(rec["fields"].get(F_MD) or "") != sp_str:
-                updates[F_MD] = sp_str
+            cur_md = rec["fields"].get(F_MD)
+            cur_md_num = cur_md if isinstance(cur_md, (int, float)) else None
+            if sp_num != cur_md_num:
+                updates[F_MD] = sp_num
             if jira_status and _lark_text(rec["fields"].get(F_JIRA_STATUS)) != jira_status:
                 updates[F_JIRA_STATUS] = jira_status
             if actual_start is not None and rec["fields"].get(F_ACTUAL_START) != actual_start:
@@ -122,12 +123,12 @@ def run(cfg: dict) -> None:
                 F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{key}",
                 F_TYPE:     itype,
             }
-            if lark_assignee: fields[F_ASSIGNEE]     = [lark_assignee]
-            if sp_str:        fields[F_MD]           = sp_str
-            if jira_status:   fields[F_JIRA_STATUS]  = jira_status
-            if actual_start:  fields[F_ACTUAL_START] = actual_start
-            if actual_end:    fields[F_ACTUAL_END]   = actual_end
-            if parent_rid:    fields[F_PARENT]       = [parent_rid]
+            if lark_assignee:      fields[F_ASSIGNEE]     = [lark_assignee]
+            if sp_num is not None: fields[F_MD]           = sp_num
+            if jira_status:        fields[F_JIRA_STATUS]  = jira_status
+            if actual_start:       fields[F_ACTUAL_START] = actual_start
+            if actual_end:         fields[F_ACTUAL_END]   = actual_end
+            if parent_rid:         fields[F_PARENT]       = [parent_rid]
             try:
                 rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"],
                                              cfg["LARK_TABLE_ID"], fields)
@@ -256,7 +257,7 @@ def backfill(cfg: dict) -> dict:
             continue
         assignee_name = (jf.get("assignee") or {}).get("displayName")
         lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
-        sp_str = _sp_to_str(jf.get("customfield_10016"))
+        sp_num = _sp_to_num(jf.get("customfield_10016"))
         jira_status = (jf.get("status") or {}).get("name")
         actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
         actual_end   = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
@@ -268,12 +269,12 @@ def backfill(cfg: dict) -> dict:
             F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{key}",
             F_TYPE:     itype,
         }
-        if lark_assignee: fields[F_ASSIGNEE]     = [lark_assignee]
-        if sp_str:        fields[F_MD]           = sp_str
-        if jira_status:   fields[F_JIRA_STATUS]  = jira_status
-        if actual_start:  fields[F_ACTUAL_START] = actual_start
-        if actual_end:    fields[F_ACTUAL_END]   = actual_end
-        if parent_rid:    fields[F_PARENT]       = [parent_rid]
+        if lark_assignee:      fields[F_ASSIGNEE]     = [lark_assignee]
+        if sp_num is not None: fields[F_MD]           = sp_num
+        if jira_status:        fields[F_JIRA_STATUS]  = jira_status
+        if actual_start:       fields[F_ACTUAL_START] = actual_start
+        if actual_end:         fields[F_ACTUAL_END]   = actual_end
+        if parent_rid:         fields[F_PARENT]       = [parent_rid]
         try:
             rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], fields)
             dedup.mark(f"lark:{rid}")
@@ -335,7 +336,7 @@ def backfill(cfg: dict) -> dict:
         cur = lark_rec["fields"]
         assignee_name = (jf.get("assignee") or {}).get("displayName")
         lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
-        sp_str = _sp_to_str(jf.get("customfield_10016"))
+        sp_num = _sp_to_num(jf.get("customfield_10016"))
         jira_status  = (jf.get("status") or {}).get("name")
         actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
         actual_end   = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
@@ -346,8 +347,10 @@ def backfill(cfg: dict) -> dict:
         updates: dict = {}
         if lark_assignee and _lark_select(cur.get(F_ASSIGNEE)) != lark_assignee:
             updates[F_ASSIGNEE] = [lark_assignee]
-        if sp_str is not None and str(cur.get(F_MD) or "") != sp_str:
-            updates[F_MD] = sp_str
+        cur_md = cur.get(F_MD)
+        cur_md_num = cur_md if isinstance(cur_md, (int, float)) else None
+        if sp_num != cur_md_num:
+            updates[F_MD] = sp_num
         if jira_status and _lark_text(cur.get(F_JIRA_STATUS)) != jira_status:
             updates[F_JIRA_STATUS] = jira_status
         if actual_start is not None and cur.get(F_ACTUAL_START) != actual_start:
@@ -382,11 +385,14 @@ def backfill(cfg: dict) -> dict:
     return result
 
 
-def _sp_to_str(val) -> "str | None":
-    if val is None:
+def _sp_to_num(val):
+    """Story points → numeric value for Lark Bitable number field.
+
+    Returns int when whole (5), float otherwise (0.5), or None if not numeric."""
+    if val is None or val == "":
         return None
     try:
         f = float(val)
-        return str(int(f)) if f == int(f) else str(f)
     except (TypeError, ValueError):
         return None
+    return int(f) if f == int(f) else f

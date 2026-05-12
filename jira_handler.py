@@ -46,8 +46,7 @@ def _handle_create(issue: dict, cfg: dict) -> None:
 
     assignee_name = (jf.get("assignee") or {}).get("displayName")
     lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
-    sp = jf.get("customfield_10016")
-    sp_str = _sp_to_str(sp)
+    sp_num = _sp_to_num(jf.get("customfield_10016"))
     jira_status = (jf.get("status") or {}).get("name")
     actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
     actual_end = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
@@ -62,8 +61,8 @@ def _handle_create(issue: dict, cfg: dict) -> None:
         F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{key}",
         F_TYPE:     itype,
     }
-    if lark_assignee:    fields[F_ASSIGNEE]     = [lark_assignee]
-    if sp_str:           fields[F_MD]           = sp_str
+    if lark_assignee:        fields[F_ASSIGNEE]     = [lark_assignee]
+    if sp_num is not None:   fields[F_MD]           = sp_num
     if jira_status:      fields[F_JIRA_STATUS]  = jira_status
     if actual_start:     fields[F_ACTUAL_START] = actual_start
     if actual_end:       fields[F_ACTUAL_END]   = actual_end
@@ -117,9 +116,11 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
                 updates[F_ASSIGNEE] = [lark_a] if lark_a else None
 
         elif field == "customfield_10016":
-            sp_str = _sp_to_str(to_str)
-            if sp_str is not None:
-                updates[F_MD] = sp_str
+            sp_num = _sp_to_num(to_str)
+            cur = lark_fields.get(F_MD)
+            cur_num = cur if isinstance(cur, (int, float)) else None
+            if sp_num != cur_num:
+                updates[F_MD] = sp_num  # may be None to clear
 
         elif field == "customfield_10175":
             ts = _jira_datetime_to_lark_ts(to_raw or to_str)
@@ -198,11 +199,16 @@ def _handle_delete(key: str, itype: str, cfg: dict) -> None:
                    description=f'Deleted Lark record for {key}: "{title}"', type=itype)
 
 
-def _sp_to_str(val) -> "str | None":
-    if val is None:
+def _sp_to_num(val):
+    """Story points → numeric value Lark Bitable accepts (int when whole, else float).
+
+    Lark number fields reject strings (NumberFieldConvFail). Returns None when
+    Jira sends null/empty/non-numeric so the caller can decide whether to clear
+    or skip."""
+    if val is None or val == "":
         return None
     try:
         f = float(val)
-        return str(int(f)) if f == int(f) else str(f)
     except (TypeError, ValueError):
         return None
+    return int(f) if f == int(f) else f

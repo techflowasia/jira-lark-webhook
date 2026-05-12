@@ -119,10 +119,25 @@ def test_delete_removes_lark_record(mock_lark):
 
 @patch("jira_handler.lark_api")
 def test_story_points_formatted_correctly(mock_lark):
+    """Lark number field requires numeric value — strings raise NumberFieldConvFail."""
     index._jira_to_lark["PROJ-1"] = "recSP"
     mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {"R. MD": 0}}
     changelog = {"items": [{"field": "customfield_10016", "toString": "5.0", "to": None}]}
     import jira_handler
     jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
     fields = mock_lark.update_record.call_args[0][4]
-    assert fields["R. MD"] == "5"
+    assert fields["R. MD"] == 5
+    assert isinstance(fields["R. MD"], int)
+
+
+@patch("jira_handler.lark_api")
+def test_story_points_skipped_when_value_matches(mock_lark):
+    """Don't write when current Lark value already matches Jira value."""
+    index._jira_to_lark["PROJ-1"] = "recSP"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {"R. MD": 5}}
+    changelog = {"items": [{"field": "customfield_10016", "toString": "5.0", "to": None}]}
+    import jira_handler
+    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+    mock_lark.update_record.assert_not_called()

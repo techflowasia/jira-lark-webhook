@@ -32,7 +32,7 @@ LARK_RECORD = {
         "Jira URL": "https://test.atlassian.net/browse/PROJ-1",
         "Type": "Epic",
         "Assignee": [{"text": "Tawan"}],
-        "R. MD": "5",
+        "R. MD": 5,
         "Jira status": "To Do",
         "Actual start date": None,
         "Actual end date": None,
@@ -62,7 +62,7 @@ def test_create_missing_lark_record(mock_lark, mock_jira):
     assert fields["Title"] == "My Epic"
     assert fields["Jira Key"] == "PROJ-1"
     assert fields["Assignee"] == ["Tawan"]
-    assert fields["R. MD"] == "5"
+    assert fields["R. MD"] == 5
     assert dedup.is_ours("lark:recNEW")
     assert index._jira_to_lark.get("PROJ-1") == "recNEW"
 
@@ -147,10 +147,11 @@ def test_safety_guard_blocks_mass_delete(mock_lark, mock_jira):
 @patch("reconcile.jira_api")
 @patch("reconcile.lark_api")
 def test_story_points_int_formatting(mock_lark, mock_jira):
+    """Lark number field requires numeric value — strings raise NumberFieldConvFail."""
     issue = {**JIRA_ISSUE, "fields": {**JIRA_ISSUE["fields"], "customfield_10016": 3.0}}
     stale_rec = {**LARK_RECORD, "fields": {**LARK_RECORD["fields"],
                                             "Jira status": "In Progress",
-                                            "R. MD": "0"}}
+                                            "R. MD": 0}}
     mock_lark.get_token.return_value = "tok"
     mock_lark.fetch_all_records.return_value = [stale_rec]
     mock_jira.fetch_all_issues.return_value = [issue]
@@ -159,4 +160,5 @@ def test_story_points_int_formatting(mock_lark, mock_jira):
     reconcile.run(CFG)
 
     fields = mock_lark.update_record.call_args[0][4]
-    assert fields["R. MD"] == "3"
+    assert fields["R. MD"] == 3
+    assert isinstance(fields["R. MD"], int)
