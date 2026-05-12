@@ -230,15 +230,21 @@ def _handle_delete(rid: str, cfg: dict) -> None:
     jira_key = index._lark_to_jira.get(rid)
     if not jira_key:
         return
+    title = ""
+    try:
+        issue = jira_api.get_issue(cfg, jira_key)
+        title = (issue.get("fields") or {}).get("summary", "")
+    except Exception:
+        pass
     dedup.mark(f"jira:{jira_key}")
     try:
         jira_api.delete_issue(cfg, jira_key)
-        log.info(f"lark_handler: deleted Jira {jira_key} (Lark {rid} deleted)")
+        log.info(f'lark_handler: deleted Jira {jira_key} (Lark {rid} deleted) — "{title}"')
         history.record(direction="lark→jira", event="deleted", lark_id=rid,
-                       jira_key=jira_key, description=f"Deleted {jira_key}")
+                       jira_key=jira_key, description=f'Deleted {jira_key}: "{title}"')
     except Exception as e:
         log.error(f"Delete Jira {jira_key}: {e}")
         history.record(direction="lark→jira", event="deleted", lark_id=rid,
-                       jira_key=jira_key, description=f"Delete {jira_key} failed",
+                       jira_key=jira_key, description=f'Delete {jira_key} failed: "{title}"',
                        status="error", error=str(e))
     index.remove_by_jira(jira_key)

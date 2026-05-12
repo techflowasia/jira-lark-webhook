@@ -152,16 +152,22 @@ def _handle_delete(key: str, cfg: dict) -> None:
     record_id = index._jira_to_lark.get(key)
     if not record_id:
         return
-    dedup.mark(f"lark:{record_id}")
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+    title = ""
+    try:
+        rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], record_id)
+        title = _lark_text(rec["fields"].get(F_TITLE)) or ""
+    except Exception:
+        pass
+    dedup.mark(f"lark:{record_id}")
     try:
         lark_api.delete_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], record_id)
     except Exception as e:
         log.error(f"Delete Lark {record_id}: {e}")
     index.remove_by_jira(key)
-    log.info(f"jira_handler: deleted Lark {record_id} (Jira {key} deleted)")
+    log.info(f'jira_handler: deleted Lark {record_id} (Jira {key} deleted) — "{title}"')
     history.record(direction="jira→lark", event="deleted", jira_key=key, lark_id=record_id,
-                   description=f"Deleted Lark record for {key}")
+                   description=f'Deleted Lark record for {key}: "{title}"')
 
 
 def _sp_to_str(val) -> "str | None":
