@@ -159,6 +159,39 @@ def test_update_skips_when_value_matches(mock_lark, mock_jira):
 
 @patch("lark_handler.jira_api")
 @patch("lark_handler.lark_api")
+def test_unlinked_record_edited_routes_to_create(mock_lark, mock_jira):
+    """record_edited on an unlinked row should create the Jira issue, not silently drop.
+    Happens when record_added fired before Type was set, or Lark only emits record_edited."""
+    rec = {**RECORD, "record_id": "recNEW"}
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = rec
+    mock_jira.create_issue.return_value = "PROJ-99"
+    mock_jira.get_account_ids.return_value = {}
+
+    import lark_handler
+    lark_handler.process({"action": "record_edited", "record_id": "recNEW"}, "tbl", CFG)
+
+    mock_jira.create_issue.assert_called_once()
+    assert index._jira_to_lark.get("PROJ-99") == "recNEW"
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_create_defers_silently_when_type_missing(mock_lark, mock_jira):
+    """User created the row but hasn't picked a Type yet — defer without history noise."""
+    rec_no_type = {**RECORD, "fields": {**RECORD["fields"], "Type": None}}
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = rec_no_type
+
+    import lark_handler, history
+    with patch.object(history, "record") as mock_history:
+        lark_handler.process({"action": "record_added", "record_id": "rec001"}, "tbl", CFG)
+        mock_history.assert_not_called()
+    mock_jira.create_issue.assert_not_called()
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
 def test_delete_unlinks_but_preserves_jira_issue(mock_lark, mock_jira):
     index._lark_to_jira["rec004"] = "PROJ-9"
     index._jira_to_lark["PROJ-9"] = "rec004"

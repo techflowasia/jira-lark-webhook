@@ -90,12 +90,17 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
     rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
     log.info(f"lark_handler: record fields keys={list(rec['fields'].keys())}")
 
-    if _lark_text(rec["fields"].get(F_JIRA_KEY)):
-        log.info(f"lark_handler: skipping create {rid} — Jira Key already set")
+    existing_key = _lark_text(rec["fields"].get(F_JIRA_KEY))
+    if existing_key:
+        log.info(f"lark_handler: skipping create {rid} — Jira Key already set ({existing_key})")
+        index.add(existing_key, rid)  # backfill the index so future edits sync
         return
 
     itype = _lark_select(rec["fields"].get(F_TYPE))
     allowed = config.get_allowed_lark_types()
+    if not itype:
+        log.info(f"lark_handler: deferring create {rid} — Type not set yet")
+        return  # silent: user is mid-typing, will retry on next record_edited
     if itype not in allowed:
         log.info(f"lark_handler: skipping create {rid} — type '{itype}' not in {allowed}")
         history.record(direction="lark→jira", event="created", lark_id=rid,
@@ -142,7 +147,11 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
             index.add(jira_key, rid)
             log.info(f"lark_handler: auto-discovered link {rid} → {jira_key}")
         else:
-            log.info(f"lark_handler: skipping update {rid} — not linked to Jira")
+            # No link yet — happens when record_added fired before Type was set
+            # (skipped silently) or when Lark only emits record_edited. Route to
+            # create so the record isn't stranded once it has a valid Type.
+            log.info(f"lark_handler: {rid} not linked — routing to create handler")
+            _handle_create(rid, table_id, cfg)
             return
 
     # Fetch current Jira state — only write a field if the value actually differs
