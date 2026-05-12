@@ -190,6 +190,9 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
 
     # Apply custom (non-system) Lark → Jira mappings
     for m in field_mappings.get_custom_lark_to_jira():
+        if m["jira_field"] == "customfield_10020":
+            # Sprint is set via Agile API (move_to_sprint) — issue update rejects text values
+            continue
         raw = rec["fields"].get(m["lark_field"])
         if raw is None:
             continue
