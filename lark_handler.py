@@ -100,7 +100,7 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
         log.info(f"lark_handler: skipping create {rid} — type '{itype}' not in {allowed}")
         history.record(direction="lark→jira", event="created", lark_id=rid,
                        description=f"Skipped: type '{itype}' not in allowed types",
-                       status="skipped")
+                       status="skipped", type=itype)
         return
 
     title = _lark_text(rec["fields"].get(F_TITLE)) or f"[Lark] {rid}"
@@ -126,7 +126,8 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
     index.add(new_key, rid)
     log.info(f"lark_handler: created Jira {new_key} from Lark {rid}")
     history.record(direction="lark→jira", event="created", lark_id=rid,
-                   jira_key=new_key, description=f"Created {itype}: \"{title}\"")
+                   jira_key=new_key, description=f"Created {itype}: \"{title}\"",
+                   type=itype)
 
 
 def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
@@ -236,8 +237,9 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
 
     desc = ", ".join(changed)
     log.info(f"lark_handler: updated Jira {jira_key} — {desc}")
+    itype_now = _lark_select(rec["fields"].get(F_TYPE)) or ""
     history.record(direction="lark→jira", event="updated", lark_id=rid,
-                   jira_key=jira_key, description=desc)
+                   jira_key=jira_key, description=desc, type=itype_now)
 
 
 def _handle_delete(rid: str, cfg: dict) -> None:

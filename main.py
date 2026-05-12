@@ -480,12 +480,13 @@ async def dashboard(request: Request):
           <td class="ts">{entry["ts"]}</td>
           <td>{direction_badge(entry["direction"])}</td>
           <td>{event_badge(entry["event"])}</td>
+          <td>{entry.get("type") or "—"}</td>
           <td><code>{entry.get("jira_key") or "—"}</code></td>
           <td><code class="small">{entry.get("lark_id") or "—"}</code></td>
           <td>{entry["description"]}{err}</td>
         </tr>"""
     if not rows_html:
-        rows_html = '<tr><td colspan="6" class="empty">No events in this range.</td></tr>'
+        rows_html = '<tr><td colspan="7" class="empty">No events in this range.</td></tr>'
 
     # --- Pagination links ---
     def page_url(p):
@@ -662,9 +663,9 @@ async def dashboard(request: Request):
     table {{ font-size: 12px; min-width: 480px; }}
     th, td {{ padding: 8px 10px; }}
 
-    /* History table: hide Lark Record ID column (cols 5) */
-    #history-table th:nth-child(5),
-    #history-table td:nth-child(5) {{ display: none; }}
+    /* History table: hide Lark Record ID column (col 6) */
+    #history-table th:nth-child(6),
+    #history-table td:nth-child(6) {{ display: none; }}
 
     /* Field mapping table: hide Label + Type columns (cols 3, 5) */
     #field-table th:nth-child(3),
@@ -849,6 +850,7 @@ async def dashboard(request: Request):
           <th>Time</th>
           <th>Direction</th>
           <th>Event</th>
+          <th>Type</th>
           <th>Jira Key</th>
           <th>Lark Record</th>
           <th>Description</th>

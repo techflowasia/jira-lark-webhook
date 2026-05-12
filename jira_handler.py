@@ -4,7 +4,7 @@ import lark_api, index, dedup, history, field_mappings, config
 from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END, F_PARENT,
                     F_RELEASE, JIRA_TO_LARK_ASSIGNEE)
-from utils import _jira_datetime_to_lark_ts, _lark_text, _lark_select
+from utils import _jira_datetime_to_lark_ts, _lark_text, _lark_select, _lark_link_rid
 
 log = logging.getLogger(__name__)
 
@@ -17,6 +17,7 @@ RELEVANT_CHANGELOG_FIELDS = {
 
 def process(event: str, issue: dict, changelog: dict, cfg: dict) -> None:
     key = issue.get("key", "")
+    itype = ((issue.get("fields") or {}).get("issuetype") or {}).get("name", "")
     log.info(f"jira_handler: event={event} key={key}")
     try:
         if event == "jira:issue_created":
@@ -24,11 +25,11 @@ def process(event: str, issue: dict, changelog: dict, cfg: dict) -> None:
         elif event == "jira:issue_updated":
             _handle_update(issue, changelog, cfg)
         elif event == "jira:issue_deleted":
-            _handle_delete(key, cfg)
+            _handle_delete(key, itype, cfg)
     except Exception as e:
         log.error(f"jira_handler.{event} key={key}: {e}", exc_info=True)
         history.record(direction="jira→lark", event=event, jira_key=key,
-                       description=str(e), status="error", error=str(e))
+                       description=str(e), status="error", error=str(e), type=itype)
 
 
 def _handle_create(issue: dict, cfg: dict) -> None:
@@ -75,7 +76,8 @@ def _handle_create(issue: dict, cfg: dict) -> None:
     index.add(key, rid)
     log.info(f"jira_handler: created Lark {rid} from Jira {key}")
     history.record(direction="jira→lark", event="created", jira_key=key, lark_id=rid,
-                   description=f"Created {itype}: \"{jf.get('summary', '')}\"" )
+                   description=f"Created {itype}: \"{jf.get('summary', '')}\"",
+                   type=itype)
 
 
 def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
@@ -133,24 +135,21 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
             if to_str and to_str != _lark_select(lark_fields.get(F_JIRA_STATUS)):
                 updates[F_JIRA_STATUS] = to_str
 
-        elif field == "parent":
-            parent_jira_key = (issue["fields"].get("parent") or {}).get("key")
-            parent_record_id = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
-            if parent_record_id:
-                current_parent_ids = [
-                    (p.get("record_id") or p.get("id"))
-                    for p in (lark_fields.get(F_PARENT) or [])
-                    if isinstance(p, dict)
-                ]
-                if parent_record_id not in current_parent_ids:
-                    updates[F_PARENT] = [parent_record_id]
-
         elif field == "customfield_10020":
             if to_str:
                 current_release = (_lark_text(lark_fields.get(F_RELEASE))
                                    or _lark_select(lark_fields.get(F_RELEASE)))
                 if to_str != current_release:
                     updates[F_RELEASE] = [to_str]
+
+    # Reconcile parent on every update — Jira only fires a 'parent' changelog
+    # item when parent itself changes, so a title-only edit would otherwise miss
+    # back-filling a parent that wasn't in the index at create time (e.g. subtask
+    # synced before its parent task was linked).
+    parent_jira_key = (issue["fields"].get("parent") or {}).get("key")
+    parent_record_id = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
+    if parent_record_id and _lark_link_rid(lark_fields.get(F_PARENT)) != parent_record_id:
+        updates[F_PARENT] = [parent_record_id]
 
     # Apply custom (non-system) Jira → Lark mappings from changelog
     custom_j2l = {m["jira_field"]: m for m in field_mappings.get_custom_jira_to_lark()}
@@ -170,11 +169,12 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     desc = ", ".join(f"{item.get('field')}: {item.get('toString','')}" for item in items
                      if (item.get("fieldId") or item.get("field")) in RELEVANT_CHANGELOG_FIELDS)
     log.info(f"jira_handler: updated Lark {record_id} from Jira {key} — {desc}")
+    itype = ((issue.get("fields") or {}).get("issuetype") or {}).get("name", "")
     history.record(direction="jira→lark", event="updated", jira_key=key, lark_id=record_id,
-                   description=desc or "updated")
+                   description=desc or "updated", type=itype)
 
 
-def _handle_delete(key: str, cfg: dict) -> None:
+def _handle_delete(key: str, itype: str, cfg: dict) -> None:
     record_id = index._jira_to_lark.get(key)
     if not record_id:
         return
@@ -183,6 +183,8 @@ def _handle_delete(key: str, cfg: dict) -> None:
     try:
         rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], record_id)
         title = _lark_text(rec["fields"].get(F_TITLE)) or ""
+        if not itype:
+            itype = _lark_select(rec["fields"].get(F_TYPE)) or ""
     except Exception:
         pass
     dedup.mark(f"lark:{record_id}")
@@ -193,7 +195,7 @@ def _handle_delete(key: str, cfg: dict) -> None:
     index.remove_by_jira(key)
     log.info(f'jira_handler: deleted Lark {record_id} (Jira {key} deleted) — "{title}"')
     history.record(direction="jira→lark", event="deleted", jira_key=key, lark_id=record_id,
-                   description=f'Deleted Lark record for {key}: "{title}"')
+                   description=f'Deleted Lark record for {key}: "{title}"', type=itype)
 
 
 def _sp_to_str(val) -> "str | None":

@@ -30,22 +30,32 @@ def _get_client():
 
 def record(*, direction: str, event: str, lark_id: str = "",
            jira_key: str = "", description: str, status: str = "ok",
-           error: str = "") -> None:
+           error: str = "", type: str = "") -> None:
     ts_str = datetime.now(_TZ7).strftime("%Y-%m-%d %H:%M:%S +07")
     mem = {"ts": ts_str, "direction": direction, "event": event,
-           "lark_id": lark_id, "jira_key": jira_key,
+           "lark_id": lark_id, "jira_key": jira_key, "type": type,
            "description": description, "status": status, "error": error}
     _fallback.appendleft(mem)
 
     client = _get_client()
     if client:
+        payload = {
+            "direction": direction, "event": event,
+            "lark_id": lark_id, "jira_key": jira_key, "type": type,
+            "description": description, "status": status, "error": error,
+        }
         try:
-            client.table("sync_history").insert({
-                "direction": direction, "event": event,
-                "lark_id": lark_id, "jira_key": jira_key,
-                "description": description, "status": status, "error": error,
-            }).execute()
+            client.table("sync_history").insert(payload).execute()
         except Exception as e:
+            msg = str(e)
+            if "type" in msg and ("column" in msg.lower() or "schema" in msg.lower()):
+                payload.pop("type", None)
+                try:
+                    client.table("sync_history").insert(payload).execute()
+                    return
+                except Exception as e2:
+                    log.warning(f"history.record Supabase insert (retry) failed: {e2}")
+                    return
             log.warning(f"history.record Supabase insert failed: {e}")
 
 
