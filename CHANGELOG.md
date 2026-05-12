@@ -1,13 +1,20 @@
 # Project Log — jira-lark-webhook
 
 A reverse-chronological log of every commit on `main`, grouped by date.
-Generated from `git log` on 2026-05-12.
+Generated from `git log` on 2026-05-13.
 
-Total commits: **39**
+Total commits: **41**
 First commit: **2026-05-11** (`075fea5` — initial real-time bidirectional sync)
-Latest commit: **2026-05-12** (`e9337fc` — Type column in sync history)
+Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don't silence deletes)
 
 ---
+
+## 2026-05-13 — Delete cascade + duplicate-create race fixes
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| `910c9cb` | fix | Split lark dedup key (`lark:` for writes, `lark_delete:` for deletes) so a write within 120 s no longer silently swallows a user-initiated delete |
+| `fc67a95` | fix | Per-rid in-flight lock in `lark_handler._handle_create` to prevent duplicate Jira issues from parallel webhook deliveries; reorder dedup+index mark to before Lark write-back; cascade Lark delete → Jira delete (was preserve-only); add matching `dedup.is_ours("jira:")` skip in `jira_handler._handle_delete` |
 
 ## 2026-05-12 — Hardening, loop-prevention, and dashboard polish
 
