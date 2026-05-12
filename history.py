@@ -49,6 +49,12 @@ def record(*, direction: str, event: str, lark_id: str = "",
         except Exception as e:
             msg = str(e)
             if "type" in msg and ("column" in msg.lower() or "schema" in msg.lower()):
+                log.warning(
+                    "history.record: 'type' column missing from sync_history — "
+                    "dropping field and retrying. Run: "
+                    "ALTER TABLE sync_history ADD COLUMN type text; "
+                    "(see migrations/001_add_type_column.sql)"
+                )
                 payload.pop("type", None)
                 try:
                     client.table("sync_history").insert(payload).execute()

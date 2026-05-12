@@ -208,6 +208,54 @@ def test_delete_unlinks_but_preserves_jira_issue(mock_lark, mock_jira):
 
 @patch("lark_handler.jira_api")
 @patch("lark_handler.lark_api")
+def test_delete_records_type_from_jira_issuetype(mock_lark, mock_jira):
+    """Delete history row should populate Type from Jira's issuetype since
+    the Lark record is gone by then."""
+    index._lark_to_jira["rec006"] = "PROJ-12"
+    index._jira_to_lark["PROJ-12"] = "rec006"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.side_effect = Exception("not found")  # truly gone
+    mock_jira.get_issue.return_value = {"fields": {"issuetype": {"name": "Epic"}}}
+
+    import lark_handler, history
+    with patch.object(history, "record") as mock_history:
+        lark_handler.process({"action": "record_deleted", "record_id": "rec006"}, "tbl", CFG)
+        mock_history.assert_called_once()
+        kwargs = mock_history.call_args.kwargs
+        assert kwargs.get("type") == "Epic"
+        assert kwargs.get("event") == "deleted"
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_exception_path_records_type_from_lark(mock_lark, mock_jira):
+    """When an unexpected error fires during processing, the error row in
+    history should still carry the record's Type so the dashboard column
+    isn't blank."""
+    index._lark_to_jira["rec007"] = "PROJ-13"
+    index._jira_to_lark["PROJ-13"] = "rec007"
+    rec = {**RECORD, "record_id": "rec007",
+           "fields": {**RECORD["fields"], "Jira Key": "PROJ-13",
+                      "Type": "Story", "Title": "Some title"}}
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = rec
+    mock_jira.get_issue.return_value = {"fields": {"summary": "old"}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+    mock_jira.update_issue.side_effect = Exception("boom")  # unhandled
+
+    import lark_handler, history
+    with patch.object(history, "record") as mock_history:
+        lark_handler.process({"action": "record_edited", "record_id": "rec007"}, "tbl", CFG)
+        called_kwargs = [c.kwargs for c in mock_history.call_args_list]
+        error_calls = [k for k in called_kwargs if k.get("status") == "error"]
+        assert error_calls, "expected an error row to be recorded"
+        assert error_calls[0].get("type") == "Story"
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
 def test_delete_ignores_spurious_event_when_record_still_exists(mock_lark, mock_jira):
     index._lark_to_jira["rec005"] = "PROJ-10"
     index._jira_to_lark["PROJ-10"] = "rec005"

@@ -75,10 +75,17 @@ def process(action: dict, table_id: str, cfg: dict) -> None:
     except Exception as e:
         log.error(f"lark_handler.{act} rid={rid}: {e}", exc_info=True)
         jira_key = index._lark_to_jira.get(rid, "")
+        itype = ""
+        try:
+            token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+            rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
+            itype = _lark_select(rec["fields"].get(F_TYPE)) or ""
+        except Exception:
+            pass
         history.record(direction="lark→jira", event=act or "unknown",
                        lark_id=rid, jira_key=jira_key,
                        description=f"Lark update error: {e}",
-                       status="error", error=str(e))
+                       status="error", error=str(e), type=itype)
 
 
 def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
@@ -270,9 +277,18 @@ def _handle_delete(rid: str, cfg: dict) -> None:
     except Exception:
         pass  # Record is truly gone — proceed to unlink.
 
+    # Type isn't recoverable from Lark anymore — pull from Jira's issuetype.
+    itype = ""
+    try:
+        itype = ((jira_api.get_issue(cfg, jira_key) or {}).get("fields", {})
+                 .get("issuetype", {}) or {}).get("name", "")
+    except Exception:
+        pass
+
     # Lark record deletion does NOT cascade to Jira — just unlink from index.
     index.remove_by_jira(jira_key)
     log.info(f'lark_handler: Lark {rid} deleted — unlinked {jira_key}, Jira issue preserved')
     history.record(direction="lark→jira", event="deleted", lark_id=rid,
                    jira_key=jira_key,
-                   description=f'Lark record deleted — {jira_key} preserved in Jira')
+                   description=f'Lark record deleted — {jira_key} preserved in Jira',
+                   type=itype)
