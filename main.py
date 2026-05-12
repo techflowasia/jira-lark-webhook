@@ -341,6 +341,16 @@ async def save_sync_types_endpoint(request: Request):
         return {"ok": False, "error": str(e)}
 
 
+@app.post("/api/match-by-title")
+async def api_match_by_title():
+    cfg = get_cfg()
+    try:
+        result = await asyncio.to_thread(reconcile.match_by_title, cfg)
+        return result
+    except Exception as e:
+        return {"matched": 0, "skipped_ambiguous": 0, "pairs": [], "error": str(e)}
+
+
 @app.post("/toggle")
 async def toggle_sync():
     global _sync_enabled
@@ -683,6 +693,19 @@ async def dashboard(request: Request):
     </div>
   </div>
 
+  <div class="section" id="match-by-title-section">
+    <div class="section-header">Match Unlinked Records by Title</div>
+    <div style="padding:12px 20px 4px;color:#94a3b8;font-size:13px">
+      Links existing Lark records to Jira issues by exact title match — useful for records created before the webhook was registered.
+      Ambiguous titles (duplicates on either side) are skipped.
+    </div>
+    <div class="sync-save-row">
+      <button class="sync-save-btn" id="match-btn" onclick="runMatchByTitle()">Match Unlinked by Title</button>
+      <span class="sync-msg" id="match-msg"></span>
+    </div>
+    <div id="match-results" style="display:none;padding:0 20px 16px"></div>
+  </div>
+
   <div class="section">
     <!-- Filter bar -->
     <div class="filter-bar">
@@ -1020,6 +1043,45 @@ async function saveSyncTypes() {{
   setTimeout(function() {{ msg.textContent = ''; }}, 3000);
 }}
 // ── end Sync Types ────────────────────────────────────────────────
+
+// ── Match by Title ────────────────────────────────────────────────
+async function runMatchByTitle() {{
+  var btn = document.getElementById('match-btn');
+  var msg = document.getElementById('match-msg');
+  var results = document.getElementById('match-results');
+  btn.disabled = true;
+  msg.textContent = 'Running…';
+  results.style.display = 'none';
+  results.innerHTML = '';
+  try {{
+    var res = await fetch('/api/match-by-title', {{ method: 'POST' }});
+    var data = await res.json();
+    if (data.error) {{
+      msg.textContent = 'Error: ' + data.error;
+      msg.style.color = '#f87171';
+    }} else {{
+      var parts = [];
+      if (data.matched > 0) parts.push(data.matched + ' matched');
+      else parts.push('No matches found');
+      if (data.skipped_ambiguous > 0) parts.push(data.skipped_ambiguous + ' skipped (ambiguous title)');
+      msg.textContent = parts.join(' · ');
+      msg.style.color = data.matched > 0 ? '#4ade80' : '#94a3b8';
+      if (data.pairs && data.pairs.length > 0) {{
+        var rows = data.pairs.map(function(p) {{
+          return '<tr><td style="padding:4px 12px 4px 0;font-family:monospace;color:#60a5fa">' + p.jira_key + '</td>'
+               + '<td style="padding:4px 0;color:#e2e8f0">' + p.title + '</td></tr>';
+        }}).join('');
+        results.innerHTML = '<table style="font-size:12px;margin-top:8px">' + rows + '</table>';
+        results.style.display = 'block';
+      }}
+    }}
+  }} catch(e) {{
+    msg.textContent = 'Request failed';
+    msg.style.color = '#f87171';
+  }}
+  btn.disabled = false;
+}}
+// ── end Match by Title ────────────────────────────────────────────
 
 async function switchTable(id, name) {{
   if (!confirm('Switch sync to table "' + name + '"?\\nThis will rebuild the index.')) return;

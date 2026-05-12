@@ -11,14 +11,15 @@ def _url(cfg: dict, path: str) -> str:
     return f"https://{cfg['JIRA_DOMAIN']}{path}"
 
 
-def fetch_all_issues(cfg: dict) -> list:
+def fetch_all_issues(cfg: dict, types: "list | None" = None) -> list:
     issues, next_token = [], None
+    type_list = ", ".join(types) if types else "Epic, Story, Task"
     fields = ["summary", "issuetype", "assignee", "customfield_10015",
               "duedate", "customfield_10016", "parent", "status",
               "customfield_10175", "customfield_10176"]
     while True:
         payload = {
-            "jql": f"project={cfg['JIRA_PROJECT']} AND issuetype in (Epic,Story,Task) ORDER BY key ASC",
+            "jql": f"project={cfg['JIRA_PROJECT']} AND issuetype in ({type_list}) ORDER BY key ASC",
             "maxResults": 100,
             "fields": fields,
         }
