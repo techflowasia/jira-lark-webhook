@@ -47,6 +47,8 @@ A bidirectional webhook sync service that keeps Jira issues and Lark Base record
 | `history.py` | Sync event log — writes to Supabase `sync_history`, falls back to in-memory deque |
 | `field_mappings.py` | Configurable field mapping cache — loads from Supabase, falls back to hardcoded defaults |
 | `utils.py` | Field parse helpers: `_lark_text`, `_lark_select`, date/timestamp converters |
+| `migrations/` | One-off SQL migrations for the Supabase schema (run manually in the SQL editor) |
+| `tests/` | pytest suite: `test_dedup.py`, `test_jira_handler.py`, `test_lark_handler.py`, `test_reconcile.py`, `test_utils.py` |
 
 ---
 
@@ -105,7 +107,7 @@ Hardcoded in `main.py` (not secrets — Lark app credentials for the OAuth flow)
 
 | Table | Purpose |
 |-------|---------|
-| `sync_history` | Event log (direction, event, jira_key, lark_id, description, status, error, ts) |
+| `sync_history` | Event log (direction, event, jira_key, lark_id, type, description, status, error, ts). The `type` column (Epic / Story / Task / …) is added by `migrations/001_add_type_column.sql`. |
 | `field_mappings` | Configurable Lark↔Jira field mappings |
 | `settings` | Key-value store: `sync_enabled`, `reconcile_enabled`, `active_table_id`, `active_table_name`, `allowed_jira_types`, `allowed_lark_types` |
 
@@ -157,8 +159,10 @@ Only records/issues whose `Type`/`issuetype` is in the allowed set are synced.
 
 ## Key Design Patterns
 
-### Dedup Loop Prevention (`dedup.py`)
-Before any write to Jira or Lark, the originating key is `dedup.mark()`'d with a 120 s TTL. When the mirrored webhook arrives, `dedup.is_ours()` returns `True` and the handler skips it.
+### Dedup Loop Prevention (`dedup.py` + value comparison)
+Two layers prevent sync loops:
+1. **TTL dedup (`dedup.py`)** — before any write to Jira or Lark, the originating key is `dedup.mark()`'d with a 120 s TTL. When the mirrored webhook arrives within the window, `dedup.is_ours()` returns `True` and the handler skips it. Used for `create` and `delete` paths.
+2. **Value comparison (update handlers)** — for `update` events, the handler fetches the current target-side record and only writes fields whose value actually differs. This is the authoritative loop guard for updates (replaces TTL-only dedup, which dropped legitimate edits made during the TTL window). See `jira_handler._handle_update` and `lark_handler._handle_update`.
 
 ### In-memory Index (`index.py`)
 `_jira_to_lark` and `_lark_to_jira` dicts are rebuilt from all Lark records on startup and updated incrementally on every create/delete. Links discovered at update time (auto-discover via Jira Key field).
@@ -188,4 +192,10 @@ uvicorn main:app --reload --port 10000
 pytest tests/
 ```
 
-Tests are in `tests/` covering: `test_dedup.py`, `test_jira_handler.py`, `test_lark_handler.py`, `test_reconcile.py`.
+Tests are in `tests/` covering: `test_dedup.py`, `test_jira_handler.py`, `test_lark_handler.py`, `test_reconcile.py`, `test_utils.py`.
+
+---
+
+## Project History
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the full commit log grouped by date and feature.
