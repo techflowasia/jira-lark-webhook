@@ -27,6 +27,28 @@ def _lark_text(field_val) -> "str | None":
     return str(field_val) or None
 
 
+def _lark_link_rid(value) -> "str | None":
+    """First linked record_id from a Lark link/two-way-link field.
+
+    Lark v1 Bitable returns link fields as:
+      [{"record_ids": ["rec..."], "text": "...", ...}, ...]
+    Legacy/edge shapes tolerated: {"record_id": "rec..."} or {"id": "rec..."}.
+    """
+    if not value:
+        return None
+    items = value if isinstance(value, list) else [value]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rids = item.get("record_ids")
+        if isinstance(rids, list) and rids:
+            return rids[0]
+        rid = item.get("record_id") or item.get("id")
+        if rid:
+            return rid
+    return None
+
+
 def _lark_select(field_val) -> "str | None":
     if field_val is None:
         return None

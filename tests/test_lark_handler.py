@@ -102,6 +102,43 @@ def test_update_pushes_to_jira(mock_lark, mock_jira):
 
 @patch("lark_handler.jira_api")
 @patch("lark_handler.lark_api")
+def test_update_syncs_parent_with_record_ids_shape(mock_lark, mock_jira):
+    """Lark's v1 Bitable returns link fields with `record_ids` (plural).
+    Regression test for the bug where parent was never written to Jira."""
+    index._lark_to_jira["rec010"] = "PROJ-11"
+    index._jira_to_lark["PROJ-11"] = "rec010"
+    rec = {
+        "record_id": "rec010",
+        "fields": {
+            "Title": "Child story",
+            "Type": "Story",
+            "Jira Key": "PROJ-11",
+            "Parent items": [{
+                "record_ids": ["recEpic"],
+                "table_id": "tbl",
+                "text": "Epic 1",
+                "text_arr": ["Epic 1"],
+                "type": "text",
+            }],
+        },
+    }
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = rec
+    mock_jira.get_issue.return_value = {"fields": {"summary": "Child story", "parent": None}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
+    import lark_handler
+    lark_handler.process({"action": "record_edited", "record_id": "rec010"}, "tbl", CFG)
+
+    mock_jira.update_issue.assert_called_once()
+    fields = mock_jira.update_issue.call_args[0][2]
+    assert fields["parent"] == {"key": "PROJ-10"}, f"expected parent PROJ-10, got {fields.get('parent')}"
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
 def test_update_skips_loop(mock_lark, mock_jira):
     dedup.mark("lark:rec003")
     import lark_handler
@@ -111,13 +148,32 @@ def test_update_skips_loop(mock_lark, mock_jira):
 
 @patch("lark_handler.jira_api")
 @patch("lark_handler.lark_api")
-def test_delete_removes_jira_issue(mock_lark, mock_jira):
+def test_delete_unlinks_but_preserves_jira_issue(mock_lark, mock_jira):
     index._lark_to_jira["rec004"] = "PROJ-9"
     index._jira_to_lark["PROJ-9"] = "rec004"
+    # Simulate record truly gone in Lark (get_record raises)
+    mock_lark.get_record.side_effect = Exception("not found")
 
     import lark_handler
     lark_handler.process({"action": "record_deleted", "record_id": "rec004"}, "tbl", CFG)
 
-    mock_jira.delete_issue.assert_called_once_with(CFG, "PROJ-9")
+    mock_jira.delete_issue.assert_not_called()
     assert "PROJ-9" not in index._jira_to_lark
-    assert dedup.is_ours("jira:PROJ-9")
+    assert "rec004" not in index._lark_to_jira
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_delete_ignores_spurious_event_when_record_still_exists(mock_lark, mock_jira):
+    index._lark_to_jira["rec005"] = "PROJ-10"
+    index._jira_to_lark["PROJ-10"] = "rec005"
+    # Simulate record still alive in Lark (get_record succeeds)
+    mock_lark.get_record.return_value = {"record_id": "rec005", "fields": {}}
+
+    import lark_handler
+    lark_handler.process({"action": "record_deleted", "record_id": "rec005"}, "tbl", CFG)
+
+    mock_jira.delete_issue.assert_not_called()
+    # Index should NOT be unlinked — record is still alive
+    assert "PROJ-10" in index._jira_to_lark
+    assert "rec005" in index._lark_to_jira

@@ -4,7 +4,7 @@ import logging
 import lark_api, jira_api, index, dedup, history, field_mappings, config
 from config import (F_TITLE, F_START, F_END, F_ASSIGNEE, F_JIRA_KEY, F_JIRA_URL,
                     F_TYPE, F_PARENT, F_RELEASE, LARK_TO_JIRA_ASSIGNEE)
-from utils import _lark_text, _lark_select, _lark_ts_to_jira_date, _norm
+from utils import _lark_text, _lark_select, _lark_ts_to_jira_date, _norm, _lark_link_rid
 
 log = logging.getLogger(__name__)
 
@@ -51,12 +51,11 @@ def _get_sprint_map(cfg: dict) -> dict:
 def _resolve_parent(rec: dict) -> "str | None":
     parent_data = rec["fields"].get(F_PARENT) or []
     for item in parent_data:
-        if isinstance(item, dict):
-            parent_rid = item.get("record_id") or item.get("id")
-            if parent_rid:
-                jk = index._lark_to_jira.get(parent_rid)
-                if jk:
-                    return jk
+        rid = _lark_link_rid([item])
+        if rid:
+            jk = index._lark_to_jira.get(rid)
+            if jk:
+                return jk
     return None
 
 
@@ -131,10 +130,6 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
 
 
 def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
-    if dedup.is_ours(f"lark:{rid}"):
-        log.info(f"lark_handler: skipping update {rid} — dedup")
-        return
-
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
 
@@ -149,21 +144,29 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
             log.info(f"lark_handler: skipping update {rid} — not linked to Jira")
             return
 
+    # Fetch current Jira state — only write a field if the value actually differs
+    try:
+        jira_issue = jira_api.get_issue(cfg, jira_key)
+        jira_fields = (jira_issue or {}).get("fields", {})
+    except Exception as e:
+        log.warning(f"lark_handler: could not fetch Jira {jira_key}: {e} — skipping comparison")
+        jira_fields = {}
+
     updates: dict = {}
     changed: list = []
 
     title = _lark_text(rec["fields"].get(F_TITLE))
-    if title:
+    if title and title != jira_fields.get("summary"):
         updates["summary"] = title
         changed.append(f"Title: \"{title}\"")
 
     start = _lark_ts_to_jira_date(rec["fields"].get(F_START))
-    if start:
+    if start and start != jira_fields.get("customfield_10015"):
         updates["customfield_10015"] = start
         changed.append(f"Start: {start}")
 
     end = _lark_ts_to_jira_date(rec["fields"].get(F_END))
-    if end:
+    if end and end != jira_fields.get("duedate"):
         updates["duedate"] = end
         changed.append(f"Due: {end}")
 
@@ -172,21 +175,27 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
         jira_name = LARK_TO_JIRA_ASSIGNEE.get(assignee_lark, "")
         account_id = _get_account_ids(cfg).get(jira_name)
         if account_id:
-            updates["assignee"] = {"id": account_id}
-            changed.append(f"Assignee: {assignee_lark}")
+            current_account_id = (jira_fields.get("assignee") or {}).get("accountId")
+            if account_id != current_account_id:
+                updates["assignee"] = {"id": account_id}
+                changed.append(f"Assignee: {assignee_lark}")
 
     release_raw = (_lark_text(rec["fields"].get(F_RELEASE))
                    or _lark_select(rec["fields"].get(F_RELEASE)))
     if release_raw:
         vid = _get_version_map(cfg).get(_norm(release_raw))
         if vid:
-            updates["fixVersions"] = [{"id": vid}]
-            changed.append(f"Release: {release_raw}")
+            current_version_ids = [v["id"] for v in (jira_fields.get("fixVersions") or [])]
+            if vid not in current_version_ids:
+                updates["fixVersions"] = [{"id": vid}]
+                changed.append(f"Release: {release_raw}")
 
     parent_jira_key = _resolve_parent(rec)
     if parent_jira_key:
-        updates["parent"] = {"key": parent_jira_key}
-        changed.append(f"Parent: {parent_jira_key}")
+        current_parent = (jira_fields.get("parent") or {}).get("key")
+        if parent_jira_key != current_parent:
+            updates["parent"] = {"key": parent_jira_key}
+            changed.append(f"Parent: {parent_jira_key}")
 
     # Apply custom (non-system) Lark → Jira mappings
     for m in field_mappings.get_custom_lark_to_jira():
@@ -214,7 +223,6 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
         log.info(f"lark_handler: no relevant updates for {jira_key}")
         return
 
-    dedup.mark(f"jira:{jira_key}")
     log.info(f"lark_handler: sending to Jira {jira_key} fields={list(updates.keys())}")
     jira_api.update_issue(cfg, jira_key, updates)
 
@@ -233,24 +241,27 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
 
 
 def _handle_delete(rid: str, cfg: dict) -> None:
+    if dedup.is_ours(f"lark:{rid}"):
+        log.info(f"lark_handler: skipping delete {rid} — dedup (triggered by our own reconcile)")
+        return
+
     jira_key = index._lark_to_jira.get(rid)
     if not jira_key:
         return
-    title = ""
+
+    # Verify the record is actually gone — Lark sometimes fires record_deleted spuriously.
     try:
-        issue = jira_api.get_issue(cfg, jira_key)
-        title = (issue.get("fields") or {}).get("summary", "")
+        token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+        lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
+        # Record still exists — spurious event, do nothing.
+        log.warning(f"lark_handler: ignoring spurious record_deleted for {rid} ({jira_key}) — record still exists in Lark")
+        return
     except Exception:
-        pass
-    dedup.mark(f"jira:{jira_key}")
-    try:
-        jira_api.delete_issue(cfg, jira_key)
-        log.info(f'lark_handler: deleted Jira {jira_key} (Lark {rid} deleted) — "{title}"')
-        history.record(direction="lark→jira", event="deleted", lark_id=rid,
-                       jira_key=jira_key, description=f'Deleted {jira_key}: "{title}"')
-    except Exception as e:
-        log.error(f"Delete Jira {jira_key}: {e}")
-        history.record(direction="lark→jira", event="deleted", lark_id=rid,
-                       jira_key=jira_key, description=f'Delete {jira_key} failed: "{title}"',
-                       status="error", error=str(e))
+        pass  # Record is truly gone — proceed to unlink.
+
+    # Lark record deletion does NOT cascade to Jira — just unlink from index.
     index.remove_by_jira(jira_key)
+    log.info(f'lark_handler: Lark {rid} deleted — unlinked {jira_key}, Jira issue preserved')
+    history.record(direction="lark→jira", event="deleted", lark_id=rid,
+                   jira_key=jira_key,
+                   description=f'Lark record deleted — {jira_key} preserved in Jira')

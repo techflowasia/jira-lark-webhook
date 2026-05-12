@@ -4,7 +4,7 @@ import lark_api, index, dedup, history, field_mappings, config
 from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END, F_PARENT,
                     F_RELEASE, JIRA_TO_LARK_ASSIGNEE)
-from utils import _jira_datetime_to_lark_ts
+from utils import _jira_datetime_to_lark_ts, _lark_text, _lark_select
 
 log = logging.getLogger(__name__)
 
@@ -82,13 +82,22 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     key = issue["key"]
     record_id = index._jira_to_lark.get(key)
     if not record_id:
-        return
-    if dedup.is_ours(f"jira:{key}"):
+        log.warning(f"jira_handler: {key} not in index — skipping")
         return
 
     items = changelog.get("items", [])
     if not any((item.get("fieldId") or item.get("field")) in RELEVANT_CHANGELOG_FIELDS for item in items):
         return
+
+    token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+
+    # Fetch current Lark state — only write a field if the value actually differs
+    try:
+        lark_rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], record_id)
+        lark_fields = lark_rec.get("fields", {})
+    except Exception as e:
+        log.warning(f"jira_handler: could not fetch Lark {record_id}: {e} — skipping comparison")
+        lark_fields = {}
 
     updates: dict = {}
     for item in items:
@@ -97,12 +106,13 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
         to_raw = item.get("to")
 
         if field == "summary":
-            if to_str is not None:
+            if to_str is not None and to_str != _lark_text(lark_fields.get(F_TITLE)):
                 updates[F_TITLE] = to_str
 
         elif field == "assignee":
             lark_a = JIRA_TO_LARK_ASSIGNEE.get(to_str) if to_str else None
-            updates[F_ASSIGNEE] = [lark_a] if lark_a else None
+            if lark_a != _lark_select(lark_fields.get(F_ASSIGNEE)):
+                updates[F_ASSIGNEE] = [lark_a] if lark_a else None
 
         elif field == "customfield_10016":
             sp_str = _sp_to_str(to_str)
@@ -111,27 +121,36 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
 
         elif field == "customfield_10175":
             ts = _jira_datetime_to_lark_ts(to_raw or to_str)
-            if ts is not None:
+            if ts is not None and ts != lark_fields.get(F_ACTUAL_START):
                 updates[F_ACTUAL_START] = ts
 
         elif field == "customfield_10176":
             ts = _jira_datetime_to_lark_ts(to_raw or to_str)
-            if ts is not None:
+            if ts is not None and ts != lark_fields.get(F_ACTUAL_END):
                 updates[F_ACTUAL_END] = ts
 
         elif field == "status":
-            if to_str:
+            if to_str and to_str != _lark_select(lark_fields.get(F_JIRA_STATUS)):
                 updates[F_JIRA_STATUS] = to_str
 
         elif field == "parent":
             parent_jira_key = (issue["fields"].get("parent") or {}).get("key")
             parent_record_id = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
             if parent_record_id:
-                updates[F_PARENT] = [parent_record_id]
+                current_parent_ids = [
+                    (p.get("record_id") or p.get("id"))
+                    for p in (lark_fields.get(F_PARENT) or [])
+                    if isinstance(p, dict)
+                ]
+                if parent_record_id not in current_parent_ids:
+                    updates[F_PARENT] = [parent_record_id]
 
         elif field == "customfield_10020":
             if to_str:
-                updates[F_RELEASE] = [to_str]
+                current_release = (_lark_text(lark_fields.get(F_RELEASE))
+                                   or _lark_select(lark_fields.get(F_RELEASE)))
+                if to_str != current_release:
+                    updates[F_RELEASE] = [to_str]
 
     # Apply custom (non-system) Jira → Lark mappings from changelog
     custom_j2l = {m["jira_field"]: m for m in field_mappings.get_custom_jira_to_lark()}
@@ -146,8 +165,6 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     if not updates:
         return
 
-    dedup.mark(f"lark:{record_id}")
-    token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"],
                            record_id, updates)
     desc = ", ".join(f"{item.get('field')}: {item.get('toString','')}" for item in items

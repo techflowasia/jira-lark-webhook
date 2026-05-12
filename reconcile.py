@@ -6,7 +6,7 @@ from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END,
                     F_PARENT, F_START, F_END, F_RELEASE,
                     JIRA_TO_LARK_ASSIGNEE, LARK_TO_JIRA_ASSIGNEE)
-from utils import _lark_text, _lark_select, _jira_datetime_to_lark_ts, _lark_ts_to_jira_date
+from utils import _lark_text, _lark_select, _jira_datetime_to_lark_ts, _lark_ts_to_jira_date, _lark_link_rid
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +85,9 @@ def run(cfg: dict) -> None:
         actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
         actual_end = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
 
+        parent_jira_key = (jf.get("parent") or {}).get("key")
+        parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
+
         if key in lark_by_jira_key:
             rec = lark_by_jira_key[key]
             rid = rec["record_id"]
@@ -100,6 +103,9 @@ def run(cfg: dict) -> None:
                 updates[F_ACTUAL_START] = actual_start
             if actual_end is not None and rec["fields"].get(F_ACTUAL_END) != actual_end:
                 updates[F_ACTUAL_END] = actual_end
+            cur_parent_rid = _lark_link_rid(rec["fields"].get(F_PARENT))
+            if parent_rid and cur_parent_rid != parent_rid:
+                updates[F_PARENT] = [parent_rid]
 
             if updates:
                 dedup.mark(f"lark:{rid}")
@@ -121,6 +127,7 @@ def run(cfg: dict) -> None:
             if jira_status:   fields[F_JIRA_STATUS]  = jira_status
             if actual_start:  fields[F_ACTUAL_START] = actual_start
             if actual_end:    fields[F_ACTUAL_END]   = actual_end
+            if parent_rid:    fields[F_PARENT]       = [parent_rid]
             try:
                 rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"],
                                              cfg["LARK_TABLE_ID"], fields)
@@ -153,6 +160,8 @@ def backfill(cfg: dict) -> dict:
     except Exception as e:
         log.error(f"backfill: fetch failed — {e}")
         raise
+
+    index.rebuild(lark_records)
 
     jira_by_key = {i["key"]: i for i in jira_issues}
     allowed_jira = config.get_allowed_jira_types()
@@ -296,14 +305,8 @@ def backfill(cfg: dict) -> dict:
         assignee_id = account_ids.get(jira_name)
         start = _lark_ts_to_jira_date(rec["fields"].get(F_START))
         end   = _lark_ts_to_jira_date(rec["fields"].get(F_END))
-        parent_jira_key = None
-        for item in (rec["fields"].get(F_PARENT) or []):
-            if isinstance(item, dict):
-                p_rid = item.get("record_id") or item.get("id")
-                if p_rid:
-                    parent_jira_key = index._lark_to_jira.get(p_rid)
-                    if parent_jira_key:
-                        break
+        p_rid = _lark_link_rid(rec["fields"].get(F_PARENT))
+        parent_jira_key = index._lark_to_jira.get(p_rid) if p_rid else None
         dedup.mark(f"lark:{rid}")
         try:
             new_key = jira_api.create_issue(cfg, itype, title,
@@ -353,11 +356,7 @@ def backfill(cfg: dict) -> dict:
             updates[F_ACTUAL_END] = actual_end
         if sprint_name and _lark_select(cur.get(F_RELEASE)) != sprint_name:
             updates[F_RELEASE] = [sprint_name]
-        cur_parent_rid = next(
-            (item.get("record_id") or item.get("id")
-             for item in (cur.get(F_PARENT) or []) if isinstance(item, dict)),
-            None
-        )
+        cur_parent_rid = _lark_link_rid(cur.get(F_PARENT))
         if parent_rid and cur_parent_rid != parent_rid:
             updates[F_PARENT] = [parent_rid]
         if updates:
