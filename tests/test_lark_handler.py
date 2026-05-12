@@ -68,6 +68,55 @@ def test_create_skips_if_dedup_marked(mock_lark, mock_jira):
 
 @patch("lark_handler.jira_api")
 @patch("lark_handler.lark_api")
+def test_create_skips_if_already_in_flight(mock_lark, mock_jira):
+    """Concurrent record_added events for the same rid: only the first proceeds."""
+    import lark_handler
+    lark_handler._create_in_flight.add("rec001")
+    try:
+        lark_handler.process({"action": "record_added", "record_id": "rec001"}, "tbl", CFG)
+        mock_jira.create_issue.assert_not_called()
+        mock_lark.get_record.assert_not_called()
+    finally:
+        lark_handler._create_in_flight.discard("rec001")
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_concurrent_creates_only_one_jira_issue(mock_lark, mock_jira):
+    """Two threads firing record_added for the same rid in parallel → only one Jira issue."""
+    import threading
+    import lark_handler
+
+    started = threading.Event()
+    proceed = threading.Event()
+
+    def slow_get_record(*a, **kw):
+        # First caller blocks here; second caller should already have been bounced.
+        started.set()
+        proceed.wait(timeout=2)
+        return RECORD
+
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.side_effect = slow_get_record
+    mock_jira.create_issue.return_value = "PROJ-77"
+    mock_jira.get_account_ids.return_value = {}
+
+    t1 = threading.Thread(target=lark_handler.process,
+                          args=({"action": "record_added", "record_id": "rec001"}, "tbl", CFG))
+    t2 = threading.Thread(target=lark_handler.process,
+                          args=({"action": "record_added", "record_id": "rec001"}, "tbl", CFG))
+    t1.start()
+    started.wait(timeout=2)  # t1 is inside the lock now
+    t2.start()
+    t2.join(timeout=2)  # t2 should bounce off in-flight check immediately
+    proceed.set()
+    t1.join(timeout=2)
+
+    mock_jira.create_issue.assert_called_once()
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
 def test_create_skips_if_jira_key_already_set(mock_lark, mock_jira):
     rec_with_key = {**RECORD, "fields": {**RECORD["fields"], "Jira Key": "PROJ-1"}}
     mock_lark.get_token.return_value = "tok"
@@ -192,18 +241,41 @@ def test_create_defers_silently_when_type_missing(mock_lark, mock_jira):
 
 @patch("lark_handler.jira_api")
 @patch("lark_handler.lark_api")
-def test_delete_unlinks_but_preserves_jira_issue(mock_lark, mock_jira):
+def test_delete_cascades_to_jira(mock_lark, mock_jira):
+    """Lark record deletion cascades to delete the linked Jira issue."""
     index._lark_to_jira["rec004"] = "PROJ-9"
     index._jira_to_lark["PROJ-9"] = "rec004"
     # Simulate record truly gone in Lark (get_record raises)
     mock_lark.get_record.side_effect = Exception("not found")
+    mock_jira.get_issue.return_value = {"fields": {"issuetype": {"name": "Story"}}}
 
     import lark_handler
     lark_handler.process({"action": "record_deleted", "record_id": "rec004"}, "tbl", CFG)
 
-    mock_jira.delete_issue.assert_not_called()
+    mock_jira.delete_issue.assert_called_once_with(CFG, "PROJ-9")
     assert "PROJ-9" not in index._jira_to_lark
     assert "rec004" not in index._lark_to_jira
+    # The cascading delete marks dedup so Jira's webhook firing back is recognized
+    assert dedup.is_ours("jira:PROJ-9")
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_delete_failure_keeps_index_link(mock_lark, mock_jira):
+    """If the Jira delete fails, we keep the index link so the next reconcile can retry."""
+    index._lark_to_jira["rec008"] = "PROJ-14"
+    index._jira_to_lark["PROJ-14"] = "rec008"
+    mock_lark.get_record.side_effect = Exception("not found")
+    mock_jira.get_issue.return_value = {"fields": {"issuetype": {"name": "Task"}}}
+    mock_jira.delete_issue.side_effect = Exception("Jira 500")
+
+    import lark_handler
+    lark_handler.process({"action": "record_deleted", "record_id": "rec008"}, "tbl", CFG)
+
+    mock_jira.delete_issue.assert_called_once()
+    # Index NOT cleared because Jira delete failed
+    assert "PROJ-14" in index._jira_to_lark
+    assert "rec008" in index._lark_to_jira
 
 
 @patch("lark_handler.jira_api")

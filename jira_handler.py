@@ -176,6 +176,9 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
 
 
 def _handle_delete(key: str, itype: str, cfg: dict) -> None:
+    if dedup.is_ours(f"jira:{key}"):
+        log.info(f"jira_handler: skipping delete {key} — dedup (originated from Lark)")
+        return
     record_id = index._jira_to_lark.get(key)
     if not record_id:
         return

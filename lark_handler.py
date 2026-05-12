@@ -1,5 +1,6 @@
 """Lark Base events → Jira actions."""
 import time
+import threading
 import logging
 import lark_api, jira_api, index, dedup, history, field_mappings, config
 from config import (F_TITLE, F_START, F_END, F_ASSIGNEE, F_JIRA_KEY, F_JIRA_URL,
@@ -11,6 +12,12 @@ log = logging.getLogger(__name__)
 _account_ids_cache: dict = {"data": None, "expires_at": 0}
 _version_cache: dict = {"data": {}, "expires_at": 0}
 _sprint_cache: dict = {"data": {}, "expires_at": 0}
+
+# Serializes concurrent record_added handlers for the same rid. Lark sometimes
+# delivers the same event multiple times in parallel; without this guard each
+# delivery creates its own Jira issue.
+_create_in_flight: set[str] = set()
+_create_lock = threading.Lock()
 
 
 def _get_account_ids(cfg: dict) -> dict:
@@ -89,57 +96,71 @@ def process(action: dict, table_id: str, cfg: dict) -> None:
 
 
 def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
-    if dedup.is_ours(f"lark:{rid}"):
-        log.info(f"lark_handler: skipping create {rid} — dedup")
-        return
+    # Atomically claim this rid. If another handler is already creating for the
+    # same record, skip — Lark delivers duplicate record_added events in parallel.
+    with _create_lock:
+        if rid in _create_in_flight:
+            log.info(f"lark_handler: skipping create {rid} — another handler already in flight")
+            return
+        _create_in_flight.add(rid)
+    try:
+        if dedup.is_ours(f"lark:{rid}"):
+            log.info(f"lark_handler: skipping create {rid} — dedup")
+            return
 
-    token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
-    rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
-    log.info(f"lark_handler: record fields keys={list(rec['fields'].keys())}")
+        token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+        rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
+        log.info(f"lark_handler: record fields keys={list(rec['fields'].keys())}")
 
-    existing_key = _lark_text(rec["fields"].get(F_JIRA_KEY))
-    if existing_key:
-        log.info(f"lark_handler: skipping create {rid} — Jira Key already set ({existing_key})")
-        index.add(existing_key, rid)  # backfill the index so future edits sync
-        return
+        existing_key = _lark_text(rec["fields"].get(F_JIRA_KEY))
+        if existing_key:
+            log.info(f"lark_handler: skipping create {rid} — Jira Key already set ({existing_key})")
+            index.add(existing_key, rid)  # backfill the index so future edits sync
+            return
 
-    itype = _lark_select(rec["fields"].get(F_TYPE))
-    allowed = config.get_allowed_lark_types()
-    if not itype:
-        log.info(f"lark_handler: deferring create {rid} — Type not set yet")
-        return  # silent: user is mid-typing, will retry on next record_edited
-    if itype not in allowed:
-        log.info(f"lark_handler: skipping create {rid} — type '{itype}' not in {allowed}")
+        itype = _lark_select(rec["fields"].get(F_TYPE))
+        allowed = config.get_allowed_lark_types()
+        if not itype:
+            log.info(f"lark_handler: deferring create {rid} — Type not set yet")
+            return  # silent: user is mid-typing, will retry on next record_edited
+        if itype not in allowed:
+            log.info(f"lark_handler: skipping create {rid} — type '{itype}' not in {allowed}")
+            history.record(direction="lark→jira", event="created", lark_id=rid,
+                           description=f"Skipped: type '{itype}' not in allowed types",
+                           status="skipped", type=itype)
+            return
+
+        title = _lark_text(rec["fields"].get(F_TITLE)) or f"[Lark] {rid}"
+        start = _lark_ts_to_jira_date(rec["fields"].get(F_START))
+        end = _lark_ts_to_jira_date(rec["fields"].get(F_END))
+        parent_jira_key = _resolve_parent(rec) if itype in ("Story", "Task") else None
+
+        assignee_lark = _lark_select(rec["fields"].get(F_ASSIGNEE))
+        jira_name = LARK_TO_JIRA_ASSIGNEE.get(assignee_lark, "")
+        assignee_id = _get_account_ids(cfg).get(jira_name)
+
+        new_key = jira_api.create_issue(cfg, itype, title,
+                                         start_date=start, due_date=end,
+                                         assignee_id=assignee_id,
+                                         parent_key=parent_jira_key)
+        # Mark + link BEFORE updating Lark, so the Jira webhook firing back for
+        # this issue is recognized as our own creation even if it arrives before
+        # the lark_api.update_record call below completes.
+        dedup.mark(f"jira:{new_key}")
+        dedup.mark(f"lark:{rid}")
+        index.add(new_key, rid)
+
+        lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid, {
+            F_JIRA_KEY: new_key,
+            F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{new_key}",
+        })
+        log.info(f"lark_handler: created Jira {new_key} from Lark {rid}")
         history.record(direction="lark→jira", event="created", lark_id=rid,
-                       description=f"Skipped: type '{itype}' not in allowed types",
-                       status="skipped", type=itype)
-        return
-
-    title = _lark_text(rec["fields"].get(F_TITLE)) or f"[Lark] {rid}"
-    start = _lark_ts_to_jira_date(rec["fields"].get(F_START))
-    end = _lark_ts_to_jira_date(rec["fields"].get(F_END))
-    parent_jira_key = _resolve_parent(rec) if itype in ("Story", "Task") else None
-
-    assignee_lark = _lark_select(rec["fields"].get(F_ASSIGNEE))
-    jira_name = LARK_TO_JIRA_ASSIGNEE.get(assignee_lark, "")
-    assignee_id = _get_account_ids(cfg).get(jira_name)
-
-    new_key = jira_api.create_issue(cfg, itype, title,
-                                     start_date=start, due_date=end,
-                                     assignee_id=assignee_id,
-                                     parent_key=parent_jira_key)
-    dedup.mark(f"jira:{new_key}")
-
-    dedup.mark(f"lark:{rid}")
-    lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid, {
-        F_JIRA_KEY: new_key,
-        F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{new_key}",
-    })
-    index.add(new_key, rid)
-    log.info(f"lark_handler: created Jira {new_key} from Lark {rid}")
-    history.record(direction="lark→jira", event="created", lark_id=rid,
-                   jira_key=new_key, description=f"Created {itype}: \"{title}\"",
-                   type=itype)
+                       jira_key=new_key, description=f"Created {itype}: \"{title}\"",
+                       type=itype)
+    finally:
+        with _create_lock:
+            _create_in_flight.discard(rid)
 
 
 def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
@@ -275,9 +296,9 @@ def _handle_delete(rid: str, cfg: dict) -> None:
         log.warning(f"lark_handler: ignoring spurious record_deleted for {rid} ({jira_key}) — record still exists in Lark")
         return
     except Exception:
-        pass  # Record is truly gone — proceed to unlink.
+        pass  # Record is truly gone — proceed.
 
-    # Type isn't recoverable from Lark anymore — pull from Jira's issuetype.
+    # Type isn't recoverable from Lark anymore — pull from Jira's issuetype before deleting.
     itype = ""
     try:
         itype = ((jira_api.get_issue(cfg, jira_key) or {}).get("fields", {})
@@ -285,10 +306,22 @@ def _handle_delete(rid: str, cfg: dict) -> None:
     except Exception:
         pass
 
-    # Lark record deletion does NOT cascade to Jira — just unlink from index.
+    # Cascade delete to Jira. Mark dedup first so the jira:issue_deleted webhook
+    # firing back for this delete is recognized as our own.
+    dedup.mark(f"jira:{jira_key}")
+    try:
+        jira_api.delete_issue(cfg, jira_key)
+    except Exception as e:
+        log.error(f"lark_handler: failed to delete Jira {jira_key}: {e}")
+        history.record(direction="lark→jira", event="deleted", lark_id=rid,
+                       jira_key=jira_key,
+                       description=f"Failed to delete Jira {jira_key}: {e}",
+                       status="error", error=str(e), type=itype)
+        return
+
     index.remove_by_jira(jira_key)
-    log.info(f'lark_handler: Lark {rid} deleted — unlinked {jira_key}, Jira issue preserved')
+    log.info(f"lark_handler: Lark {rid} deleted — cascaded delete to Jira {jira_key}")
     history.record(direction="lark→jira", event="deleted", lark_id=rid,
                    jira_key=jira_key,
-                   description=f'Lark record deleted — {jira_key} preserved in Jira',
+                   description=f"Deleted Jira {jira_key} (Lark record deleted)",
                    type=itype)
