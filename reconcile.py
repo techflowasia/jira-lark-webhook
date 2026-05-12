@@ -21,25 +21,35 @@ def run(cfg: dict) -> None:
         log.error(f"Reconcile: fetch failed — {e}")
         return
 
-    # Build lark_by_jira_key, deleting duplicate Lark records (same Jira Key)
-    lark_by_jira_key = {}
+    jira_keys  = {i["key"] for i in jira_issues}
+    jira_by_key = {i["key"]: i for i in jira_issues}
+
+    # Group linked Lark records by Jira Key, resolve duplicates by title match
+    lark_grouped: dict = {}
     for rec in lark_records:
         jk = _lark_text(rec["fields"].get(F_JIRA_KEY))
-        if not jk:
+        if jk:
+            lark_grouped.setdefault(jk, []).append(rec)
+
+    lark_by_jira_key: dict = {}
+    for jk, recs in lark_grouped.items():
+        if len(recs) == 1:
+            lark_by_jira_key[jk] = recs[0]
             continue
-        if jk in lark_by_jira_key:
+        # Keep the record whose title matches the Jira summary; fallback to first
+        jira_summary = (jira_by_key.get(jk, {}).get("fields", {}) or {}).get("summary", "") or ""
+        keeper = next((r for r in recs if _lark_text(r["fields"].get(F_TITLE)) == jira_summary), recs[0])
+        lark_by_jira_key[jk] = keeper
+        for rec in recs:
+            if rec["record_id"] == keeper["record_id"]:
+                continue
             rid = rec["record_id"]
             dedup.mark(f"lark:{rid}")
             try:
                 lark_api.delete_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
-                log.warning(f"Reconcile: deleted duplicate Lark {rid} (key {jk})")
+                log.warning(f"Reconcile: deleted duplicate Lark {rid} (kept {keeper['record_id']} for {jk})")
             except Exception as e:
                 log.error(f"Reconcile: delete duplicate {rid}: {e}")
-        else:
-            lark_by_jira_key[jk] = rec
-
-    jira_keys = {i["key"] for i in jira_issues}
-    jira_by_key = {i["key"]: i for i in jira_issues}
 
     index.rebuild(lark_records)
 
@@ -147,24 +157,34 @@ def backfill(cfg: dict) -> dict:
     allowed_jira = config.get_allowed_jira_types()
     allowed_lark = config.get_allowed_lark_types()
 
-    # ── Step 1: Remove duplicate Lark records (same Jira Key) ────────────
-    lark_by_jira_key: dict = {}
-    removed_duplicates = 0
+    # ── Step 1: Remove duplicate Lark records — keep the one whose title ──
+    #           matches the Jira issue summary; fallback to first seen      ─
+    lark_grouped: dict = {}
     for rec in lark_records:
         jk = _lark_text(rec["fields"].get(F_JIRA_KEY))
-        if not jk:
+        if jk:
+            lark_grouped.setdefault(jk, []).append(rec)
+
+    lark_by_jira_key: dict = {}
+    removed_duplicates = 0
+    for jk, recs in lark_grouped.items():
+        if len(recs) == 1:
+            lark_by_jira_key[jk] = recs[0]
             continue
-        if jk in lark_by_jira_key:
+        jira_summary = (jira_by_key.get(jk, {}).get("fields", {}) or {}).get("summary", "") or ""
+        keeper = next((r for r in recs if _lark_text(r["fields"].get(F_TITLE)) == jira_summary), recs[0])
+        lark_by_jira_key[jk] = keeper
+        for rec in recs:
+            if rec["record_id"] == keeper["record_id"]:
+                continue
             rid = rec["record_id"]
             dedup.mark(f"lark:{rid}")
             try:
                 lark_api.delete_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
                 removed_duplicates += 1
-                log.warning(f"backfill: deleted duplicate Lark {rid} (key {jk})")
+                log.warning(f"backfill: deleted duplicate Lark {rid} (kept {keeper['record_id']} for {jk})")
             except Exception as e:
                 log.error(f"backfill: delete duplicate {rid}: {e}")
-        else:
-            lark_by_jira_key[jk] = rec
 
     # ── Step 2: Match unlinked Lark records to Jira issues by title ───────
     unlinked = [r for r in lark_records if not _lark_text(r["fields"].get(F_JIRA_KEY))]
