@@ -120,7 +120,8 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
                 updates[F_JIRA_STATUS] = to_str
 
         elif field == "parent":
-            parent_record_id = index._jira_to_lark.get(to_str) if to_str else None
+            parent_jira_key = (issue["fields"].get("parent") or {}).get("key")
+            parent_record_id = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
             if parent_record_id:
                 updates[F_PARENT] = [parent_record_id]
 
