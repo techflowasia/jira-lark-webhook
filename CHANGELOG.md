@@ -9,6 +9,12 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
+## 2026-05-14 — Lark 429 retry/backoff
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| _pending_ | fix | Add retry/backoff (Retry-After aware) to all `lark_api` HTTP calls so bursts of `record_edited` webhooks no longer flood the dashboard with 429 "Too Many Requests" errors; stop re-calling Lark from the `lark_handler.process` catch-block when the original failure was itself a Lark API error |
+
 ## 2026-05-13 — Delete cascade + duplicate-create race fixes
 
 | Commit | Type | Summary |

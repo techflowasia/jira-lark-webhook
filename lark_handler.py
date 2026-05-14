@@ -82,13 +82,16 @@ def process(action: dict, table_id: str, cfg: dict) -> None:
     except Exception as e:
         log.error(f"lark_handler.{act} rid={rid}: {e}", exc_info=True)
         jira_key = index._lark_to_jira.get(rid, "")
+        # Don't re-call Lark to recover Type when the failure was itself a Lark
+        # API error — that just adds more load to an already rate-limited API.
         itype = ""
-        try:
-            token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
-            rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
-            itype = _lark_select(rec["fields"].get(F_TYPE)) or ""
-        except Exception:
-            pass
+        if "larksuite.com" not in str(e):
+            try:
+                token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+                rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
+                itype = _lark_select(rec["fields"].get(F_TYPE)) or ""
+            except Exception:
+                pass
         history.record(direction="lark→jira", event=act or "unknown",
                        lark_id=rid, jira_key=jira_key,
                        description=f"Lark update error: {e}",

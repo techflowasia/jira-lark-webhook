@@ -1,17 +1,57 @@
 """Lark OpenAPI client."""
+import logging
+import random
 import time
 import requests
 
+log = logging.getLogger(__name__)
+
 LARK_BASE_URL = "https://open.larksuite.com/open-apis"
 _token_cache = {"token": None, "expires_at": 0}
+
+# Retry policy for transient Lark API failures (429 + 5xx). Active editing
+# generates bursts of record_edited webhooks that each spawn a background
+# handler hitting Lark — without backoff the bitable QPS cap (≈20/sec) trips
+# 429s in a thundering herd.
+_RETRY_STATUSES = {429, 500, 502, 503, 504}
+_MAX_RETRIES = 5
+_BASE_DELAY = 0.5  # seconds; doubles each attempt, capped
+
+
+def _sleep_for(resp: requests.Response, attempt: int) -> float:
+    """Prefer Retry-After when present; otherwise exponential backoff + jitter."""
+    retry_after = resp.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(0.1, float(retry_after))
+        except ValueError:
+            pass
+    return min(_BASE_DELAY * (2 ** attempt), 8.0) + random.uniform(0, 0.25)
+
+
+def _request(method: str, url: str, **kwargs) -> requests.Response:
+    """requests.request wrapper with retry/backoff on 429 + 5xx."""
+    for attempt in range(_MAX_RETRIES):
+        resp = requests.request(method, url, timeout=30, **kwargs)
+        if resp.status_code not in _RETRY_STATUSES:
+            return resp
+        if attempt == _MAX_RETRIES - 1:
+            return resp
+        delay = _sleep_for(resp, attempt)
+        log.warning(
+            "Lark %s %s -> %s; retrying in %.2fs (attempt %d/%d)",
+            method, url, resp.status_code, delay, attempt + 1, _MAX_RETRIES,
+        )
+        time.sleep(delay)
+    return resp
 
 
 def get_token(app_id: str, app_secret: str) -> str:
     now = time.time()
     if _token_cache["token"] and now < _token_cache["expires_at"] - 60:
         return _token_cache["token"]
-    resp = requests.post(f"{LARK_BASE_URL}/auth/v3/app_access_token/internal",
-                         json={"app_id": app_id, "app_secret": app_secret})
+    resp = _request("POST", f"{LARK_BASE_URL}/auth/v3/app_access_token/internal",
+                    json={"app_id": app_id, "app_secret": app_secret})
     resp.raise_for_status()
     data = resp.json()
     _token_cache["token"] = data["tenant_access_token"]
@@ -29,7 +69,7 @@ def fetch_all_records(token: str, base_token: str, table_id: str) -> list:
         params = {"page_size": 200}
         if page_token:
             params["page_token"] = page_token
-        resp = requests.get(
+        resp = _request("GET",
             f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records",
             headers=_headers(token), params=params)
         resp.raise_for_status()
@@ -45,7 +85,7 @@ def fetch_all_records(token: str, base_token: str, table_id: str) -> list:
 
 
 def get_record(token: str, base_token: str, table_id: str, record_id: str) -> dict:
-    resp = requests.get(
+    resp = _request("GET",
         f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records/{record_id}",
         headers=_headers(token))
     resp.raise_for_status()
@@ -57,7 +97,7 @@ def get_record(token: str, base_token: str, table_id: str, record_id: str) -> di
 
 
 def create_record(token: str, base_token: str, table_id: str, fields: dict) -> str:
-    resp = requests.post(
+    resp = _request("POST",
         f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records",
         headers=_headers(token), json={"fields": fields})
     resp.raise_for_status()
@@ -69,7 +109,7 @@ def create_record(token: str, base_token: str, table_id: str, fields: dict) -> s
 
 def update_record(token: str, base_token: str, table_id: str,
                   record_id: str, fields: dict) -> None:
-    resp = requests.put(
+    resp = _request("PUT",
         f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records/{record_id}",
         headers=_headers(token), json={"fields": fields})
     resp.raise_for_status()
@@ -79,7 +119,7 @@ def update_record(token: str, base_token: str, table_id: str,
 
 
 def delete_record(token: str, base_token: str, table_id: str, record_id: str) -> None:
-    resp = requests.delete(
+    resp = _request("DELETE",
         f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records/{record_id}",
         headers=_headers(token))
     resp.raise_for_status()
@@ -90,7 +130,7 @@ def delete_record(token: str, base_token: str, table_id: str, record_id: str) ->
 
 def list_tables(token: str, base_token: str) -> list:
     """Return [{table_id, name}, ...] for all tables in the Base."""
-    resp = requests.get(
+    resp = _request("GET",
         f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables",
         headers=_headers(token), params={"page_size": 100})
     resp.raise_for_status()
@@ -103,7 +143,7 @@ def list_tables(token: str, base_token: str) -> list:
 
 def list_fields(token: str, base_token: str, table_id: str) -> list:
     """Return [{field_name, field_id, type}, ...] for the active table."""
-    resp = requests.get(
+    resp = _request("GET",
         f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
         headers=_headers(token), params={"page_size": 300})
     resp.raise_for_status()
@@ -116,7 +156,7 @@ def list_fields(token: str, base_token: str, table_id: str) -> list:
 
 def get_select_options(token: str, base_token: str, table_id: str, field_name: str) -> list:
     """Return option names for a select field."""
-    resp = requests.get(
+    resp = _request("GET",
         f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
         headers=_headers(token), params={"page_size": 300})
     resp.raise_for_status()
