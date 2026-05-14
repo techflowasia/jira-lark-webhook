@@ -9,6 +9,14 @@ log = logging.getLogger(__name__)
 LARK_BASE_URL = "https://open.larksuite.com/open-apis"
 _token_cache = {"token": None, "expires_at": 0}
 
+# Short-lived cache for table field schemas. The dashboard hits /api/lark-fields
+# on every page load AND on every "+ Add Field" click — schemas rarely change
+# but Lark's bitable QPS cap (~20/s) trips a 429 that even retry/backoff can't
+# clear, leaving the field dropdown stuck on "Loading…". TTL is short so users
+# still see schema edits within a minute.
+_fields_cache: dict = {}
+_FIELDS_TTL = 60.0
+
 # Retry policy for transient Lark API failures (429 + 5xx). Active editing
 # generates bursts of record_edited webhooks that each spawn a background
 # handler hitting Lark — without backoff the bitable QPS cap (≈20/sec) trips
@@ -141,29 +149,43 @@ def list_tables(token: str, base_token: str) -> list:
             for t in data.get("data", {}).get("items", [])]
 
 
-def list_fields(token: str, base_token: str, table_id: str) -> list:
-    """Return [{field_name, field_id, type}, ...] for the active table."""
+def _fetch_field_items(token: str, base_token: str, table_id: str) -> list:
+    """Fetch raw field items for a table, with a short TTL cache."""
+    key = (base_token, table_id)
+    entry = _fields_cache.get(key)
+    now = time.time()
+    if entry and now < entry["expires_at"]:
+        return entry["items"]
     resp = _request("GET",
         f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
         headers=_headers(token), params={"page_size": 300})
     resp.raise_for_status()
     data = resp.json()
     if data.get("code") != 0:
-        raise RuntimeError(f"Lark list_fields error: {data.get('msg')}")
-    return [{"field_name": f["field_name"], "field_id": f["field_id"]}
-            for f in data.get("data", {}).get("items", [])]
+        raise RuntimeError(f"Lark fields error: {data.get('msg')}")
+    items = data.get("data", {}).get("items", [])
+    _fields_cache[key] = {"items": items, "expires_at": now + _FIELDS_TTL}
+    return items
+
+
+def invalidate_fields_cache(base_token=None, table_id=None) -> None:
+    """Drop cached field schemas. Call after switching active table."""
+    if base_token is None or table_id is None:
+        _fields_cache.clear()
+    else:
+        _fields_cache.pop((base_token, table_id), None)
+
+
+def list_fields(token: str, base_token: str, table_id: str) -> list:
+    """Return [{field_name, field_id}, ...] for the active table."""
+    items = _fetch_field_items(token, base_token, table_id)
+    return [{"field_name": f["field_name"], "field_id": f["field_id"]} for f in items]
 
 
 def get_select_options(token: str, base_token: str, table_id: str, field_name: str) -> list:
     """Return option names for a select field."""
-    resp = _request("GET",
-        f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
-        headers=_headers(token), params={"page_size": 300})
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code") != 0:
-        raise RuntimeError(f"Lark get_select_options error: {data.get('msg')}")
-    for f in data.get("data", {}).get("items", []):
+    items = _fetch_field_items(token, base_token, table_id)
+    for f in items:
         if f["field_name"] == field_name:
             options = (f.get("property") or {}).get("options", [])
             return [opt["name"] for opt in options]

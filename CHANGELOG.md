@@ -9,10 +9,12 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
-## 2026-05-14 — Lark 429 retry/backoff
+## 2026-05-14 — Lark 429 retry/backoff + field-schema cache + update coalescing
 
 | Commit | Type | Summary |
 |--------|------|---------|
+| _pending_ | fix | Coalesce concurrent `record_edited` events for the same `rid` in `lark_handler._handle_update` (per-rid in-flight set + pending re-run flag) — Lark frequently fires duplicate edited events that previously raced on `get_record` and tripped per-Base QPS limits, surfacing as 429 errors in the history log even on the first apparent webhook |
+| _pending_ | fix | 60 s TTL cache for `lark_api.list_fields` / `get_select_options` so the dashboard field-mapping dropdown stops getting stuck on "Loading…" when Lark returns 429 on repeat page loads; invalidated when the active table is switched |
 | _pending_ | fix | Add retry/backoff (Retry-After aware) to all `lark_api` HTTP calls so bursts of `record_edited` webhooks no longer flood the dashboard with 429 "Too Many Requests" errors; stop re-calling Lark from the `lark_handler.process` catch-block when the original failure was itself a Lark API error |
 
 ## 2026-05-13 — Delete cascade + duplicate-create race fixes

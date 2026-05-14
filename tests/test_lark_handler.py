@@ -117,6 +117,52 @@ def test_concurrent_creates_only_one_jira_issue(mock_lark, mock_jira):
 
 @patch("lark_handler.jira_api")
 @patch("lark_handler.lark_api")
+def test_concurrent_updates_coalesce_one_extra_pass(mock_lark, mock_jira):
+    """Two threads firing record_edited for the same rid in parallel → second
+    coalesces into a single re-run pass on the in-flight handler instead of
+    racing on get_record (which would otherwise trip Lark 429s)."""
+    import threading
+    import lark_handler
+
+    index._lark_to_jira["recU"] = "PROJ-9"
+    index._jira_to_lark["PROJ-9"] = "recU"
+    rec = {"record_id": "recU",
+           "fields": {"Title": "T", "Type": "Story", "Jira Key": "PROJ-9"}}
+
+    started = threading.Event()
+    proceed = threading.Event()
+
+    def slow_get_record(*a, **kw):
+        if not started.is_set():
+            started.set()
+            proceed.wait(timeout=2)
+        return rec
+
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.side_effect = slow_get_record
+    mock_jira.get_issue.return_value = {"fields": {"summary": "T"}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
+    t1 = threading.Thread(target=lark_handler.process,
+                          args=({"action": "record_edited", "record_id": "recU"}, "tbl", CFG))
+    t2 = threading.Thread(target=lark_handler.process,
+                          args=({"action": "record_edited", "record_id": "recU"}, "tbl", CFG))
+    t1.start()
+    started.wait(timeout=2)
+    t2.start()
+    t2.join(timeout=2)  # bounces off in-flight check, marks pending re-run
+    proceed.set()
+    t1.join(timeout=2)
+
+    # First pass + one coalesced re-run = exactly 2 get_record calls (not 1 per event,
+    # not parallel calls that would race on Lark's QPS cap).
+    assert mock_lark.get_record.call_count == 2
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
 def test_create_skips_if_jira_key_already_set(mock_lark, mock_jira):
     rec_with_key = {**RECORD, "fields": {**RECORD["fields"], "Jira Key": "PROJ-1"}}
     mock_lark.get_token.return_value = "tok"

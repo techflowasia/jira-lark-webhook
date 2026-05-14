@@ -250,6 +250,7 @@ async def set_table(request: Request):
         return {"ok": False, "error": "table_id required"}
 
     set_active_table(table_id, table_name)
+    lark_api.invalidate_fields_cache()
 
     # Persist to Supabase
     client = history._get_client()

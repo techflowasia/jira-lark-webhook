@@ -19,6 +19,16 @@ _sprint_cache: dict = {"data": {}, "expires_at": 0}
 _create_in_flight: set[str] = set()
 _create_lock = threading.Lock()
 
+# Coalesces concurrent record_edited handlers for the same rid. Lark frequently
+# fires several record_edited events for one user edit (and the same event can
+# be delivered twice). Without this guard each delivery races on get_record and
+# the parallel calls trip Lark's per-Base QPS cap (429s in history). When a
+# handler is already in flight, additional events just flag a re-run so the
+# in-flight handler does one more pass with fresh state at the end.
+_update_in_flight: set[str] = set()
+_update_pending: set[str] = set()
+_update_lock = threading.Lock()
+
 
 def _get_account_ids(cfg: dict) -> dict:
     now = time.time()
@@ -167,6 +177,31 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
 
 
 def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
+    # Coalesce duplicate / rapid-fire record_edited events for the same rid into
+    # at most two sequential passes (initial + re-run with fresh state if more
+    # events arrived during processing). Parallel get_records on the same rid
+    # were the main source of 429s in the history log.
+    with _update_lock:
+        if rid in _update_in_flight:
+            _update_pending.add(rid)
+            log.info(f"lark_handler: coalescing update {rid} — handler already in flight")
+            return
+        _update_in_flight.add(rid)
+    try:
+        _handle_update_impl(rid, table_id, cfg)
+        while True:
+            with _update_lock:
+                if rid not in _update_pending:
+                    break
+                _update_pending.discard(rid)
+            _handle_update_impl(rid, table_id, cfg)
+    finally:
+        with _update_lock:
+            _update_in_flight.discard(rid)
+            _update_pending.discard(rid)
+
+
+def _handle_update_impl(rid: str, table_id: str, cfg: dict) -> None:
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
 
