@@ -51,17 +51,32 @@ def _load_toggle_states() -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
+    log = logging.getLogger(__name__)
     cfg = get_cfg()
-    token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
-    records = lark_api.fetch_all_records(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
-    index.rebuild(records)
-    logging.getLogger(__name__).info(f"Index built: {len(index._jira_to_lark)} linked records")
+    # Build the in-memory index, but never let a Lark outage crash startup —
+    # if the bind fails, Render's port scan kills the container and we never
+    # come back. Empty index means new webhooks may arrive unlinked, but the
+    # 30-min reconcile loop and the auto-discover path in _handle_update will
+    # repair the link as soon as Lark recovers.
+    asyncio.create_task(_initial_index_rebuild(cfg))
     asyncio.create_task(_reconcile_loop())
     asyncio.create_task(_keepalive_loop())
     asyncio.create_task(_load_active_table_async())
     asyncio.create_task(asyncio.to_thread(field_mappings.load))
     asyncio.create_task(asyncio.to_thread(_cfg_mod.load_sync_types))
     asyncio.create_task(asyncio.to_thread(_load_toggle_states))
+
+
+async def _initial_index_rebuild(cfg: dict) -> None:
+    log = logging.getLogger(__name__)
+    try:
+        token = await asyncio.to_thread(lark_api.get_token, cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+        records = await asyncio.to_thread(
+            lark_api.fetch_all_records, token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
+        index.rebuild(records)
+        log.info(f"Index built: {len(index._jira_to_lark)} linked records")
+    except Exception as e:
+        log.error(f"Initial index rebuild failed (continuing with empty index): {e}")
 
 
 async def _load_active_table_async() -> None:
