@@ -1256,6 +1256,13 @@ async def debug_index():
     }
 
 
+@app.get("/debug/lark-calls")
+async def debug_lark_calls():
+    """Lark API call counts (this process). Watch this to verify the
+    quota-reduction work. Authoritative monthly figure is the Lark console."""
+    return lark_api.call_stats()
+
+
 @app.post("/debug/rebuild")
 async def debug_rebuild():
     """Force-rebuild the index from all current Lark records."""

@@ -1,13 +1,41 @@
 """Lark OpenAPI client."""
 import logging
 import random
+import threading
 import time
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
 import requests
 
 log = logging.getLogger(__name__)
 
 LARK_BASE_URL = "https://open.larksuite.com/open-apis"
 _token_cache = {"token": None, "expires_at": 0}
+
+# Per-day Lark API call counter (Bangkok day boundary, matching the rest of
+# the project's date handling). In-memory only — resets on process restart;
+# the Lark Developer Console is authoritative for the monthly quota. Exposed
+# at GET /debug/lark-calls to watch the quota-reduction work land.
+_BKK = timezone(timedelta(hours=7))
+_call_counts: dict = defaultdict(int)
+_call_counts_lock = threading.Lock()
+_process_start = time.time()
+
+
+def call_stats() -> dict:
+    """Snapshot of Lark API calls made by this process."""
+    today = datetime.now(_BKK).strftime("%Y-%m-%d")
+    with _call_counts_lock:
+        by_day = dict(_call_counts)
+    month_prefix = today[:7]
+    return {
+        "today": by_day.get(today, 0),
+        "this_month": sum(v for k, v in by_day.items() if k.startswith(month_prefix)),
+        "total_since_start": sum(by_day.values()),
+        "by_day": dict(sorted(by_day.items())),
+        "process_started": datetime.fromtimestamp(_process_start, tz=_BKK)
+                            .strftime("%Y-%m-%d %H:%M:%S +07"),
+    }
 
 # Short-lived cache for table field schemas. The dashboard hits /api/lark-fields
 # on every page load AND on every "+ Add Field" click — schemas rarely change
@@ -39,6 +67,9 @@ def _sleep_for(resp: requests.Response, attempt: int) -> float:
 
 def _request(method: str, url: str, **kwargs) -> requests.Response:
     """requests.request wrapper with retry/backoff on 429 + 5xx."""
+    day = datetime.now(_BKK).strftime("%Y-%m-%d")
+    with _call_counts_lock:
+        _call_counts[day] += 1
     for attempt in range(_MAX_RETRIES):
         resp = requests.request(method, url, timeout=30, **kwargs)
         if resp.status_code not in _RETRY_STATUSES:
