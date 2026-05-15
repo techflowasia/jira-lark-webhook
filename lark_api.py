@@ -92,6 +92,61 @@ def fetch_all_records(token: str, base_token: str, table_id: str) -> list:
     return records
 
 
+def find_modified_time_field(token: str, base_token: str, table_id: str) -> "str | None":
+    """Return the name of the table's 'Last modified time' system field, or None.
+
+    Reuses the 60 s field-schema cache (no extra Lark call). Detected by
+    ui_type 'ModifiedTime' so it works regardless of the user-chosen field
+    name or workspace language. None means the incremental reconcile path
+    is unavailable → callers fall back to a full fetch.
+    """
+    for f in _fetch_field_items(token, base_token, table_id):
+        # Lark represents "Last modified time" as ui_type ModifiedTime /
+        # numeric type 1002. Check both so detection survives API
+        # representation differences and workspace language.
+        if (f.get("ui_type") or "") == "ModifiedTime" or f.get("type") == 1002:
+            return f.get("field_name")
+    return None
+
+
+def search_records_modified_since(token: str, base_token: str, table_id: str,
+                                  modified_field_name: str, since_ts_ms: int) -> list:
+    """Records whose last-modified time is at/after since_ts_ms.
+
+    Uses the bitable records/search endpoint. Lark date filters are
+    day-granular (the timestamp is floored to midnight in the doc timezone),
+    which only over-fetches slightly — acceptable for a safety-net reconcile.
+    """
+    records, page_token = [], None
+    body = {
+        "filter": {
+            "conjunction": "and",
+            "conditions": [{
+                "field_name": modified_field_name,
+                "operator": "isGreater",
+                "value": ["ExactDate", str(int(since_ts_ms))],
+            }],
+        },
+    }
+    while True:
+        params = {"page_size": 200}
+        if page_token:
+            params["page_token"] = page_token
+        resp = _request("POST",
+            f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records/search",
+            headers=_headers(token), params=params, json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Lark search error: {data.get('msg')}")
+        for item in data.get("data", {}).get("items", []):
+            records.append({"record_id": item["record_id"], "fields": item.get("fields", {})})
+        if not data.get("data", {}).get("has_more"):
+            break
+        page_token = data.get("data", {}).get("page_token")
+    return records
+
+
 def get_record(token: str, base_token: str, table_id: str, record_id: str) -> dict:
     resp = _request("GET",
         f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records/{record_id}",

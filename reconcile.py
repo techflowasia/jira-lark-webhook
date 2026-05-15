@@ -1,7 +1,10 @@
-"""30-min safety-net cron: full diff Jira <-> Lark."""
+"""Safety-net reconcile: full diff Jira <-> Lark, with a lightweight
+incremental path between daily full sweeps to stay under the Lark API quota."""
 import logging
+import time
+from datetime import datetime, timezone, timedelta
 from collections import Counter
-import lark_api, jira_api, index, dedup, config
+import lark_api, jira_api, index, dedup, config, history
 from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END,
                     F_PARENT, F_START, F_END, F_RELEASE,
@@ -10,16 +13,143 @@ from utils import _lark_text, _lark_select, _jira_datetime_to_lark_ts, _lark_ts_
 
 log = logging.getLogger(__name__)
 
+# Force a full sweep at least this often. Incremental runs in between only
+# catch create/update drift; deletion-orphan and duplicate cleanup need the
+# whole dataset, so they wait for the daily full sweep.
+_FULL_SWEEP_INTERVAL_MS = 24 * 3600 * 1000
+# Clock-skew safety: query slightly before the last run timestamp.
+_INCREMENTAL_BUFFER_MS = 10 * 60 * 1000
+
+
+def _get_setting(key: str) -> "str | None":
+    client = history._get_client()
+    if not client:
+        return None
+    try:
+        rows = client.table("settings").select("value").eq("key", key).execute()
+        return (rows.data or [{}])[0].get("value") if rows.data else None
+    except Exception as e:
+        log.warning(f"Reconcile: could not read setting {key}: {e}")
+        return None
+
+
+def _set_setting(key: str, value: str) -> None:
+    client = history._get_client()
+    if not client:
+        return
+    try:
+        client.table("settings").upsert({"key": key, "value": value}).execute()
+    except Exception as e:
+        log.warning(f"Reconcile: could not persist setting {key}: {e}")
+
+
+def _ms_to_jira_jql(ts_ms: int) -> str:
+    # Jira JQL accepts "yyyy-MM-dd HH:mm" in the instance timezone. Bangkok
+    # (UTC+7) matches the rest of this project's date handling.
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone(timedelta(hours=7)))
+    return dt.strftime("%Y-%m-%d %H:%M")
+
 
 def run(cfg: dict) -> None:
+    """Dispatcher: full sweep daily, lightweight incremental in between.
+
+    Falls back to a full sweep whenever the incremental path can't be trusted
+    (no modified-time field on the Lark table, no prior timestamp, stale
+    timestamp, or any incremental error) — so behavior degrades safely to the
+    original full reconcile, never to a missed sync.
+    """
     log.info("Reconcile: starting")
     try:
         token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+    except Exception as e:
+        log.error(f"Reconcile: token fetch failed — {e}")
+        return
+
+    now_ms = int(time.time() * 1000)
+    try:
+        last_full = int(_get_setting("last_full_reconcile_ts") or 0)
+    except (TypeError, ValueError):
+        last_full = 0
+    try:
+        last_any = int(_get_setting("last_reconcile_ts") or 0)
+    except (TypeError, ValueError):
+        last_any = 0
+
+    mod_field = None
+    try:
+        mod_field = lark_api.find_modified_time_field(
+            token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
+    except Exception as e:
+        log.warning(f"Reconcile: modified-time field probe failed — {e}")
+
+    use_incremental = bool(
+        mod_field and last_any and last_full
+        and (now_ms - last_full) < _FULL_SWEEP_INTERVAL_MS)
+
+    if use_incremental:
+        since_ms = max(0, last_any - _INCREMENTAL_BUFFER_MS)
+        try:
+            _run_incremental(cfg, token, mod_field, since_ms)
+            _set_setting("last_reconcile_ts", str(now_ms))
+            log.info("Reconcile: incremental done")
+            return
+        except Exception as e:
+            log.error(f"Reconcile: incremental failed ({e}) — falling back to full sweep")
+
+    try:
+        _run_full(cfg, token)
+    except Exception as e:
+        log.error(f"Reconcile: full sweep failed — {e}")
+        return
+    _set_setting("last_full_reconcile_ts", str(now_ms))
+    _set_setting("last_reconcile_ts", str(now_ms))
+
+
+def _run_incremental(cfg: dict, token: str, mod_field: str, since_ms: int) -> None:
+    """Create/update Lark records only for records/issues changed since the
+    last run. Deliberately does NOT remove duplicates or delete orphans —
+    those need the full dataset and are handled by the daily full sweep."""
+    lark_records = lark_api.search_records_modified_since(
+        token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], mod_field, since_ms)
+    since_jql = _ms_to_jira_jql(since_ms)
+    jira_issues = jira_api.fetch_all_issues(
+        cfg, types=list(config.get_allowed_jira_types()), updated_since=since_jql)
+    log.info(f"Reconcile incremental: {len(lark_records)} Lark, "
+             f"{len(jira_issues)} Jira changed since {since_jql}")
+
+    # Lark records that already carry a Jira Key, indexed by key. Records whose
+    # Jira issue changed but whose own row didn't won't be here — fetched
+    # per-issue below so the field diff stays accurate (no blind overwrites).
+    lark_by_jira_key: dict = {}
+    for rec in lark_records:
+        jk = _lark_text(rec["fields"].get(F_JIRA_KEY))
+        if jk:
+            lark_by_jira_key[jk] = rec
+
+    for issue in jira_issues:
+        key = issue["key"]
+        if issue["fields"]["issuetype"]["name"] not in config.get_allowed_jira_types():
+            continue
+        rec = lark_by_jira_key.get(key)
+        if rec is None:
+            rid = index._jira_to_lark.get(key)
+            if rid:
+                try:
+                    rec = lark_api.get_record(
+                        token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
+                except Exception as e:
+                    log.error(f"Reconcile incremental: get_record {rid} ({key}): {e}")
+                    continue
+        _sync_issue_to_lark(cfg, token, issue, rec)
+
+
+def _run_full(cfg: dict, token: str) -> None:
+    try:
         lark_records = lark_api.fetch_all_records(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
         jira_issues = jira_api.fetch_all_issues(cfg, types=list(config.get_allowed_jira_types()))
     except Exception as e:
         log.error(f"Reconcile: fetch failed — {e}")
-        return
+        raise
 
     jira_keys  = {i["key"] for i in jira_issues}
     jira_by_key = {i["key"]: i for i in jira_issues}
@@ -71,74 +201,83 @@ def run(cfg: dict) -> None:
 
     # Create / update Lark records for all Jira issues
     for issue in jira_issues:
-        key = issue["key"]
-        jf = issue["fields"]
-        itype = jf["issuetype"]["name"]
-        if itype not in config.get_allowed_jira_types():
+        if issue["fields"]["issuetype"]["name"] not in config.get_allowed_jira_types():
             continue
-
-        assignee_name = (jf.get("assignee") or {}).get("displayName")
-        lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
-        sp_num = _sp_to_num(jf.get("customfield_10016"))
-        jira_status = (jf.get("status") or {}).get("name")
-        actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
-        actual_end = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
-
-        parent_jira_key = (jf.get("parent") or {}).get("key")
-        parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
-
-        if key in lark_by_jira_key:
-            rec = lark_by_jira_key[key]
-            rid = rec["record_id"]
-            updates = {}
-
-            if lark_assignee and _lark_select(rec["fields"].get(F_ASSIGNEE)) != lark_assignee:
-                updates[F_ASSIGNEE] = [lark_assignee]
-            cur_md = rec["fields"].get(F_MD)
-            cur_md_num = cur_md if isinstance(cur_md, (int, float)) else None
-            if sp_num != cur_md_num:
-                updates[F_MD] = sp_num
-            if jira_status and _lark_text(rec["fields"].get(F_JIRA_STATUS)) != jira_status:
-                updates[F_JIRA_STATUS] = jira_status
-            if actual_start is not None and rec["fields"].get(F_ACTUAL_START) != actual_start:
-                updates[F_ACTUAL_START] = actual_start
-            if actual_end is not None and rec["fields"].get(F_ACTUAL_END) != actual_end:
-                updates[F_ACTUAL_END] = actual_end
-            cur_parent_rid = _lark_link_rid(rec["fields"].get(F_PARENT))
-            if parent_rid and cur_parent_rid != parent_rid:
-                updates[F_PARENT] = [parent_rid]
-
-            if updates:
-                dedup.mark(f"lark:{rid}")
-                try:
-                    lark_api.update_record(token, cfg["LARK_BASE_TOKEN"],
-                                           cfg["LARK_TABLE_ID"], rid, updates)
-                    log.info(f"Reconcile: updated Lark {rid} ({key})")
-                except Exception as e:
-                    log.error(f"Reconcile: update {rid}: {e}")
-        else:
-            fields = {
-                F_TITLE:    jf.get("summary", ""),
-                F_JIRA_KEY: key,
-                F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{key}",
-                F_TYPE:     itype,
-            }
-            if lark_assignee:      fields[F_ASSIGNEE]     = [lark_assignee]
-            if sp_num is not None: fields[F_MD]           = sp_num
-            if jira_status:        fields[F_JIRA_STATUS]  = jira_status
-            if actual_start:       fields[F_ACTUAL_START] = actual_start
-            if actual_end:         fields[F_ACTUAL_END]   = actual_end
-            if parent_rid:         fields[F_PARENT]       = [parent_rid]
-            try:
-                rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"],
-                                             cfg["LARK_TABLE_ID"], fields)
-                dedup.mark(f"lark:{rid}")
-                index.add(key, rid)
-                log.info(f"Reconcile: created Lark {rid} ({key})")
-            except Exception as e:
-                log.error(f"Reconcile: create for {key}: {e}")
+        _sync_issue_to_lark(cfg, token, issue, lark_by_jira_key.get(issue["key"]))
 
     log.info("Reconcile: done")
+
+
+def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") -> None:
+    """Create or field-diff-update the Lark record for one Jira issue.
+
+    `rec` is the existing Lark record ({record_id, fields}) or None to create.
+    Shared verbatim by the full sweep and the incremental path so the two
+    can never diverge. Caller is responsible for the allowed-type check.
+    """
+    key = issue["key"]
+    jf = issue["fields"]
+    itype = jf["issuetype"]["name"]
+
+    assignee_name = (jf.get("assignee") or {}).get("displayName")
+    lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
+    sp_num = _sp_to_num(jf.get("customfield_10016"))
+    jira_status = (jf.get("status") or {}).get("name")
+    actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
+    actual_end = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
+
+    parent_jira_key = (jf.get("parent") or {}).get("key")
+    parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
+
+    if rec is not None:
+        rid = rec["record_id"]
+        updates = {}
+
+        if lark_assignee and _lark_select(rec["fields"].get(F_ASSIGNEE)) != lark_assignee:
+            updates[F_ASSIGNEE] = [lark_assignee]
+        cur_md = rec["fields"].get(F_MD)
+        cur_md_num = cur_md if isinstance(cur_md, (int, float)) else None
+        if sp_num != cur_md_num:
+            updates[F_MD] = sp_num
+        if jira_status and _lark_text(rec["fields"].get(F_JIRA_STATUS)) != jira_status:
+            updates[F_JIRA_STATUS] = jira_status
+        if actual_start is not None and rec["fields"].get(F_ACTUAL_START) != actual_start:
+            updates[F_ACTUAL_START] = actual_start
+        if actual_end is not None and rec["fields"].get(F_ACTUAL_END) != actual_end:
+            updates[F_ACTUAL_END] = actual_end
+        cur_parent_rid = _lark_link_rid(rec["fields"].get(F_PARENT))
+        if parent_rid and cur_parent_rid != parent_rid:
+            updates[F_PARENT] = [parent_rid]
+
+        if updates:
+            dedup.mark(f"lark:{rid}")
+            try:
+                lark_api.update_record(token, cfg["LARK_BASE_TOKEN"],
+                                       cfg["LARK_TABLE_ID"], rid, updates)
+                log.info(f"Reconcile: updated Lark {rid} ({key})")
+            except Exception as e:
+                log.error(f"Reconcile: update {rid}: {e}")
+    else:
+        fields = {
+            F_TITLE:    jf.get("summary", ""),
+            F_JIRA_KEY: key,
+            F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{key}",
+            F_TYPE:     itype,
+        }
+        if lark_assignee:      fields[F_ASSIGNEE]     = [lark_assignee]
+        if sp_num is not None: fields[F_MD]           = sp_num
+        if jira_status:        fields[F_JIRA_STATUS]  = jira_status
+        if actual_start:       fields[F_ACTUAL_START] = actual_start
+        if actual_end:         fields[F_ACTUAL_END]   = actual_end
+        if parent_rid:         fields[F_PARENT]       = [parent_rid]
+        try:
+            rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"],
+                                         cfg["LARK_TABLE_ID"], fields)
+            dedup.mark(f"lark:{rid}")
+            index.add(key, rid)
+            log.info(f"Reconcile: created Lark {rid} ({key})")
+        except Exception as e:
+            log.error(f"Reconcile: create for {key}: {e}")
 
 
 def backfill(cfg: dict) -> dict:

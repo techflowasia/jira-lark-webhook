@@ -162,3 +162,162 @@ def test_story_points_int_formatting(mock_lark, mock_jira):
     fields = mock_lark.update_record.call_args[0][4]
     assert fields["R. MD"] == 3
     assert isinstance(fields["R. MD"], int)
+
+
+# ---- Change D: two-tier dispatcher (full daily, incremental in between) ----
+
+import time as _time
+
+
+@patch("reconcile._set_setting")
+@patch("reconcile._get_setting")
+@patch("reconcile.jira_api")
+@patch("reconcile.lark_api")
+def test_full_sweep_when_no_modified_time_field(mock_lark, mock_jira, mget, mset):
+    """No modified-time field on the table → must do a full sweep."""
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.find_modified_time_field.return_value = None  # field absent
+    now = int(_time.time() * 1000)
+    mget.side_effect = lambda k: str(now - 3600_000)  # recent timestamps
+    mock_lark.fetch_all_records.return_value = []
+    mock_jira.fetch_all_issues.return_value = []
+
+    import reconcile
+    reconcile.run(CFG)
+
+    mock_lark.fetch_all_records.assert_called_once()  # full path
+    mock_lark.search_records_modified_since.assert_not_called()
+
+
+@patch("reconcile._set_setting")
+@patch("reconcile._get_setting")
+@patch("reconcile.jira_api")
+@patch("reconcile.lark_api")
+def test_full_sweep_when_no_prior_timestamp(mock_lark, mock_jira, mget, mset):
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.find_modified_time_field.return_value = "Last modified time"
+    mget.side_effect = lambda k: None  # never reconciled before
+    mock_lark.fetch_all_records.return_value = []
+    mock_jira.fetch_all_issues.return_value = []
+
+    import reconcile
+    reconcile.run(CFG)
+
+    mock_lark.fetch_all_records.assert_called_once()
+    mock_lark.search_records_modified_since.assert_not_called()
+
+
+@patch("reconcile._set_setting")
+@patch("reconcile._get_setting")
+@patch("reconcile.jira_api")
+@patch("reconcile.lark_api")
+def test_full_sweep_when_last_full_is_stale(mock_lark, mock_jira, mget, mset):
+    """Last full sweep > 24 h ago → force a full sweep even if a recent
+    incremental timestamp exists."""
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.find_modified_time_field.return_value = "Last modified time"
+    now = int(_time.time() * 1000)
+    def _g(k):
+        if k == "last_full_reconcile_ts":
+            return str(now - 25 * 3600_000)   # 25 h ago — stale
+        return str(now - 3600_000)            # last_any recent
+    mget.side_effect = _g
+    mock_lark.fetch_all_records.return_value = []
+    mock_jira.fetch_all_issues.return_value = []
+
+    import reconcile
+    reconcile.run(CFG)
+
+    mock_lark.fetch_all_records.assert_called_once()
+    mock_lark.search_records_modified_since.assert_not_called()
+
+
+@patch("reconcile._set_setting")
+@patch("reconcile._get_setting")
+@patch("reconcile.jira_api")
+@patch("reconcile.lark_api")
+def test_incremental_used_when_recent(mock_lark, mock_jira, mget, mset):
+    """mod field + recent full + recent any → incremental path, no full fetch."""
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.find_modified_time_field.return_value = "Last modified time"
+    now = int(_time.time() * 1000)
+    mget.side_effect = lambda k: str(now - 3600_000)  # 1 h ago for both
+    mock_lark.search_records_modified_since.return_value = []
+    mock_jira.fetch_all_issues.return_value = []
+
+    import reconcile
+    reconcile.run(CFG)
+
+    mock_lark.search_records_modified_since.assert_called_once()
+    mock_lark.fetch_all_records.assert_not_called()
+    # Jira fetched incrementally with an updated_since JQL bound.
+    _, kwargs = mock_jira.fetch_all_issues.call_args
+    assert kwargs.get("updated_since")
+    # last_reconcile_ts advanced; last_full_reconcile_ts NOT (no full sweep).
+    keys_set = [c.args[0] for c in mset.call_args_list]
+    assert "last_reconcile_ts" in keys_set
+    assert "last_full_reconcile_ts" not in keys_set
+
+
+@patch("reconcile._set_setting")
+@patch("reconcile._get_setting")
+@patch("reconcile.jira_api")
+@patch("reconcile.lark_api")
+def test_incremental_does_not_delete_orphans(mock_lark, mock_jira, mget, mset):
+    """A Jira issue gone from the changed set must NOT be deleted on the
+    incremental path — orphan cleanup is deferred to the daily full sweep."""
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.find_modified_time_field.return_value = "Last modified time"
+    now = int(_time.time() * 1000)
+    mget.side_effect = lambda k: str(now - 3600_000)
+    # A stale Lark record shows up in the modified set but its Jira issue
+    # isn't in the (empty) changed-issues result.
+    mock_lark.search_records_modified_since.return_value = [LARK_RECORD]
+    mock_jira.fetch_all_issues.return_value = []
+
+    import reconcile
+    reconcile.run(CFG)
+
+    mock_lark.delete_record.assert_not_called()
+
+
+@patch("reconcile._set_setting")
+@patch("reconcile._get_setting")
+@patch("reconcile.jira_api")
+@patch("reconcile.lark_api")
+def test_incremental_falls_back_to_full_on_error(mock_lark, mock_jira, mget, mset):
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.find_modified_time_field.return_value = "Last modified time"
+    now = int(_time.time() * 1000)
+    mget.side_effect = lambda k: str(now - 3600_000)
+    mock_lark.search_records_modified_since.side_effect = RuntimeError("boom")
+    mock_lark.fetch_all_records.return_value = []
+    mock_jira.fetch_all_issues.return_value = []
+
+    import reconcile
+    reconcile.run(CFG)
+
+    mock_lark.fetch_all_records.assert_called_once()  # fell back to full
+
+
+@patch("reconcile._set_setting")
+@patch("reconcile._get_setting")
+@patch("reconcile.jira_api")
+@patch("reconcile.lark_api")
+def test_incremental_buffer_applied(mock_lark, mock_jira, mget, mset):
+    """search since_ms must be last_reconcile_ts minus the 10-min buffer."""
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.find_modified_time_field.return_value = "Last modified time"
+    now = int(_time.time() * 1000)
+    last_any = now - 3600_000
+    def _g(k):
+        return str(last_any) if k == "last_reconcile_ts" else str(now - 3600_000)
+    mget.side_effect = _g
+    mock_lark.search_records_modified_since.return_value = []
+    mock_jira.fetch_all_issues.return_value = []
+
+    import reconcile
+    reconcile.run(CFG)
+
+    since_arg = mock_lark.search_records_modified_since.call_args[0][4]
+    assert since_arg == max(0, last_any - 10 * 60 * 1000)

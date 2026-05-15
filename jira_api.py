@@ -11,15 +11,26 @@ def _url(cfg: dict, path: str) -> str:
     return f"https://{cfg['JIRA_DOMAIN']}{path}"
 
 
-def fetch_all_issues(cfg: dict, types: "list | None" = None) -> list:
+def fetch_all_issues(cfg: dict, types: "list | None" = None,
+                     updated_since: "str | None" = None) -> list:
+    """All project issues of the given types.
+
+    When `updated_since` (JQL datetime string, e.g. "2026-05-15 10:30") is
+    given, only issues updated at/after that time are returned — used by the
+    incremental reconcile path to avoid a full-project scan every run.
+    """
     issues, next_token = [], None
     type_list = ", ".join(types) if types else "Epic, Story, Task"
     fields = ["summary", "issuetype", "assignee", "customfield_10015",
               "duedate", "customfield_10016", "parent", "status",
               "customfield_10175", "customfield_10176", "customfield_10020"]
+    jql = f"project={cfg['JIRA_PROJECT']} AND issuetype in ({type_list})"
+    if updated_since:
+        jql += f' AND updated >= "{updated_since}"'
+    jql += " ORDER BY key ASC"
     while True:
         payload = {
-            "jql": f"project={cfg['JIRA_PROJECT']} AND issuetype in ({type_list}) ORDER BY key ASC",
+            "jql": jql,
             "maxResults": 100,
             "fields": fields,
         }
