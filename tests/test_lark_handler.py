@@ -194,6 +194,182 @@ def test_update_pushes_to_jira(mock_lark, mock_jira):
     assert fields["summary"] == "Updated title"
 
 
+# ---- Change B: webhook after_value fast path (skip get_record) ----
+
+_META = {
+    "fldTitle":  {"name": "Title",            "type": 1,  "options": {}},
+    "fldStart":  {"name": "Timeline - Start",  "type": 5,  "options": {}},
+    "fldType":   {"name": "Type",              "type": 3,
+                  "options": {"optEpic": "Epic", "optStory": "Story"}},
+    "fldAssign": {"name": "Assignee",          "type": 4,
+                  "options": {"optNurse": "Nurse", "optMin": "Min"}},
+    "fldParent": {"name": "Parent items",      "type": 18, "options": {}},
+}
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_update_uses_after_value_when_provided(mock_lark, mock_jira):
+    """rid in index + after_value present → get_record is NOT called."""
+    index._lark_to_jira["recFP"] = "PROJ-50"
+    index._jira_to_lark["PROJ-50"] = "recFP"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_field_meta_by_id.return_value = _META
+    mock_jira.get_issue.return_value = {"fields": {"summary": "Old title"}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
+    import lark_handler
+    lark_handler.process({
+        "action": "record_edited", "record_id": "recFP",
+        "after_value": [{"field_id": "fldTitle", "field_value": "Brand new title"}],
+    }, "tbl", CFG)
+
+    mock_lark.get_record.assert_not_called()
+    mock_jira.update_issue.assert_called_once()
+    assert mock_jira.update_issue.call_args[0][2]["summary"] == "Brand new title"
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_update_falls_back_to_get_record_when_not_in_index(mock_lark, mock_jira):
+    """rid NOT in index → must get_record (auto-discover needs full record)."""
+    rec = {"record_id": "recAD",
+           "fields": {"Title": "X", "Type": "Story", "Jira Key": "PROJ-60"}}
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = rec
+    mock_lark.get_field_meta_by_id.return_value = _META
+    mock_jira.get_issue.return_value = {"fields": {"summary": "X"}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
+    import lark_handler
+    lark_handler.process({
+        "action": "record_edited", "record_id": "recAD",
+        "after_value": [{"field_id": "fldTitle", "field_value": "X"}],
+    }, "tbl", CFG)
+
+    mock_lark.get_record.assert_called_once()
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_update_fast_path_falls_back_on_unknown_field(mock_lark, mock_jira):
+    """Unknown field_id in payload → safe fallback to get_record."""
+    index._lark_to_jira["recUF"] = "PROJ-70"
+    index._jira_to_lark["PROJ-70"] = "recUF"
+    rec = {"record_id": "recUF", "fields": {"Title": "from get_record"}}
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = rec
+    mock_lark.get_field_meta_by_id.return_value = _META
+    mock_jira.get_issue.return_value = {"fields": {"summary": "old"}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
+    import lark_handler
+    lark_handler.process({
+        "action": "record_edited", "record_id": "recUF",
+        "after_value": [{"field_id": "fldBRANDNEW", "field_value": "x"}],
+    }, "tbl", CFG)
+
+    mock_lark.get_record.assert_called_once()
+
+
+def test_decode_one_covers_every_field_type():
+    """Type-level decoding, independent of sync-scope relevance filtering."""
+    import lark_handler
+    opts = {"optStory": "Story", "optNurse": "Nurse"}
+    assert lark_handler._decode_one(1, "hello", {}) == ("hello", True)            # text
+    assert lark_handler._decode_one(2, "5", {}) == ("5", True)                    # number
+    assert lark_handler._decode_one(3, "optStory", opts) == ("Story", True)       # single-select
+    assert lark_handler._decode_one(3, "optGHOST", opts) == (None, False)         # bad option
+    assert lark_handler._decode_one(4, '["optNurse"]', opts) == (["Nurse"], True) # multi-select
+    assert lark_handler._decode_one(5, "1779037200000", {}) == (1779037200000, True)  # date
+    assert lark_handler._decode_one(18, '["rec1"]', {}) == ([{"record_ids": ["rec1"]}], True)
+    assert lark_handler._decode_one(1, "", {}) == (None, True)                    # cleared field
+    assert lark_handler._decode_one(20, "x", {}) == (None, False)                 # unhandled → fallback
+
+
+@patch("lark_handler.lark_api")
+def test_decode_after_value_date_string(mock_lark):
+    mock_lark.get_field_meta_by_id.return_value = _META
+    import lark_handler
+    out = lark_handler._decode_after_value(
+        [{"field_id": "fldStart", "field_value": "1779037200000"}], "tok", CFG)
+    assert out == {"Timeline - Start": 1779037200000}
+    assert isinstance(out["Timeline - Start"], int)
+
+
+@patch("lark_handler.lark_api")
+def test_decode_after_value_multiselect(mock_lark):
+    mock_lark.get_field_meta_by_id.return_value = _META
+    import lark_handler
+    out = lark_handler._decode_after_value(
+        [{"field_id": "fldAssign", "field_value": '["optNurse"]'}], "tok", CFG)
+    assert out == {"Assignee": ["Nurse"]}
+
+
+@patch("lark_handler.lark_api")
+def test_decode_after_value_link_field(mock_lark):
+    mock_lark.get_field_meta_by_id.return_value = _META
+    import lark_handler
+    out = lark_handler._decode_after_value(
+        [{"field_id": "fldParent", "field_value": '["rec26ZKzNm9ucD"]'}], "tok", CFG)
+    assert out == {"Parent items": [{"record_ids": ["rec26ZKzNm9ucD"]}]}
+
+
+@patch("lark_handler.lark_api")
+def test_decode_after_value_unknown_option_forces_fallback(mock_lark):
+    """Unknown option on a RELEVANT select field (Assignee) → None (fallback)."""
+    mock_lark.get_field_meta_by_id.return_value = _META
+    import lark_handler
+    out = lark_handler._decode_after_value(
+        [{"field_id": "fldAssign", "field_value": '["optGHOST"]'}], "tok", CFG)
+    assert out is None  # unknown select option → caller falls back to get_record
+
+
+@patch("lark_handler.lark_api")
+def test_decode_after_value_ignores_irrelevant_fields(mock_lark):
+    """A field not in the sync scope must be ignored, not force a fallback."""
+    meta = {**_META, "fldFormula": {"name": "Status", "type": 20, "options": {}}}
+    mock_lark.get_field_meta_by_id.return_value = meta
+    import lark_handler
+    out = lark_handler._decode_after_value([
+        {"field_id": "fldFormula", "field_value": "{...}"},
+        {"field_id": "fldTitle", "field_value": "T"},
+    ], "tok", CFG)
+    assert out == {"Title": "T"}  # Status ignored, did not return None
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_replayed_after_value_is_idempotent(mock_lark, mock_jira):
+    """Same payload twice → second pass writes nothing (value-comparison guard)."""
+    index._lark_to_jira["recID"] = "PROJ-80"
+    index._jira_to_lark["PROJ-80"] = "recID"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_field_meta_by_id.return_value = _META
+    # After first push, Jira summary matches the new value.
+    mock_jira.get_issue.side_effect = [
+        {"fields": {"summary": "old"}},
+        {"fields": {"summary": "new title"}},
+    ]
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
+    import lark_handler
+    payload = {"action": "record_edited", "record_id": "recID",
+               "after_value": [{"field_id": "fldTitle", "field_value": "new title"}]}
+    lark_handler.process(dict(payload), "tbl", CFG)
+    lark_handler.process(dict(payload), "tbl", CFG)
+
+    mock_jira.update_issue.assert_called_once()  # only the first pass writes
+
+
 @patch("lark_handler.jira_api")
 @patch("lark_handler.lark_api")
 def test_update_syncs_parent_with_record_ids_shape(mock_lark, mock_jira):

@@ -13,6 +13,7 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 | Commit | Type | Summary |
 |--------|------|---------|
+| _pending_ | perf | Skip `get_record` on Lark→Jira updates by decoding the changed fields straight from the `record_edited` webhook's `after_value` payload. New `lark_api.get_field_meta_by_id` (reuses the 60 s field cache) + `lark_handler._decode_after_value` translate `{field_id, field_value}` into the same shape `get_record` returns (text/number/select/multiselect/date/link), filtered to fields the update path actually syncs. Falls back to `get_record` for auto-discover, missing payloads, unknown fields, or undecodable values. Eliminates ~3 Lark calls per Lark edit |
 | _pending_ | perf | Stretch the reconcile loop from every 30 min to every 6 h. At 30 min it alone consumed ~21k Lark API calls/month and was the primary cause of the tenant exhausting its 10k/month Basic API quota (HTTP 429 / code 99991403). Reconcile is a missed-webhook safety net, not the real-time path; the dashboard "Run Backfill" button still forces an immediate full reconcile |
 
 ## 2026-05-14 — Lark 429 retry/backoff + field-schema cache + update coalescing

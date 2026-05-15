@@ -190,3 +190,25 @@ def get_select_options(token: str, base_token: str, table_id: str, field_name: s
             options = (f.get("property") or {}).get("options", [])
             return [opt["name"] for opt in options]
     return []
+
+
+def get_field_meta_by_id(token: str, base_token: str, table_id: str) -> dict:
+    """Map field_id -> {name, type, options} for decoding webhook payloads.
+
+    `options` is {option_id: option_name} for single/multi-select fields,
+    empty otherwise. Reuses the 60 s _fetch_field_items cache so this adds
+    no extra Lark API calls on the webhook hot path.
+    """
+    items = _fetch_field_items(token, base_token, table_id)
+    meta = {}
+    for f in items:
+        fid = f.get("field_id")
+        if not fid:
+            continue
+        options = (f.get("property") or {}).get("options") or []
+        meta[fid] = {
+            "name": f.get("field_name"),
+            "type": f.get("type"),
+            "options": {o["id"]: o["name"] for o in options if o.get("id")},
+        }
+    return meta

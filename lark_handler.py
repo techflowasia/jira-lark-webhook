@@ -1,4 +1,5 @@
 """Lark Base events → Jira actions."""
+import json
 import time
 import threading
 import logging
@@ -76,6 +77,103 @@ def _resolve_parent(rec: dict) -> "str | None":
     return None
 
 
+# Lark Bitable field type numbers (verified against the live Base schema).
+_FT_TEXT, _FT_NUMBER, _FT_SINGLE_SELECT = 1, 2, 3
+_FT_MULTI_SELECT, _FT_DATETIME, _FT_LINK = 4, 5, 18
+
+
+def _relevant_lark_fields() -> set:
+    """Lark field names the Lark→Jira update path actually reads.
+
+    Anything not in this set (e.g. a recomputed formula field that Lark
+    bundles into the same webhook) is ignored during decode so it doesn't
+    needlessly force a get_record fallback.
+    """
+    names = {F_TITLE, F_START, F_END, F_ASSIGNEE, F_RELEASE, F_PARENT}
+    names.update(m["lark_field"] for m in field_mappings.get_custom_lark_to_jira())
+    return names
+
+
+def _decode_one(ftype, raw, options):
+    """Decode one webhook field_value into the shape get_record returns.
+
+    Returns (value, ok). ok=False means "can't safely decode — caller should
+    fall back to get_record". An empty/cleared value decodes to (None, True);
+    the update handler already skips None-valued fields.
+    """
+    if raw is None or raw == "":
+        return None, True
+    if ftype == _FT_TEXT:
+        return raw, True
+    if ftype == _FT_NUMBER:
+        return raw, True  # custom mappings coerce via float(raw)
+    if ftype == _FT_SINGLE_SELECT:
+        name = options.get(raw)
+        return (name, True) if name is not None else (None, False)
+    if ftype == _FT_MULTI_SELECT:
+        try:
+            ids = json.loads(raw)
+        except (ValueError, TypeError):
+            return None, False
+        if not isinstance(ids, list):
+            return None, False
+        names = []
+        for oid in ids:
+            nm = options.get(oid)
+            if nm is None:
+                return None, False
+            names.append(nm)
+        return names, True  # matches get_record shape: ["Nurse", ...]
+    if ftype == _FT_DATETIME:
+        try:
+            return int(raw), True
+        except (ValueError, TypeError):
+            return None, False
+    if ftype == _FT_LINK:
+        try:
+            rids = json.loads(raw)
+        except (ValueError, TypeError):
+            return None, False
+        if not isinstance(rids, list):
+            return None, False
+        return [{"record_ids": rids}], True  # matches _lark_link_rid expectation
+    return None, False  # unhandled type in sync scope → force safe fallback
+
+
+def _decode_after_value(after_value, token, cfg):
+    """Translate webhook [{field_id, field_value}] → {field_name: value}.
+
+    Value shapes match what lark_api.get_record returns, so the rest of
+    _handle_update_impl runs unchanged. Returns None if any *relevant*
+    changed field can't be confidently decoded (unknown field, unknown
+    select option, bad encoding) — caller then falls back to get_record.
+    """
+    try:
+        meta = lark_api.get_field_meta_by_id(
+            token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
+    except Exception as e:
+        log.info(f"lark_handler: field meta fetch failed ({e}) — fall back to get_record")
+        return None
+
+    relevant = _relevant_lark_fields()
+    fields = {}
+    for av in after_value:
+        fid = av.get("field_id")
+        m = meta.get(fid)
+        if not m:
+            log.info(f"lark_handler: unknown field_id {fid} in webhook — fall back to get_record")
+            return None
+        fname = m["name"]
+        if fname not in relevant:
+            continue  # irrelevant field (e.g. formula recompute) — ignore, don't fall back
+        value, ok = _decode_one(m["type"], av.get("field_value"), m["options"])
+        if not ok:
+            log.info(f"lark_handler: can't decode '{fname}' (type {m['type']}) — fall back to get_record")
+            return None
+        fields[fname] = value
+    return fields
+
+
 def process(action: dict, table_id: str, cfg: dict) -> None:
     act = action.get("action")
     rid = action.get("record_id", "")
@@ -84,7 +182,7 @@ def process(action: dict, table_id: str, cfg: dict) -> None:
         if act == "record_added":
             _handle_create(rid, table_id, cfg)
         elif act == "record_edited":
-            _handle_update(rid, table_id, cfg)
+            _handle_update(rid, table_id, cfg, after_value=action.get("after_value") or [])
         elif act == "record_deleted":
             _handle_delete(rid, cfg)
         else:
@@ -176,11 +274,16 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
             _create_in_flight.discard(rid)
 
 
-def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
+def _handle_update(rid: str, table_id: str, cfg: dict, after_value=None) -> None:
     # Coalesce duplicate / rapid-fire record_edited events for the same rid into
     # at most two sequential passes (initial + re-run with fresh state if more
     # events arrived during processing). Parallel get_records on the same rid
     # were the main source of 429s in the history log.
+    #
+    # The first pass may use the webhook's after_value payload (fast path, no
+    # get_record). The coalesced re-run intentionally passes after_value=None so
+    # it re-reads fresh full state via get_record — the coalesced events that
+    # triggered the re-run carried their own (now-discarded) payloads.
     with _update_lock:
         if rid in _update_in_flight:
             _update_pending.add(rid)
@@ -188,24 +291,42 @@ def _handle_update(rid: str, table_id: str, cfg: dict) -> None:
             return
         _update_in_flight.add(rid)
     try:
-        _handle_update_impl(rid, table_id, cfg)
+        _handle_update_impl(rid, table_id, cfg, after_value=after_value)
         while True:
             with _update_lock:
                 if rid not in _update_pending:
                     break
                 _update_pending.discard(rid)
-            _handle_update_impl(rid, table_id, cfg)
+            _handle_update_impl(rid, table_id, cfg, after_value=None)
     finally:
         with _update_lock:
             _update_in_flight.discard(rid)
             _update_pending.discard(rid)
 
 
-def _handle_update_impl(rid: str, table_id: str, cfg: dict) -> None:
+def _handle_update_impl(rid: str, table_id: str, cfg: dict, after_value=None) -> None:
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
-    rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
 
     jira_key = index._lark_to_jira.get(rid)
+    rec = None
+
+    # Fast path: we already know the Jira link AND the webhook handed us the
+    # changed fields → decode the payload and skip get_record entirely. This is
+    # the single biggest Lark API-call saving on the webhook hot path.
+    if jira_key and after_value:
+        decoded = _decode_after_value(after_value, token, cfg)
+        if decoded is not None:
+            if not decoded:
+                log.info(f"lark_handler: {rid} no synced fields changed — skipping (no get_record)")
+                return
+            rec = {"record_id": rid, "fields": decoded}
+            log.info(
+                f"lark_handler: {rid} fast-path update — {len(decoded)} field(s) "
+                f"from webhook, no get_record")
+
+    if rec is None:
+        rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
+
     if not jira_key:
         # Not in index — check if the record itself has a Jira Key (auto-discover)
         jira_key = _lark_text(rec["fields"].get(F_JIRA_KEY))
