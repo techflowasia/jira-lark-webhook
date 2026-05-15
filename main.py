@@ -135,7 +135,11 @@ async def _keepalive_loop() -> None:
 async def _reconcile_loop() -> None:
     log = logging.getLogger(__name__)
     while True:
-        await asyncio.sleep(1800)
+        # 6 h, not 30 min: reconcile is a safety net for missed webhooks, not the
+        # primary sync path. At 30 min it alone burned ~21k Lark calls/month and
+        # blew the tenant API quota. The dashboard "Run Backfill" button still
+        # forces an immediate full reconcile when needed.
+        await asyncio.sleep(21600)
         if _reconcile_enabled:
             await asyncio.to_thread(reconcile.run, get_cfg())
         else:

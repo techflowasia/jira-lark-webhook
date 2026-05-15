@@ -9,6 +9,12 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
+## 2026-05-15 — Cut Lark API volume to stay under monthly quota
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| _pending_ | perf | Stretch the reconcile loop from every 30 min to every 6 h. At 30 min it alone consumed ~21k Lark API calls/month and was the primary cause of the tenant exhausting its 10k/month Basic API quota (HTTP 429 / code 99991403). Reconcile is a missed-webhook safety net, not the real-time path; the dashboard "Run Backfill" button still forces an immediate full reconcile |
+
 ## 2026-05-14 — Lark 429 retry/backoff + field-schema cache + update coalescing
 
 | Commit | Type | Summary |
