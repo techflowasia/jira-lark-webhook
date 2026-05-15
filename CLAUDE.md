@@ -10,6 +10,22 @@
 
 ---
 
+## Data Integrity Rule
+
+**This project's whole purpose is keeping Jira and Lark data in sync. Data loss or divergence is a critical failure, not a cosmetic one.**
+
+For every change — new requirement OR bug fix — you must verify data is not ruined before considering the task done:
+
+- After any change that touches a sync path (handlers, reconcile, decoders, field mappings, API clients), check that real records are not lost, blanked, duplicated, or diverged between Jira and Lark.
+- When a fix repairs a bug, also repair the data the bug already corrupted (e.g. bad field values, garbage schema options) — fixing the code is not enough if its damage remains.
+- Verify on the actual deployed data (sample affected records on both sides), not just unit tests. Confirm both sides hold the same, correct values.
+- Watch for sync loops and runaway writes after any change: monitor `/debug/lark-calls` and `/debug/payloads`; a stable, bounded call count is part of "done".
+- If a change could blank or drop a field for existing records, migrate/repair those records as part of the same task — never leave records mid-corrupted.
+
+A change that passes tests but loses or diverges real sync data is **not** complete.
+
+---
+
 ## What This Project Does
 
 A bidirectional webhook sync service that keeps Jira issues and Lark Base records in sync in real time. When a record is created/updated/deleted in either system, the change is mirrored to the other side within seconds. A 30-minute reconcile loop acts as a safety net for missed webhooks.

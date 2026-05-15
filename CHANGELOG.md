@@ -9,6 +9,12 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
+## 2026-05-16 — Project rule: data-integrity verification
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| `812eddb` | docs | Add "Data Integrity Rule" to `CLAUDE.md`: every requirement/bugfix must verify real Jira↔Lark data isn't lost/diverged and repair data the bug already corrupted (sample deployed records both sides, watch `/debug/lark-calls` for loops) — tests passing alone is not "done" |
+
 ## 2026-05-15 — Fix Title sync loop + multi-select Release corruption
 
 | Commit | Type | Summary |
