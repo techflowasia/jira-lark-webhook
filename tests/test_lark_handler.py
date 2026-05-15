@@ -30,6 +30,11 @@ def setup_function():
     index._lark_to_jira.clear()
     index._jira_to_lark["PROJ-10"] = "recEpic"
     index._lark_to_jira["recEpic"] = "PROJ-10"
+    import lark_handler
+    lark_handler._version_cache.clear()
+    lark_handler._version_cache.update({"data": {}, "expires_at": 0})
+    lark_handler._sprint_cache.clear()
+    lark_handler._sprint_cache.update({"data": {}, "expires_at": 0})
 
 
 @patch("lark_handler.jira_api")
@@ -597,3 +602,69 @@ def test_delete_ignores_spurious_event_when_record_still_exists(mock_lark, mock_
     # Index should NOT be unlinked — record is still alive
     assert "PROJ-10" in index._jira_to_lark
     assert "rec005" in index._lark_to_jira
+
+
+# ---- Regression: newly created Jira sprint must sync from Lark Release ----
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_new_sprint_synced_when_stale_cache_misses(mock_lark, mock_jira):
+    """Stale sprint cache misses a just-created sprint → refresh-on-miss must
+    still resolve it and call move_to_sprint (the original silent-no-sync bug)."""
+    import time as _t
+    import lark_handler
+    index._lark_to_jira["recSP"] = "PROJ-90"
+    index._jira_to_lark["PROJ-90"] = "recSP"
+
+    # Cache is fresh (expires in the future) but does NOT contain the new sprint.
+    lark_handler._sprint_cache.update(
+        {"data": {"old sprint": 11}, "expires_at": _t.time() + 3600,
+         "last_forced": 0})
+
+    rec = {"record_id": "recSP",
+           "fields": {"Title": "T", "Jira Key": "PROJ-90",
+                      "Release": ["VR Sprint 5"]}}
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = rec
+    mock_jira.get_issue.return_value = {"fields": {"summary": "T"}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = "board1"
+    # Forced refresh returns the freshly created sprint.
+    mock_jira.get_board_sprints.return_value = [{"id": 99, "name": "VR Sprint 5"}]
+
+    lark_handler.process({"action": "record_edited", "record_id": "recSP"}, "tbl", CFG)
+
+    mock_jira.move_to_sprint.assert_called_once_with(CFG, 99, "PROJ-90")
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_forced_refresh_throttled_for_version_only_release(mock_lark, mock_jira):
+    """A Release name that is never a sprint must not refetch sprints on every
+    edit — the forced refresh is throttled to once per interval."""
+    import time as _t
+    import lark_handler
+    index._lark_to_jira["recVO"] = "PROJ-91"
+    index._jira_to_lark["PROJ-91"] = "recVO"
+
+    lark_handler._sprint_cache.update(
+        {"data": {"some sprint": 5}, "expires_at": _t.time() + 3600,
+         "last_forced": _t.time()})  # just force-refreshed → throttled
+
+    rec = {"record_id": "recVO",
+           "fields": {"Title": "T", "Jira Key": "PROJ-91",
+                      "Release": ["Beta 1 (version only)"]}}
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = rec
+    mock_jira.get_issue.return_value = {"fields": {"summary": "T"}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = "board1"
+    mock_jira.get_board_sprints.return_value = [{"id": 5, "name": "some sprint"}]
+
+    lark_handler.process({"action": "record_edited", "record_id": "recVO"}, "tbl", CFG)
+
+    # Throttled: no forced sprint refetch, no spurious move_to_sprint.
+    mock_jira.get_board_sprints.assert_not_called()
+    mock_jira.move_to_sprint.assert_not_called()

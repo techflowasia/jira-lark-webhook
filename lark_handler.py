@@ -40,9 +40,15 @@ def _get_account_ids(cfg: dict) -> dict:
     return data
 
 
-def _get_version_map(cfg: dict) -> dict:
+# Force a sprint/version map refresh at most once per this interval even on
+# repeated misses, so a Release value that is a version-only name (never a
+# sprint) can't trigger a Jira refetch on every single edit.
+_FORCED_REFRESH_INTERVAL = 60
+
+
+def _get_version_map(cfg: dict, force: bool = False) -> dict:
     now = time.time()
-    if _version_cache["data"] and now < _version_cache["expires_at"]:
+    if not force and _version_cache["data"] and now < _version_cache["expires_at"]:
         return _version_cache["data"]
     try:
         data = {_norm(v["name"]): v["id"] for v in jira_api.get_project_versions(cfg)}
@@ -52,9 +58,9 @@ def _get_version_map(cfg: dict) -> dict:
     return data
 
 
-def _get_sprint_map(cfg: dict) -> dict:
+def _get_sprint_map(cfg: dict, force: bool = False) -> dict:
     now = time.time()
-    if _sprint_cache["data"] and now < _sprint_cache["expires_at"]:
+    if not force and _sprint_cache["data"] and now < _sprint_cache["expires_at"]:
         return _sprint_cache["data"]
     try:
         bid = jira_api.get_board_id(cfg)
@@ -64,6 +70,24 @@ def _get_sprint_map(cfg: dict) -> dict:
         data = {}
     _sprint_cache.update({"data": data, "expires_at": now + 3600})
     return data
+
+
+def _resolve_id(cache: dict, getter, cfg: dict, name: str):
+    """Resolve a normalized Release name → Jira id, refreshing once on miss.
+
+    A Jira sprint/version created within the map's 1 h TTL isn't in the
+    cached map, so the first lookup misses and the Release→sprint /
+    Release→fixVersion sync is silently skipped (no error). On miss, force a
+    single refresh before giving up. Throttled via cache['last_forced'] so a
+    version-only Release name can't cause a Jira refetch on every edit.
+    """
+    val = getter(cfg).get(name)
+    if val is not None:
+        return val
+    if time.time() - cache.get("last_forced", 0) < _FORCED_REFRESH_INTERVAL:
+        return None
+    cache["last_forced"] = time.time()
+    return getter(cfg, force=True).get(name)
 
 
 def _resolve_parent(rec: dict) -> "str | None":
@@ -380,7 +404,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict, after_value=None) ->
     release_raw = (_lark_text(rec["fields"].get(F_RELEASE))
                    or _lark_select(rec["fields"].get(F_RELEASE)))
     if release_raw:
-        vid = _get_version_map(cfg).get(_norm(release_raw))
+        vid = _resolve_id(_version_cache, _get_version_map, cfg, _norm(release_raw))
         if vid:
             current_version_ids = [v["id"] for v in (jira_fields.get("fixVersions") or [])]
             if vid not in current_version_ids:
@@ -416,20 +440,34 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict, after_value=None) ->
             updates[m["jira_field"]] = val
             changed.append(f"{m['jira_label'] or m['lark_field']}: {val}")
 
-    if not updates:
+    # Resolve the Release→sprint move BEFORE the early-return guard. A Release
+    # change that maps to a sprint but not a fixVersion (or whose fixVersion
+    # already matches) produces no `updates`; gating the sprint move behind
+    # `if not updates` silently skipped it — the second half of the
+    # "new sprint doesn't sync" bug.
+    sid = None
+    if release_raw:
+        sid = _resolve_id(_sprint_cache, _get_sprint_map, cfg, _norm(release_raw))
+        if sid:
+            current_sprint_ids = [s.get("id") for s in
+                                  (jira_fields.get("customfield_10020") or [])]
+            if sid in current_sprint_ids:
+                sid = None  # already in that sprint — skip the redundant Jira call
+
+    if not updates and not sid:
         log.info(f"lark_handler: no relevant updates for {jira_key}")
         return
 
-    log.info(f"lark_handler: sending to Jira {jira_key} fields={list(updates.keys())}")
-    jira_api.update_issue(cfg, jira_key, updates)
+    if updates:
+        log.info(f"lark_handler: sending to Jira {jira_key} fields={list(updates.keys())}")
+        jira_api.update_issue(cfg, jira_key, updates)
 
-    if release_raw:
-        sid = _get_sprint_map(cfg).get(_norm(release_raw))
-        if sid:
-            try:
-                jira_api.move_to_sprint(cfg, sid, jira_key)
-            except Exception as e:
-                log.warning(f"Sprint move {jira_key}: {e}")
+    if sid:
+        try:
+            jira_api.move_to_sprint(cfg, sid, jira_key)
+            changed.append(f"Sprint: {release_raw}")
+        except Exception as e:
+            log.warning(f"Sprint move {jira_key}: {e}")
 
     desc = ", ".join(changed)
     log.info(f"lark_handler: updated Jira {jira_key} — {desc}")
