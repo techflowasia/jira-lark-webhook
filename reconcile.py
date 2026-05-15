@@ -9,7 +9,8 @@ from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END,
                     F_PARENT, F_START, F_END, F_RELEASE,
                     JIRA_TO_LARK_ASSIGNEE, LARK_TO_JIRA_ASSIGNEE)
-from utils import _lark_text, _lark_select, _jira_datetime_to_lark_ts, _lark_ts_to_jira_date, _lark_link_rid
+from utils import (_lark_text, _lark_select, _jira_datetime_to_lark_ts,
+                   _lark_ts_to_jira_date, _lark_link_rid, _lark_multi)
 
 log = logging.getLogger(__name__)
 
@@ -480,7 +481,7 @@ def backfill(cfg: dict) -> dict:
         actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
         actual_end   = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
         sprint_data  = jf.get("customfield_10020") or []
-        sprint_name  = sprint_data[0].get("name") if sprint_data else None
+        sprint_names = [s.get("name") for s in sprint_data if s.get("name")]
         parent_jira_key = (jf.get("parent") or {}).get("key")
         parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
         updates: dict = {}
@@ -496,8 +497,8 @@ def backfill(cfg: dict) -> dict:
             updates[F_ACTUAL_START] = actual_start
         if actual_end is not None and cur.get(F_ACTUAL_END) != actual_end:
             updates[F_ACTUAL_END] = actual_end
-        if sprint_name and _lark_select(cur.get(F_RELEASE)) != sprint_name:
-            updates[F_RELEASE] = [sprint_name]
+        if sprint_names and set(sprint_names) != set(_lark_multi(cur.get(F_RELEASE))):
+            updates[F_RELEASE] = sprint_names
         cur_parent_rid = _lark_link_rid(cur.get(F_PARENT))
         if parent_rid and cur_parent_rid != parent_rid:
             updates[F_PARENT] = [parent_rid]

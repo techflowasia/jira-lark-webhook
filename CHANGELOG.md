@@ -9,7 +9,12 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
-## 2026-05-15 — Cut Lark API volume to stay under monthly quota
+## 2026-05-15 — Fix Title sync loop + multi-select Release corruption
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| _pending_ | fix | **Title sync loop (VR-227).** The `record_edited` webhook delivers text fields as a JSON-*stringified* rich-text array (`'[{"text":"hi","type":"text"}]'`), but `lark_handler._decode_one` returned that string verbatim for text fields, so `_lark_text` yielded the raw JSON. That JSON went to Jira summary → synced back to Lark Title → each round added another `[{"type":"text",...}]` layer (exponential nesting, runaway API burn). Decoder now `json.loads`-parses text values to the list shape `get_record` returns; unparseable values fall back to `get_record`. Regression: `test_decode_one_text_parses_json_stringified_array`, `test_fast_path_title_writes_plain_text_not_json` |
+| _pending_ | fix | **Multi-select Release combined-option corruption.** Jira's sprint changelog `toString` is comma-joined (`"VR Sprint 2, Beta 1"`); `jira_handler` wrote `[to_str]` so Lark's multi-select Release created a single bogus combined option. Now split into separate option names (`_split_sprint_changelog`), use all sprint names on the create path (`_sprint_names`), and compare as a set via new `utils._lark_multi` so a multi-value Release no longer triggers redundant writes. Same fix in `reconcile.py` backfill Step 5. Regression: `test_sprint_changelog_splits_into_separate_release_options`, `test_sprint_changelog_skips_when_release_set_matches` |
 
 | Commit | Type | Summary |
 |--------|------|---------|

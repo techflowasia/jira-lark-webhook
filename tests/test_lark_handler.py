@@ -668,3 +668,54 @@ def test_forced_refresh_throttled_for_version_only_release(mock_lark, mock_jira)
     # Throttled: no forced sprint refetch, no spurious move_to_sprint.
     mock_jira.get_board_sprints.assert_not_called()
     mock_jira.move_to_sprint.assert_not_called()
+
+
+# ---- Regression: webhook text fields are JSON-stringified (VR-227 loop) ----
+
+def test_decode_one_text_parses_json_stringified_array():
+    """Webhook delivers text as '[{"text":"hi","type":"text"}]' (a STRING).
+    Must parse to the list shape so _lark_text yields "hi", not the JSON."""
+    import lark_handler
+    val, ok = lark_handler._decode_one(
+        1, '[{"text":"All chat list / create direct / group chat","type":"text"}]', {})
+    assert ok is True
+    assert val == [{"text": "All chat list / create direct / group chat",
+                    "type": "text"}]
+    # _lark_text on the decoded value must give plain text, not JSON.
+    from utils import _lark_text
+    assert _lark_text(val) == "All chat list / create direct / group chat"
+
+
+def test_decode_one_text_plain_string_kept():
+    import lark_handler
+    assert lark_handler._decode_one(1, "plain title", {}) == ("plain title", True)
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_fast_path_title_writes_plain_text_not_json(mock_lark, mock_jira):
+    """End-to-end: a Title edit delivered as a stringified rich-text array
+    must push the inner plain text to Jira summary — NOT the JSON wrapper
+    (which previously fed the exponential-nesting sync loop)."""
+    index._lark_to_jira["recTL"] = "PROJ-227"
+    index._jira_to_lark["PROJ-227"] = "recTL"
+    meta = {"fldT": {"name": "Title", "type": 1, "options": {}}}
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_field_meta_by_id.return_value = meta
+    mock_jira.get_issue.return_value = {"fields": {"summary": "old"}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
+    import lark_handler
+    lark_handler.process({
+        "action": "record_edited", "record_id": "recTL",
+        "after_value": [{"field_id": "fldT",
+                         "field_value": '[{"text":"All chat list / create direct / group chat","type":"text"}]'}],
+    }, "tbl", CFG)
+
+    mock_lark.get_record.assert_not_called()
+    mock_jira.update_issue.assert_called_once()
+    summary = mock_jira.update_issue.call_args[0][2]["summary"]
+    assert summary == "All chat list / create direct / group chat"
+    assert "{" not in summary  # no JSON wrapper leaked through

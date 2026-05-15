@@ -141,3 +141,41 @@ def test_story_points_skipped_when_value_matches(mock_lark):
     import jira_handler
     jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
     mock_lark.update_record.assert_not_called()
+
+
+# ---- Regression: multi-select Release must not become one combined option ----
+
+@patch("jira_handler.lark_api")
+def test_sprint_changelog_splits_into_separate_release_options(mock_lark):
+    """Jira sprint changelog toString is comma-joined ("A, B"). It must be
+    written to Lark as separate multi-select values, not one "A, B" option."""
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {"Release": []}}
+    changelog = {"items": [{"field": "customfield_10020",
+                            "toString": "VR Sprint 2, Beta 1", "to": None}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+
+    mock_lark.update_record.assert_called_once()
+    fields = mock_lark.update_record.call_args[0][4]
+    assert fields["Release"] == ["VR Sprint 2", "Beta 1"]
+
+
+@patch("jira_handler.lark_api")
+def test_sprint_changelog_skips_when_release_set_matches(mock_lark):
+    """No redundant write (loop guard) when Lark Release already holds the
+    same set of names, regardless of order."""
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {"Release": ["Beta 1", "VR Sprint 2"]}}
+    changelog = {"items": [{"field": "customfield_10020",
+                            "toString": "VR Sprint 2, Beta 1", "to": None}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+
+    mock_lark.update_record.assert_not_called()

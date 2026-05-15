@@ -128,6 +128,21 @@ def _decode_one(ftype, raw, options):
     if raw is None or raw == "":
         return None, True
     if ftype == _FT_TEXT:
+        # The webhook delivers rich-text/url fields as a JSON-STRINGIFIED
+        # segment array, e.g. '[{"text":"hi","type":"text"}]'. Returning that
+        # string as-is made _lark_text yield the literal JSON instead of "hi",
+        # which got written to Jira summary and re-synced back, nesting one
+        # more layer each round (the VR-227 Title corruption loop). Parse it
+        # to the list shape get_record returns so _lark_text extracts the
+        # text. Genuinely-plain values are kept as-is.
+        if isinstance(raw, str) and raw[:1] == "[":
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                return None, False  # undecodable → fall back to get_record
+            if isinstance(parsed, list):
+                return parsed, True
+            return None, False
         return raw, True
     if ftype == _FT_NUMBER:
         return raw, True  # custom mappings coerce via float(raw)

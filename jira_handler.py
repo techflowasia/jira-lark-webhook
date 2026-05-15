@@ -4,9 +4,22 @@ import lark_api, index, dedup, history, field_mappings, config
 from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END, F_PARENT,
                     F_RELEASE, JIRA_TO_LARK_ASSIGNEE)
-from utils import _jira_datetime_to_lark_ts, _lark_text, _lark_select, _lark_link_rid
+from utils import (_jira_datetime_to_lark_ts, _lark_text, _lark_select,
+                   _lark_link_rid, _lark_multi)
 
 log = logging.getLogger(__name__)
+
+
+def _sprint_names(sprint_data) -> list:
+    """All sprint names from Jira's customfield_10020 (list of sprint dicts)."""
+    return [s.get("name") for s in (sprint_data or []) if s.get("name")]
+
+
+def _split_sprint_changelog(to_str: str) -> list:
+    """Jira's sprint changelog `toString` is comma-joined ("A, B"). Split it
+    into individual option names so Lark's multi-select Release gets separate
+    values instead of one bogus combined "A, B" option."""
+    return [s.strip() for s in (to_str or "").split(",") if s.strip()]
 
 RELEVANT_CHANGELOG_FIELDS = {
     "summary", "assignee", "customfield_10016",
@@ -53,7 +66,7 @@ def _handle_create(issue: dict, cfg: dict) -> None:
     parent_jira_key = (jf.get("parent") or {}).get("key")
     parent_record_id = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
     sprint_data = jf.get("customfield_10020") or []
-    sprint_name = sprint_data[0].get("name") if sprint_data else None
+    sprint_names = _sprint_names(sprint_data)
 
     fields = {
         F_TITLE:    jf.get("summary", ""),
@@ -67,7 +80,7 @@ def _handle_create(issue: dict, cfg: dict) -> None:
     if actual_start:     fields[F_ACTUAL_START] = actual_start
     if actual_end:       fields[F_ACTUAL_END]   = actual_end
     if parent_record_id: fields[F_PARENT]       = [parent_record_id]
-    if sprint_name:      fields[F_RELEASE]      = [sprint_name]
+    if sprint_names:     fields[F_RELEASE]      = sprint_names
 
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], fields)
@@ -138,10 +151,10 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
 
         elif field == "customfield_10020":
             if to_str:
-                current_release = (_lark_text(lark_fields.get(F_RELEASE))
-                                   or _lark_select(lark_fields.get(F_RELEASE)))
-                if to_str != current_release:
-                    updates[F_RELEASE] = [to_str]
+                new_releases = _split_sprint_changelog(to_str)
+                current = set(_lark_multi(lark_fields.get(F_RELEASE)))
+                if new_releases and set(new_releases) != current:
+                    updates[F_RELEASE] = new_releases
 
     # Reconcile parent on every update — Jira only fires a 'parent' changelog
     # item when parent itself changes, so a title-only edit would otherwise miss

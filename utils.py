@@ -62,6 +62,34 @@ def _lark_select(field_val) -> "str | None":
     return None
 
 
+def _lark_multi(field_val) -> list:
+    """All option names from a Lark multi-select value, order-preserving.
+
+    get_record returns multi-select as ["A", "B"] (list of names) or a list
+    of {"text"/"name": ...} dicts. A bare string is treated as one value.
+    Used for set-based comparison so a multi-value Release doesn't trigger
+    a redundant write (and a sync loop) on every reconcile/changelog pass.
+    """
+    if field_val is None:
+        return []
+    if isinstance(field_val, str):
+        return [field_val] if field_val else []
+    if isinstance(field_val, dict):
+        v = field_val.get("text") or field_val.get("name")
+        return [v] if v else []
+    if isinstance(field_val, list):
+        out = []
+        for item in field_val:
+            if isinstance(item, dict):
+                v = item.get("text") or item.get("name")
+            else:
+                v = item
+            if v:
+                out.append(v)
+        return out
+    return []
+
+
 def _jira_date_to_lark_ts(date_str: "str | None") -> "int | None":
     if not date_str:
         return None
