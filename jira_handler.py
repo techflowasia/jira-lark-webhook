@@ -110,7 +110,12 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
         return
 
     items = changelog.get("items", [])
-    if not any((item.get("fieldId") or item.get("field")) in RELEVANT_CHANGELOG_FIELDS for item in items):
+    # Custom (dashboard-configured) Jira→Lark mappings count as relevant too —
+    # otherwise a changelog with ONLY a custom field (e.g. customfield_10178
+    # "QA Man day") hits this early-return and is silently dropped, no log.
+    custom_j2l = {m["jira_field"]: m for m in field_mappings.get_custom_jira_to_lark()}
+    _relevant = RELEVANT_CHANGELOG_FIELDS | set(custom_j2l)
+    if not any((item.get("fieldId") or item.get("field")) in _relevant for item in items):
         return
 
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
@@ -198,15 +203,32 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
         # it so it's logged; the reconcile loop repairs once the parent syncs.
         parent_deferred = parent_jira_key
 
-    # Apply custom (non-system) Jira → Lark mappings from changelog
-    custom_j2l = {m["jira_field"]: m for m in field_mappings.get_custom_jira_to_lark()}
+    # Apply custom (dashboard-configured) Jira → Lark mappings from changelog.
+    # Coerce by the mapping's field_type — writing a raw string to a Lark
+    # Number field fails with NumberFieldConvFail. Value-compare so a number
+    # like 5 vs 5.0 (or unchanged value) doesn't cause a redundant write/loop.
     for item in items:
         jf = item.get("fieldId") or item.get("field")
-        if jf in custom_j2l and jf not in RELEVANT_CHANGELOG_FIELDS:
-            m = custom_j2l[jf]
-            to_str = item.get("toString")
-            if to_str is not None:
-                updates[m["lark_field"]] = to_str
+        if jf not in custom_j2l or jf in RELEVANT_CHANGELOG_FIELDS:
+            continue
+        m = custom_j2l[jf]
+        name = m["lark_field"]
+        ft = m.get("field_type", "text")
+        raw = item.get("to")
+        to_str = item.get("toString")
+        if ft == "number":
+            val = _sp_to_num(raw if raw not in (None, "") else to_str)
+            cur = lark_fields.get(name)
+            cur_num = cur if isinstance(cur, (int, float)) else None
+            if val != cur_num:
+                updates[name] = val  # may be None to clear
+        elif ft == "date":
+            ts = _jira_date_to_lark_ts(raw or to_str)
+            if ts is not None and ts != lark_fields.get(name):
+                updates[name] = ts
+        else:
+            if to_str is not None and to_str != _lark_text(lark_fields.get(name)):
+                updates[name] = to_str
 
     if not updates:
         if parent_deferred:

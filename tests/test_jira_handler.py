@@ -304,3 +304,65 @@ def test_parent_change_deferred_is_logged_not_silent(mock_lark):
     kw = mrec.call_args.kwargs
     assert kw.get("status") == "skipped"
     assert "VR-999" in kw.get("description", "")
+
+
+# ---- Regression: Bug 3 — custom Jira→Lark mapping (QA Man day, Number) ----
+
+_QA_MAP = [{"id": 9, "lark_field": "P. QA md", "jira_field": "customfield_10178",
+            "jira_label": "QA Manday", "direction": "both",
+            "field_type": "number", "is_system": False, "active": True}]
+
+
+@patch("jira_handler.field_mappings.get_custom_jira_to_lark", return_value=_QA_MAP)
+@patch("jira_handler.lark_api")
+def test_custom_only_changelog_passes_gate_and_syncs_as_number(mock_lark, _gm):
+    """A changelog with ONLY a custom field must pass the gate (was dropped
+    silently) and write a NUMBER, not the raw string (NumberFieldConvFail)."""
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {}}
+    changelog = {"items": [{"field": "QA Man day", "fieldId": "customfield_10178",
+                            "to": "5", "toString": "5"}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+
+    mock_lark.update_record.assert_called_once()
+    fields = mock_lark.update_record.call_args[0][4]
+    assert fields["P. QA md"] == 5
+    assert isinstance(fields["P. QA md"], int)  # number, not "5"
+
+
+@patch("jira_handler.field_mappings.get_custom_jira_to_lark", return_value=_QA_MAP)
+@patch("jira_handler.lark_api")
+def test_custom_number_no_redundant_write_when_equal(mock_lark, _gm):
+    """Loop guard: Lark already holds the same number → no write."""
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {"P. QA md": 5}}
+    changelog = {"items": [{"field": "QA Man day", "fieldId": "customfield_10178",
+                            "to": "5", "toString": "5"}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+
+    mock_lark.update_record.assert_not_called()
+
+
+@patch("jira_handler.field_mappings.get_custom_jira_to_lark", return_value=_QA_MAP)
+@patch("jira_handler.lark_api")
+def test_custom_number_float_value(mock_lark, _gm):
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {"P. QA md": 1}}
+    changelog = {"items": [{"field": "QA Man day", "fieldId": "customfield_10178",
+                            "to": "0.5", "toString": "0.5"}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+
+    fields = mock_lark.update_record.call_args[0][4]
+    assert fields["P. QA md"] == 0.5
