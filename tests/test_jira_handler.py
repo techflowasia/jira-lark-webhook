@@ -179,3 +179,128 @@ def test_sprint_changelog_skips_when_release_set_matches(mock_lark):
     jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
 
     mock_lark.update_record.assert_not_called()
+
+
+# ---- Regression: Bug 2 — Jira Start/End date → Lark (was unrecognized) ----
+
+def test_jira_date_to_lark_ts_round_trips_bangkok():
+    """Loop-safety: Jira date → Lark ms → Lark date must be the SAME day,
+    and match Lark's native Bangkok-midnight storage (no redundant writes)."""
+    from utils import _jira_date_to_lark_ts, _lark_ts_to_jira_date
+    ts = _jira_date_to_lark_ts("2026-06-05")
+    assert ts is not None
+    assert _lark_ts_to_jira_date(ts) == "2026-06-05"
+
+
+@patch("jira_handler.lark_api")
+def test_duedate_changelog_syncs_to_lark_end(mock_lark):
+    from utils import _jira_date_to_lark_ts
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {}}
+    changelog = {"items": [{"field": "duedate", "fieldId": "duedate",
+                            "to": "2026-06-05", "toString": "2026-06-05 00:00:00.0"}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+
+    mock_lark.update_record.assert_called_once()
+    fields = mock_lark.update_record.call_args[0][4]
+    assert fields["Timeline - End"] == _jira_date_to_lark_ts("2026-06-05")
+
+
+@patch("jira_handler.lark_api")
+def test_startdate_changelog_syncs_to_lark_start(mock_lark):
+    from utils import _jira_date_to_lark_ts
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {}}
+    changelog = {"items": [{"field": "Start date", "fieldId": "customfield_10015",
+                            "to": "2026-06-05", "toString": "5/Jun/26"}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+
+    mock_lark.update_record.assert_called_once()
+    fields = mock_lark.update_record.call_args[0][4]
+    assert fields["Timeline - Start"] == _jira_date_to_lark_ts("2026-06-05")
+
+
+@patch("jira_handler.lark_api")
+def test_startdate_no_redundant_write_when_already_matching(mock_lark):
+    """Loop guard: if Lark already holds the Bangkok-midnight ts, no write."""
+    from utils import _jira_date_to_lark_ts
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    same = _jira_date_to_lark_ts("2026-06-05")
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {"Timeline - Start": same}}
+    changelog = {"items": [{"field": "Start date", "fieldId": "customfield_10015",
+                            "to": "2026-06-05", "toString": "5/Jun/26"}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+
+    mock_lark.update_record.assert_not_called()
+
+
+# ---- Regression: Bug 1 — parent change fires 'IssueParentAssociation' ----
+
+def _issue_with_parent(parent_key):
+    return {"key": "PROJ-1",
+            "fields": {"summary": "S", "issuetype": {"name": "Story"},
+                       "assignee": None, "customfield_10016": None,
+                       "customfield_10175": None, "customfield_10176": None,
+                       "status": {"name": "To Do"},
+                       "parent": {"key": parent_key}}}
+
+
+@patch("jira_handler.lark_api")
+def test_parent_change_syncs_via_issueparentassociation(mock_lark):
+    """Jira fires field 'IssueParentAssociation' (fieldId None) for a parent
+    change — must pass the gate and sync the new parent link to Lark."""
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    index._jira_to_lark["VR-257"] = "recParent"
+    index._lark_to_jira["recParent"] = "VR-257"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {"Parent items": []}}
+    changelog = {"items": [{"field": "IssueParentAssociation", "fieldId": None,
+                            "from": "13453", "to": "13438",
+                            "fromString": "VR-270", "toString": "VR-257"}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", _issue_with_parent("VR-257"),
+                         changelog, CFG)
+
+    mock_lark.update_record.assert_called_once()
+    fields = mock_lark.update_record.call_args[0][4]
+    assert fields["Parent items"] == ["recParent"]
+
+
+@patch("jira_handler.lark_api")
+def test_parent_change_deferred_is_logged_not_silent(mock_lark):
+    """If the new parent has no Lark record yet, do NOT silently no-op —
+    record a 'skipped' history row so the divergence is visible."""
+    import history
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    # VR-999 NOT in index
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {"Parent items": []}}
+    changelog = {"items": [{"field": "IssueParentAssociation", "fieldId": None,
+                            "from": "1", "to": "2",
+                            "fromString": "VR-1", "toString": "VR-999"}]}
+
+    with patch.object(history, "record") as mrec:
+        import jira_handler
+        jira_handler.process("jira:issue_updated", _issue_with_parent("VR-999"),
+                             changelog, CFG)
+
+    mock_lark.update_record.assert_not_called()
+    assert mrec.called, "expected a deferred-parent history row, got silent no-op"
+    kw = mrec.call_args.kwargs
+    assert kw.get("status") == "skipped"
+    assert "VR-999" in kw.get("description", "")

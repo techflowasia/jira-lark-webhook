@@ -9,6 +9,13 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
+## 2026-05-18 — Fix Jira→Lark parent + start/end date sync (silent drops)
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| _pending_ | fix | **Parent change never synced, no log.** Jira fires the parent-change changelog as field `IssueParentAssociation` (fieldId `None`), not `parent`. `RELEVANT_CHANGELOG_FIELDS` only had `parent`, so the line-103 gate returned early — no fetch, no parent reconcile, no history row. Added `IssueParentAssociation` to the gate set; parent resolver now falls back to the changelog `toString` when `issue.fields.parent` is absent; and a parent change whose target isn't linked in Lark yet records a `skipped` history row instead of a silent no-op (Data Integrity Rule — no hidden divergence). Confirmed from the live VR-331 webhook |
+| _pending_ | fix | **Start/End date never synced Jira→Lark, no log.** `customfield_10015` (Start date) and `duedate` (End date) were absent from `RELEVANT_CHANGELOG_FIELDS` and had no changelog branch, and were never set on create or in reconcile — the `both`-direction mapping only ever ran Lark→Jira. Added both to the gate set + changelog branches (use the clean `to` value), and to the create path, `reconcile._sync_issue_to_lark`, and backfill Steps 3+5. Fixed the dead `utils._jira_date_to_lark_ts` to use Bangkok midnight (`_BKK`) so it round-trips exactly with `_lark_ts_to_jira_date` — a naive/UTC midnight would make every date write differ from Lark's stored value (redundant writes / sync loop) |
+
 ## 2026-05-16 — Project rule: data-integrity verification
 
 | Commit | Type | Summary |

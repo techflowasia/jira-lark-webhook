@@ -3,9 +3,9 @@ import logging
 import lark_api, index, dedup, history, field_mappings, config
 from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END, F_PARENT,
-                    F_RELEASE, JIRA_TO_LARK_ASSIGNEE)
-from utils import (_jira_datetime_to_lark_ts, _lark_text, _lark_select,
-                   _lark_link_rid, _lark_multi)
+                    F_RELEASE, F_START, F_END, JIRA_TO_LARK_ASSIGNEE)
+from utils import (_jira_datetime_to_lark_ts, _jira_date_to_lark_ts,
+                   _lark_text, _lark_select, _lark_link_rid, _lark_multi)
 
 log = logging.getLogger(__name__)
 
@@ -24,7 +24,13 @@ def _split_sprint_changelog(to_str: str) -> list:
 RELEVANT_CHANGELOG_FIELDS = {
     "summary", "assignee", "customfield_10016",
     "customfield_10175", "customfield_10176", "status", "parent",
-    "customfield_10020",  # Sprint → Release
+    "customfield_10020",       # Sprint → Release
+    "customfield_10015",       # Start date → Timeline - Start
+    "duedate",                 # Due date  → Timeline - End
+    "IssueParentAssociation",  # Jira's actual changelog field name for a
+                               # parent change (fieldId is None) — without
+                               # this the gate returned early and parent
+                               # changes synced nothing, with no log.
 }
 
 
@@ -63,6 +69,8 @@ def _handle_create(issue: dict, cfg: dict) -> None:
     jira_status = (jf.get("status") or {}).get("name")
     actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
     actual_end = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
+    start_ts = _jira_date_to_lark_ts(jf.get("customfield_10015"))
+    end_ts = _jira_date_to_lark_ts(jf.get("duedate"))
     parent_jira_key = (jf.get("parent") or {}).get("key")
     parent_record_id = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
     sprint_data = jf.get("customfield_10020") or []
@@ -79,6 +87,8 @@ def _handle_create(issue: dict, cfg: dict) -> None:
     if jira_status:      fields[F_JIRA_STATUS]  = jira_status
     if actual_start:     fields[F_ACTUAL_START] = actual_start
     if actual_end:       fields[F_ACTUAL_END]   = actual_end
+    if start_ts:         fields[F_START]        = start_ts
+    if end_ts:           fields[F_END]          = end_ts
     if parent_record_id: fields[F_PARENT]       = [parent_record_id]
     if sprint_names:     fields[F_RELEASE]      = sprint_names
 
@@ -156,14 +166,37 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
                 if new_releases and set(new_releases) != current:
                     updates[F_RELEASE] = new_releases
 
-    # Reconcile parent on every update — Jira only fires a 'parent' changelog
-    # item when parent itself changes, so a title-only edit would otherwise miss
-    # back-filling a parent that wasn't in the index at create time (e.g. subtask
-    # synced before its parent task was linked).
+        elif field == "customfield_10015":  # Jira Start date → Timeline - Start
+            ts = _jira_date_to_lark_ts(to_raw or to_str)
+            if ts is not None and ts != lark_fields.get(F_START):
+                updates[F_START] = ts
+
+        elif field == "duedate":  # Jira Due date → Timeline - End
+            ts = _jira_date_to_lark_ts(to_raw or to_str)
+            if ts is not None and ts != lark_fields.get(F_END):
+                updates[F_END] = ts
+
+    # Reconcile parent on every update. Jira fires the parent-change changelog
+    # as field 'IssueParentAssociation' (fieldId None) — `toString` is the new
+    # parent key. Resolve from issue.fields.parent first, fall back to that
+    # changelog value if the snapshot lacks it.
+    parent_change = next(
+        (it for it in items
+         if (it.get("fieldId") or it.get("field")) in ("parent", "IssueParentAssociation")),
+        None)
     parent_jira_key = (issue["fields"].get("parent") or {}).get("key")
+    if not parent_jira_key and parent_change:
+        parent_jira_key = parent_change.get("toString") or None
     parent_record_id = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
+    parent_deferred = None
     if parent_record_id and _lark_link_rid(lark_fields.get(F_PARENT)) != parent_record_id:
         updates[F_PARENT] = [parent_record_id]
+    elif parent_change and parent_jira_key and not parent_record_id:
+        # Parent changed but its Lark record isn't linked yet — never silently
+        # drop it (a parent that's set in Jira but missing in Lark is exactly
+        # the kind of divergence the Data Integrity Rule forbids hiding). Flag
+        # it so it's logged; the reconcile loop repairs once the parent syncs.
+        parent_deferred = parent_jira_key
 
     # Apply custom (non-system) Jira → Lark mappings from changelog
     custom_j2l = {m["jira_field"]: m for m in field_mappings.get_custom_jira_to_lark()}
@@ -176,6 +209,15 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
                 updates[m["lark_field"]] = to_str
 
     if not updates:
+        if parent_deferred:
+            itype = ((issue.get("fields") or {}).get("issuetype") or {}).get("name", "")
+            log.info(f"jira_handler: {key} parent → {parent_deferred} deferred "
+                     f"(parent not yet linked in Lark)")
+            history.record(direction="jira→lark", event="updated", jira_key=key,
+                           lark_id=record_id,
+                           description=f"Parent → {parent_deferred} (deferred: "
+                                       f"parent not yet linked in Lark)",
+                           status="skipped", type=itype)
         return
 
     lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"],

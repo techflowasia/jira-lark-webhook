@@ -91,10 +91,17 @@ def _lark_multi(field_val) -> list:
 
 
 def _jira_date_to_lark_ts(date_str: "str | None") -> "int | None":
+    """Jira date ("YYYY-MM-DD") → Lark ms timestamp at Bangkok midnight.
+
+    Must use _BKK so it round-trips exactly with _lark_ts_to_jira_date and
+    matches what Lark Base natively stores for a date (base TZ Asia/Bangkok).
+    A naive/UTC midnight here would make every Jira→Lark date write differ
+    from Lark's stored value → redundant writes / a sync loop.
+    """
     if not date_str:
         return None
     try:
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=_BKK)
         return int(dt.timestamp() * 1000)
     except Exception:
         return None

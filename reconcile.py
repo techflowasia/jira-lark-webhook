@@ -10,7 +10,8 @@ from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_PARENT, F_START, F_END, F_RELEASE,
                     JIRA_TO_LARK_ASSIGNEE, LARK_TO_JIRA_ASSIGNEE)
 from utils import (_lark_text, _lark_select, _jira_datetime_to_lark_ts,
-                   _lark_ts_to_jira_date, _lark_link_rid, _lark_multi)
+                   _jira_date_to_lark_ts, _lark_ts_to_jira_date,
+                   _lark_link_rid, _lark_multi)
 
 log = logging.getLogger(__name__)
 
@@ -226,6 +227,8 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
     jira_status = (jf.get("status") or {}).get("name")
     actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
     actual_end = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
+    start_ts = _jira_date_to_lark_ts(jf.get("customfield_10015"))
+    end_ts = _jira_date_to_lark_ts(jf.get("duedate"))
 
     parent_jira_key = (jf.get("parent") or {}).get("key")
     parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
@@ -246,6 +249,10 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
             updates[F_ACTUAL_START] = actual_start
         if actual_end is not None and rec["fields"].get(F_ACTUAL_END) != actual_end:
             updates[F_ACTUAL_END] = actual_end
+        if start_ts is not None and rec["fields"].get(F_START) != start_ts:
+            updates[F_START] = start_ts
+        if end_ts is not None and rec["fields"].get(F_END) != end_ts:
+            updates[F_END] = end_ts
         cur_parent_rid = _lark_link_rid(rec["fields"].get(F_PARENT))
         if parent_rid and cur_parent_rid != parent_rid:
             updates[F_PARENT] = [parent_rid]
@@ -270,6 +277,8 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
         if jira_status:        fields[F_JIRA_STATUS]  = jira_status
         if actual_start:       fields[F_ACTUAL_START] = actual_start
         if actual_end:         fields[F_ACTUAL_END]   = actual_end
+        if start_ts:           fields[F_START]        = start_ts
+        if end_ts:             fields[F_END]          = end_ts
         if parent_rid:         fields[F_PARENT]       = [parent_rid]
         try:
             rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"],
@@ -401,6 +410,8 @@ def backfill(cfg: dict) -> dict:
         jira_status = (jf.get("status") or {}).get("name")
         actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
         actual_end   = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
+        start_ts = _jira_date_to_lark_ts(jf.get("customfield_10015"))
+        end_ts   = _jira_date_to_lark_ts(jf.get("duedate"))
         parent_jira_key = (jf.get("parent") or {}).get("key")
         parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
         fields = {
@@ -414,6 +425,8 @@ def backfill(cfg: dict) -> dict:
         if jira_status:        fields[F_JIRA_STATUS]  = jira_status
         if actual_start:       fields[F_ACTUAL_START] = actual_start
         if actual_end:         fields[F_ACTUAL_END]   = actual_end
+        if start_ts:           fields[F_START]        = start_ts
+        if end_ts:             fields[F_END]          = end_ts
         if parent_rid:         fields[F_PARENT]       = [parent_rid]
         try:
             rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], fields)
@@ -480,6 +493,8 @@ def backfill(cfg: dict) -> dict:
         jira_status  = (jf.get("status") or {}).get("name")
         actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
         actual_end   = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
+        start_ts     = _jira_date_to_lark_ts(jf.get("customfield_10015"))
+        end_ts       = _jira_date_to_lark_ts(jf.get("duedate"))
         sprint_data  = jf.get("customfield_10020") or []
         sprint_names = [s.get("name") for s in sprint_data if s.get("name")]
         parent_jira_key = (jf.get("parent") or {}).get("key")
@@ -497,6 +512,10 @@ def backfill(cfg: dict) -> dict:
             updates[F_ACTUAL_START] = actual_start
         if actual_end is not None and cur.get(F_ACTUAL_END) != actual_end:
             updates[F_ACTUAL_END] = actual_end
+        if start_ts is not None and cur.get(F_START) != start_ts:
+            updates[F_START] = start_ts
+        if end_ts is not None and cur.get(F_END) != end_ts:
+            updates[F_END] = end_ts
         if sprint_names and set(sprint_names) != set(_lark_multi(cur.get(F_RELEASE))):
             updates[F_RELEASE] = sprint_names
         cur_parent_rid = _lark_link_rid(cur.get(F_PARENT))
