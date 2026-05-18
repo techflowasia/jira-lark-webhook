@@ -14,13 +14,6 @@ def _sprint_names(sprint_data) -> list:
     """All sprint names from Jira's customfield_10020 (list of sprint dicts)."""
     return [s.get("name") for s in (sprint_data or []) if s.get("name")]
 
-
-def _split_sprint_changelog(to_str: str) -> list:
-    """Jira's sprint changelog `toString` is comma-joined ("A, B"). Split it
-    into individual option names so Lark's multi-select Release gets separate
-    values instead of one bogus combined "A, B" option."""
-    return [s.strip() for s in (to_str or "").split(",") if s.strip()]
-
 RELEVANT_CHANGELOG_FIELDS = {
     "summary", "assignee", "customfield_10016",
     "customfield_10175", "customfield_10176", "status", "parent",
@@ -164,13 +157,6 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
             if to_str and to_str != _lark_select(lark_fields.get(F_JIRA_STATUS)):
                 updates[F_JIRA_STATUS] = to_str
 
-        elif field == "customfield_10020":
-            if to_str:
-                new_releases = _split_sprint_changelog(to_str)
-                current = set(_lark_multi(lark_fields.get(F_RELEASE)))
-                if new_releases and set(new_releases) != current:
-                    updates[F_RELEASE] = new_releases
-
         elif field == "customfield_10015":  # Jira Start date → Timeline - Start
             ts = _jira_date_to_lark_ts(to_raw or to_str)
             if ts is not None and ts != lark_fields.get(F_START):
@@ -202,6 +188,19 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
         # the kind of divergence the Data Integrity Rule forbids hiding). Flag
         # it so it's logged; the reconcile loop repairs once the parent syncs.
         parent_deferred = parent_jira_key
+
+    # Reconcile Release against Jira's CURRENT sprint on every update — like
+    # parent, not only when a sprint changelog item is present. Jira sprint is
+    # the source of truth for "which sprint". Without this, a non-sprint edit
+    # (sub-task add, man-day change) leaves a stale Lark Release; the
+    # Lark→Jira sprint-move path then pushes that wrong value back and moves
+    # the Jira card to the wrong sprint (silent data corruption). Value-compare
+    # as a set so this can't cause a redundant write / loop. Empty Jira sprint
+    # is left alone here (clearing is a separate, bidirectionally-ambiguous
+    # case — see Data Integrity note in the report).
+    jira_sprints = _sprint_names(issue["fields"].get("customfield_10020"))
+    if jira_sprints and set(jira_sprints) != set(_lark_multi(lark_fields.get(F_RELEASE))):
+        updates[F_RELEASE] = jira_sprints
 
     # Apply custom (dashboard-configured) Jira → Lark mappings from changelog.
     # Coerce by the mapping's field_type — writing a raw string to a Lark

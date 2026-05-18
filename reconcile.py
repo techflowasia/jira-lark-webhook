@@ -230,6 +230,8 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
     start_ts = _jira_date_to_lark_ts(jf.get("customfield_10015"))
     end_ts = _jira_date_to_lark_ts(jf.get("duedate"))
 
+    sprint_names = [s.get("name") for s in (jf.get("customfield_10020") or [])
+                    if s.get("name")]
     parent_jira_key = (jf.get("parent") or {}).get("key")
     parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
 
@@ -256,6 +258,10 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
         cur_parent_rid = _lark_link_rid(rec["fields"].get(F_PARENT))
         if parent_rid and cur_parent_rid != parent_rid:
             updates[F_PARENT] = [parent_rid]
+        # Reconcile Release vs Jira's current sprint (Jira is source of truth);
+        # without this the 6 h loop never corrects a diverged Lark Release.
+        if sprint_names and set(sprint_names) != set(_lark_multi(rec["fields"].get(F_RELEASE))):
+            updates[F_RELEASE] = sprint_names
 
         if updates:
             dedup.mark(f"lark:{rid}")
@@ -280,6 +286,7 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
         if start_ts:           fields[F_START]        = start_ts
         if end_ts:             fields[F_END]          = end_ts
         if parent_rid:         fields[F_PARENT]       = [parent_rid]
+        if sprint_names:       fields[F_RELEASE]      = sprint_names
         try:
             rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"],
                                          cfg["LARK_TABLE_ID"], fields)
@@ -412,6 +419,8 @@ def backfill(cfg: dict) -> dict:
         actual_end   = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
         start_ts = _jira_date_to_lark_ts(jf.get("customfield_10015"))
         end_ts   = _jira_date_to_lark_ts(jf.get("duedate"))
+        sprint_names = [s.get("name") for s in (jf.get("customfield_10020") or [])
+                        if s.get("name")]
         parent_jira_key = (jf.get("parent") or {}).get("key")
         parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
         fields = {
@@ -428,6 +437,7 @@ def backfill(cfg: dict) -> dict:
         if start_ts:           fields[F_START]        = start_ts
         if end_ts:             fields[F_END]          = end_ts
         if parent_rid:         fields[F_PARENT]       = [parent_rid]
+        if sprint_names:       fields[F_RELEASE]      = sprint_names
         try:
             rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], fields)
             dedup.mark(f"lark:{rid}")

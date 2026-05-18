@@ -143,21 +143,32 @@ def test_story_points_skipped_when_value_matches(mock_lark):
     mock_lark.update_record.assert_not_called()
 
 
-# ---- Regression: multi-select Release must not become one combined option ----
+# ---- Regression: Release reconciled vs Jira CURRENT sprint, every update ----
+
+def _issue_with_sprint(sprint_names, summary="S"):
+    return {"key": "PROJ-1",
+            "fields": {"summary": summary, "issuetype": {"name": "Story"},
+                       "assignee": None, "customfield_10016": None,
+                       "customfield_10175": None, "customfield_10176": None,
+                       "status": {"name": "To Do"}, "parent": None,
+                       "customfield_10020": [{"name": n} for n in sprint_names]}}
+
 
 @patch("jira_handler.lark_api")
-def test_sprint_changelog_splits_into_separate_release_options(mock_lark):
-    """Jira sprint changelog toString is comma-joined ("A, B"). It must be
-    written to Lark as separate multi-select values, not one "A, B" option."""
+def test_release_reconciles_from_jira_current_sprint(mock_lark):
+    """Release is written from issue.fields.customfield_10020 (Jira's current
+    sprint), as separate multi-select values — not one combined option."""
     index._jira_to_lark["PROJ-1"] = "rec1"
     index._lark_to_jira["rec1"] = "PROJ-1"
     mock_lark.get_token.return_value = "tok"
     mock_lark.get_record.return_value = {"fields": {"Release": []}}
-    changelog = {"items": [{"field": "customfield_10020",
+    changelog = {"items": [{"field": "Sprint", "fieldId": "customfield_10020",
                             "toString": "VR Sprint 2, Beta 1", "to": None}]}
 
     import jira_handler
-    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+    jira_handler.process("jira:issue_updated",
+                         _issue_with_sprint(["VR Sprint 2", "Beta 1"]),
+                         changelog, CFG)
 
     mock_lark.update_record.assert_called_once()
     fields = mock_lark.update_record.call_args[0][4]
@@ -165,20 +176,45 @@ def test_sprint_changelog_splits_into_separate_release_options(mock_lark):
 
 
 @patch("jira_handler.lark_api")
-def test_sprint_changelog_skips_when_release_set_matches(mock_lark):
-    """No redundant write (loop guard) when Lark Release already holds the
-    same set of names, regardless of order."""
+def test_release_no_redundant_write_when_set_matches(mock_lark):
+    """Loop guard: Lark already holds the same sprint set (any order) → no write."""
     index._jira_to_lark["PROJ-1"] = "rec1"
     index._lark_to_jira["rec1"] = "PROJ-1"
     mock_lark.get_token.return_value = "tok"
     mock_lark.get_record.return_value = {"fields": {"Release": ["Beta 1", "VR Sprint 2"]}}
-    changelog = {"items": [{"field": "customfield_10020",
+    changelog = {"items": [{"field": "Sprint", "fieldId": "customfield_10020",
                             "toString": "VR Sprint 2, Beta 1", "to": None}]}
 
     import jira_handler
-    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+    jira_handler.process("jira:issue_updated",
+                         _issue_with_sprint(["VR Sprint 2", "Beta 1"]),
+                         changelog, CFG)
 
     mock_lark.update_record.assert_not_called()
+
+
+@patch("jira_handler.lark_api")
+def test_non_sprint_edit_corrects_diverged_release(mock_lark):
+    """THE BUG: VR-256 on Jira Beta 1.3 but Lark Release Beta 1.4. A
+    NON-sprint Jira edit (summary) must still reconcile Lark Release to
+    Jira's current sprint — otherwise the stale Lark value later moves the
+    Jira card to the wrong sprint. Fails without the unconditional reconcile."""
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_record.return_value = {"fields": {"Release": ["Beta 1.4"]}}
+    # Changelog has NO sprint item — only a summary change.
+    changelog = {"items": [{"field": "summary", "fieldId": "summary",
+                            "toString": "new title", "to": None}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated",
+                         _issue_with_sprint(["Beta 1.3"], summary="new title"),
+                         changelog, CFG)
+
+    mock_lark.update_record.assert_called_once()
+    fields = mock_lark.update_record.call_args[0][4]
+    assert fields["Release"] == ["Beta 1.3"]  # corrected to Jira's truth
 
 
 # ---- Regression: Bug 2 — Jira Start/End date → Lark (was unrecognized) ----
