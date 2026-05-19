@@ -1,10 +1,14 @@
 """Field parse helpers — copied from jira-lark-sync/sync_engine.py."""
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
-# Lark stores date-field timestamps as midnight in Bangkok time (UTC+7).
-# All date conversions must use this offset to get the correct calendar date.
-_BKK = timezone(timedelta(hours=7))
+# Lark Bitable Date fields store/return the value as UTC midnight of the
+# calendar day (time-of-day is truncated to 00:00:00Z). Date-only conversions
+# MUST use UTC, not a local offset: a Bangkok-midnight instant is 17:00Z the
+# *previous* day, which Lark truncates to the previous calendar day — every
+# Jira↔Lark round-trip then loses a day and the value-compare loop guard never
+# converges (the 2026-05 runaway rewrite incident). _jira_datetime_to_lark_ts
+# below handles real datetimes (with their own offset) and is unaffected.
 
 
 def _norm(text: str) -> str:
@@ -91,17 +95,18 @@ def _lark_multi(field_val) -> list:
 
 
 def _jira_date_to_lark_ts(date_str: "str | None") -> "int | None":
-    """Jira date ("YYYY-MM-DD") → Lark ms timestamp at Bangkok midnight.
+    """Jira date ("YYYY-MM-DD") → Lark ms timestamp at UTC midnight.
 
-    Must use _BKK so it round-trips exactly with _lark_ts_to_jira_date and
-    matches what Lark Base natively stores for a date (base TZ Asia/Bangkok).
-    A naive/UTC midnight here would make every Jira→Lark date write differ
-    from Lark's stored value → redundant writes / a sync loop.
+    UTC (not Bangkok) so it round-trips exactly with _lark_ts_to_jira_date and
+    matches what Lark Bitable stores for a Date field (UTC-midnight of the
+    day). Bangkok midnight here is 17:00Z the previous day, which Lark
+    truncates down a day → permanent one-day drift + a non-converging
+    value-compare loop. See the module header.
     """
     if not date_str:
         return None
     try:
-        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=_BKK)
+        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         return int(dt.timestamp() * 1000)
     except Exception:
         return None
@@ -122,6 +127,6 @@ def _lark_ts_to_jira_date(ts_ms) -> "str | None":
     if not ts_ms:
         return None
     try:
-        return datetime.fromtimestamp(int(ts_ms) / 1000, tz=_BKK).strftime("%Y-%m-%d")
+        return datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
     except Exception:
         return None

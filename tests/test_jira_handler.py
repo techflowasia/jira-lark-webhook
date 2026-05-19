@@ -219,9 +219,9 @@ def test_non_sprint_edit_corrects_diverged_release(mock_lark):
 
 # ---- Regression: Bug 2 — Jira Start/End date → Lark (was unrecognized) ----
 
-def test_jira_date_to_lark_ts_round_trips_bangkok():
+def test_jira_date_to_lark_ts_round_trips_utc():
     """Loop-safety: Jira date → Lark ms → Lark date must be the SAME day,
-    and match Lark's native Bangkok-midnight storage (no redundant writes)."""
+    and match Lark's native UTC-midnight storage (no redundant writes)."""
     from utils import _jira_date_to_lark_ts, _lark_ts_to_jira_date
     ts = _jira_date_to_lark_ts("2026-06-05")
     assert ts is not None
@@ -266,7 +266,7 @@ def test_startdate_changelog_syncs_to_lark_start(mock_lark):
 
 @patch("jira_handler.lark_api")
 def test_startdate_no_redundant_write_when_already_matching(mock_lark):
-    """Loop guard: if Lark already holds the Bangkok-midnight ts, no write."""
+    """Loop guard: if Lark already holds the UTC-midnight ts, no write."""
     from utils import _jira_date_to_lark_ts
     index._jira_to_lark["PROJ-1"] = "rec1"
     index._lark_to_jira["rec1"] = "PROJ-1"
