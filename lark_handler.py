@@ -397,12 +397,14 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict, after_value=None) ->
         changed.append(f"Title: \"{title}\"")
 
     start = _lark_ts_to_jira_date(rec["fields"].get(F_START))
-    if start and start != jira_fields.get("customfield_10015"):
+    if (start and start != jira_fields.get("customfield_10015")
+            and not dedup.is_ours(dedup.date_echo_key(jira_key, "start", start))):
         updates["customfield_10015"] = start
         changed.append(f"Start: {start}")
 
     end = _lark_ts_to_jira_date(rec["fields"].get(F_END))
-    if end and end != jira_fields.get("duedate"):
+    if (end and end != jira_fields.get("duedate")
+            and not dedup.is_ours(dedup.date_echo_key(jira_key, "end", end))):
         updates["duedate"] = end
         changed.append(f"Due: {end}")
 
@@ -476,6 +478,13 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict, after_value=None) ->
     if updates:
         log.info(f"lark_handler: sending to Jira {jira_key} fields={list(updates.keys())}")
         jira_api.update_issue(cfg, jira_key, updates)
+        # Echo-suppress: the Jira write fires a Jira→Lark webhook for these
+        # exact dates; mark them so jira_handler skips re-propagating (breaks
+        # the bidirectional conflict ping-pong). Symmetric with jira_handler.
+        if "customfield_10015" in updates:
+            dedup.mark(dedup.date_echo_key(jira_key, "start", updates["customfield_10015"]))
+        if "duedate" in updates:
+            dedup.mark(dedup.date_echo_key(jira_key, "end", updates["duedate"]))
 
     if sid:
         try:

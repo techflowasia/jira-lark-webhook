@@ -5,7 +5,8 @@ from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
                     F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END, F_PARENT,
                     F_RELEASE, F_START, F_END, JIRA_TO_LARK_ASSIGNEE)
 from utils import (_jira_datetime_to_lark_ts, _jira_date_to_lark_ts,
-                   _lark_text, _lark_select, _lark_link_rid, _lark_multi)
+                   _lark_ts_to_jira_date, _lark_text, _lark_select,
+                   _lark_link_rid, _lark_multi)
 
 log = logging.getLogger(__name__)
 
@@ -159,12 +160,16 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
 
         elif field == "customfield_10015":  # Jira Start date → Timeline - Start
             ts = _jira_date_to_lark_ts(to_raw or to_str)
-            if ts is not None and ts != lark_fields.get(F_START):
+            if (ts is not None and ts != lark_fields.get(F_START)
+                    and not dedup.is_ours(
+                        dedup.date_echo_key(key, "start", _lark_ts_to_jira_date(ts)))):
                 updates[F_START] = ts
 
         elif field == "duedate":  # Jira Due date → Timeline - End
             ts = _jira_date_to_lark_ts(to_raw or to_str)
-            if ts is not None and ts != lark_fields.get(F_END):
+            if (ts is not None and ts != lark_fields.get(F_END)
+                    and not dedup.is_ours(
+                        dedup.date_echo_key(key, "end", _lark_ts_to_jira_date(ts)))):
                 updates[F_END] = ts
 
     # Reconcile parent on every update. Jira fires the parent-change changelog
@@ -243,6 +248,12 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
 
     lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"],
                            record_id, updates)
+    # Echo-suppress: the Lark write above will fire a Lark→Jira webhook for
+    # these exact dates; mark them so lark_handler skips re-propagating (breaks
+    # a bidirectional conflict ping-pong). Keyed on the canonical Jira date.
+    for slot, fld in (("start", F_START), ("end", F_END)):
+        if fld in updates:
+            dedup.mark(dedup.date_echo_key(key, slot, _lark_ts_to_jira_date(updates[fld])))
     desc = ", ".join(f"{item.get('field')}: {item.get('toString','')}" for item in items
                      if (item.get("fieldId") or item.get("field")) in RELEVANT_CHANGELOG_FIELDS)
     log.info(f"jira_handler: updated Lark {record_id} from Jira {key} — {desc}")
