@@ -693,6 +693,171 @@ def test_decode_one_text_plain_string_kept():
 
 @patch("lark_handler.jira_api")
 @patch("lark_handler.lark_api")
+def test_decoder_filters_unchanged_fields(mock_lark, mock_jira):
+    """2026-05 reconcile→QA-Manday burst regression.
+
+    Lark sends the full record in BOTH before_value and after_value on every
+    record_edited; only the changed fields differ. The decoder must filter to
+    only-changed fields, otherwise downstream re-pushes every relevant value
+    on every webhook (the spurious 'QA Manday: 1.0' / 'Sprint: Beta 1.2'
+    rows when nothing changed)."""
+    import lark_handler, field_mappings
+    field_mappings._cache = [
+        {"id": 99, "lark_field": "P. QA md", "jira_field": "customfield_10178",
+         "jira_label": "QA Manday", "direction": "both", "field_type": "number",
+         "is_system": False, "active": True},
+    ]
+    try:
+        index._lark_to_jira["recBurst"] = "PROJ-281"
+        index._jira_to_lark["PROJ-281"] = "recBurst"
+
+        meta = {
+            "fldRel": {"name": "Release", "type": 4,
+                       "options": {"optBeta12": "Beta 1.2", "optOld": "Old"}},
+            "fldQA":  {"name": "P. QA md", "type": 2, "options": {}},
+        }
+        mock_lark.get_token.return_value = "tok"
+        mock_lark.get_field_meta_by_id.return_value = meta
+        # Jira already in Beta 1.2 sprint and QA Manday already 1.0
+        mock_jira.get_issue.return_value = {"fields": {
+            "summary": "T",
+            "customfield_10178": 1.0,
+            "customfield_10020": [{"id": 5, "name": "Beta 1.2"}],
+            "fixVersions": [],
+        }}
+        mock_jira.get_account_ids.return_value = {}
+        mock_jira.get_project_versions.return_value = []
+        mock_jira.get_board_id.return_value = "b1"
+        mock_jira.get_board_sprints.return_value = [{"id": 5, "name": "Beta 1.2"}]
+
+        # Webhook: only Release option id changed; P. QA md raw value
+        # is byte-identical in before and after.
+        lark_handler.process({
+            "action": "record_edited", "record_id": "recBurst",
+            "before_value": [
+                {"field_id": "fldRel", "field_value": '["optOld"]'},
+                {"field_id": "fldQA",  "field_value": "1.0"},
+            ],
+            "after_value": [
+                {"field_id": "fldRel", "field_value": '["optBeta12"]'},
+                {"field_id": "fldQA",  "field_value": "1.0"},
+            ],
+        }, "tbl", CFG)
+
+        # No issue update should include QA Manday — it didn't change.
+        for call in mock_jira.update_issue.call_args_list:
+            sent = call[0][2]
+            assert "customfield_10178" not in sent, (
+                f"QA Manday re-pushed despite unchanged before/after: {sent}")
+    finally:
+        field_mappings._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_custom_mapping_skips_when_value_matches_jira(mock_lark, mock_jira):
+    """Defense-in-depth: even if the decoder doesn't filter (no before_value
+    supplied), the custom-mapping loop must value-compare against current
+    Jira state and skip re-writing a matching value."""
+    import lark_handler, field_mappings
+    field_mappings._cache = [
+        {"id": 99, "lark_field": "P. QA md", "jira_field": "customfield_10178",
+         "jira_label": "QA Manday", "direction": "both", "field_type": "number",
+         "is_system": False, "active": True},
+    ]
+    try:
+        index._lark_to_jira["recC"] = "PROJ-100"
+        index._jira_to_lark["PROJ-100"] = "recC"
+
+        rec = {"record_id": "recC",
+               "fields": {"Title": "T", "Jira Key": "PROJ-100",
+                          "P. QA md": 1.0}}
+        mock_lark.get_token.return_value = "tok"
+        mock_lark.get_record.return_value = rec
+        mock_jira.get_issue.return_value = {"fields": {
+            "summary": "T", "customfield_10178": 1.0}}
+        mock_jira.get_account_ids.return_value = {}
+        mock_jira.get_project_versions.return_value = []
+        mock_jira.get_board_id.return_value = None
+
+        # No after_value/before_value → falls back to get_record path; the
+        # H1 decoder filter is bypassed, only H2 (this gate) protects us.
+        lark_handler.process(
+            {"action": "record_edited", "record_id": "recC"}, "tbl", CFG)
+
+        mock_jira.update_issue.assert_not_called()
+    finally:
+        field_mappings._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_custom_mapping_writes_when_value_differs(mock_lark, mock_jira):
+    """Value-compare gate must not over-block: a real change still propagates."""
+    import lark_handler, field_mappings
+    field_mappings._cache = [
+        {"id": 99, "lark_field": "P. QA md", "jira_field": "customfield_10178",
+         "jira_label": "QA Manday", "direction": "both", "field_type": "number",
+         "is_system": False, "active": True},
+    ]
+    try:
+        index._lark_to_jira["recC2"] = "PROJ-101"
+        index._jira_to_lark["PROJ-101"] = "recC2"
+
+        rec = {"record_id": "recC2",
+               "fields": {"Title": "T", "Jira Key": "PROJ-101",
+                          "P. QA md": 2.5}}
+        mock_lark.get_token.return_value = "tok"
+        mock_lark.get_record.return_value = rec
+        mock_jira.get_issue.return_value = {"fields": {
+            "summary": "T", "customfield_10178": 1.0}}
+        mock_jira.get_account_ids.return_value = {}
+        mock_jira.get_project_versions.return_value = []
+        mock_jira.get_board_id.return_value = None
+
+        lark_handler.process(
+            {"action": "record_edited", "record_id": "recC2"}, "tbl", CFG)
+
+        mock_jira.update_issue.assert_called_once()
+        sent = mock_jira.update_issue.call_args[0][2]
+        assert sent.get("customfield_10178") == 2.5
+    finally:
+        field_mappings._cache = []
+
+
+@patch("lark_handler.lark_api")
+def test_decode_after_value_no_before_disables_filter(mock_lark):
+    """When before_value isn't supplied (legacy / coalesced re-run), the
+    decoder must not filter — fall back to including every relevant field."""
+    mock_lark.get_field_meta_by_id.return_value = _META
+    import lark_handler
+    out = lark_handler._decode_after_value(
+        [{"field_id": "fldTitle", "field_value": "T"}], "tok", CFG)
+    assert out == {"Title": "T"}
+
+
+@patch("lark_handler.lark_api")
+def test_decode_after_value_filters_byte_identical_field(mock_lark):
+    """Field present in both before and after with identical raw value → drop."""
+    mock_lark.get_field_meta_by_id.return_value = _META
+    import lark_handler
+    out = lark_handler._decode_after_value(
+        after_value=[
+            {"field_id": "fldTitle", "field_value": "Same"},
+            {"field_id": "fldStart", "field_value": "1779037200000"},
+        ],
+        token="tok", cfg=CFG,
+        before_value=[
+            {"field_id": "fldTitle", "field_value": "Same"},
+            {"field_id": "fldStart", "field_value": "1779000000000"},
+        ],
+    )
+    # Title unchanged → filtered out. Start changed → kept.
+    assert out == {"Timeline - Start": 1779037200000}
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
 def test_fast_path_title_writes_plain_text_not_json(mock_lark, mock_jira):
     """End-to-end: a Title edit delivered as a stringified rich-text array
     must push the inner plain text to Jira summary — NOT the JSON wrapper
