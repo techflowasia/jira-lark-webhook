@@ -179,8 +179,16 @@ def _decode_one(ftype, raw, options):
     return None, False  # unhandled type in sync scope → force safe fallback
 
 
-def _decode_after_value(after_value, token, cfg):
+def _decode_after_value(after_value, token, cfg, before_value=None):
     """Translate webhook [{field_id, field_value}] → {field_name: value}.
+
+    Lark sends a *full* record snapshot in both before_value and after_value
+    on every record_edited event — only a few field_values actually differ.
+    When `before_value` is supplied, only fields whose raw value differs are
+    decoded. Without this filter, decoded ends up populated with every
+    relevant field's current value on every webhook, and downstream handlers
+    (especially the custom-mapping loop) re-push them to Jira — the
+    2026-05 reconcile→QA-Manday echo burst.
 
     Value shapes match what lark_api.get_record returns, so the rest of
     _handle_update_impl runs unchanged. Returns None if any *relevant*
@@ -194,6 +202,10 @@ def _decode_after_value(after_value, token, cfg):
         log.info(f"lark_handler: field meta fetch failed ({e}) — fall back to get_record")
         return None
 
+    before_by_fid = {b.get("field_id"): b.get("field_value")
+                     for b in (before_value or [])}
+    have_before = bool(before_value)
+
     relevant = _relevant_lark_fields()
     fields = {}
     for av in after_value:
@@ -205,6 +217,12 @@ def _decode_after_value(after_value, token, cfg):
         fname = m["name"]
         if fname not in relevant:
             continue  # irrelevant field (e.g. formula recompute) — ignore, don't fall back
+        # Skip fields whose raw value did not change in this webhook. Lark
+        # repeats every field's value in after_value regardless of whether it
+        # changed, so without this gate "Release changed" implicitly carries
+        # "P. QA md is 1.0" and re-pushes QA Manday to Jira.
+        if have_before and av.get("field_value") == before_by_fid.get(fid):
+            continue
         value, ok = _decode_one(m["type"], av.get("field_value"), m["options"])
         if not ok:
             log.info(f"lark_handler: can't decode '{fname}' (type {m['type']}) — fall back to get_record")
@@ -221,7 +239,9 @@ def process(action: dict, table_id: str, cfg: dict) -> None:
         if act == "record_added":
             _handle_create(rid, table_id, cfg)
         elif act == "record_edited":
-            _handle_update(rid, table_id, cfg, after_value=action.get("after_value") or [])
+            _handle_update(rid, table_id, cfg,
+                           after_value=action.get("after_value") or [],
+                           before_value=action.get("before_value") or [])
         elif act == "record_deleted":
             _handle_delete(rid, cfg)
         else:
@@ -313,7 +333,8 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
             _create_in_flight.discard(rid)
 
 
-def _handle_update(rid: str, table_id: str, cfg: dict, after_value=None) -> None:
+def _handle_update(rid: str, table_id: str, cfg: dict,
+                   after_value=None, before_value=None) -> None:
     # Coalesce duplicate / rapid-fire record_edited events for the same rid into
     # at most two sequential passes (initial + re-run with fresh state if more
     # events arrived during processing). Parallel get_records on the same rid
@@ -330,20 +351,23 @@ def _handle_update(rid: str, table_id: str, cfg: dict, after_value=None) -> None
             return
         _update_in_flight.add(rid)
     try:
-        _handle_update_impl(rid, table_id, cfg, after_value=after_value)
+        _handle_update_impl(rid, table_id, cfg,
+                            after_value=after_value, before_value=before_value)
         while True:
             with _update_lock:
                 if rid not in _update_pending:
                     break
                 _update_pending.discard(rid)
-            _handle_update_impl(rid, table_id, cfg, after_value=None)
+            _handle_update_impl(rid, table_id, cfg,
+                                after_value=None, before_value=None)
     finally:
         with _update_lock:
             _update_in_flight.discard(rid)
             _update_pending.discard(rid)
 
 
-def _handle_update_impl(rid: str, table_id: str, cfg: dict, after_value=None) -> None:
+def _handle_update_impl(rid: str, table_id: str, cfg: dict,
+                        after_value=None, before_value=None) -> None:
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
 
     jira_key = index._lark_to_jira.get(rid)
@@ -353,7 +377,8 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict, after_value=None) ->
     # changed fields → decode the payload and skip get_record entirely. This is
     # the single biggest Lark API-call saving on the webhook hot path.
     if jira_key and after_value:
-        decoded = _decode_after_value(after_value, token, cfg)
+        decoded = _decode_after_value(after_value, token, cfg,
+                                      before_value=before_value)
         if decoded is not None:
             if not decoded:
                 log.info(f"lark_handler: {rid} no synced fields changed — skipping (no get_record)")
@@ -435,7 +460,12 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict, after_value=None) ->
             updates["parent"] = {"key": parent_jira_key}
             changed.append(f"Parent: {parent_jira_key}")
 
-    # Apply custom (non-system) Lark → Jira mappings
+    # Apply custom (non-system) Lark → Jira mappings.
+    # Value-compare each one against current Jira state before adding to updates.
+    # System fields (Title, dates, etc.) already do this; custom mappings used
+    # to write unconditionally — so every reconcile-triggered webhook re-pushed
+    # the same custom values to Jira (the 2026-05 QA-Manday echo burst, layered
+    # on top of the decoder fix as defense in depth).
     for m in field_mappings.get_custom_lark_to_jira():
         if m["jira_field"] == "customfield_10020":
             # Sprint is set via Agile API (move_to_sprint) — issue update rejects text values
@@ -453,9 +483,23 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict, after_value=None) ->
                 val = None
         else:
             val = _lark_text(raw) or _lark_select(raw)
-        if val:
-            updates[m["jira_field"]] = val
-            changed.append(f"{m['jira_label'] or m['lark_field']}: {val}")
+        if not val:
+            continue
+        cur = jira_fields.get(m["jira_field"])
+        if ft == "number":
+            cur_num = float(cur) if isinstance(cur, (int, float)) else None
+            if val == cur_num:
+                continue
+        elif ft == "date":
+            if val == cur:  # both canonical "YYYY-MM-DD"
+                continue
+        else:
+            if isinstance(cur, dict):
+                cur = cur.get("value") or cur.get("name")
+            if val == cur:
+                continue
+        updates[m["jira_field"]] = val
+        changed.append(f"{m['jira_label'] or m['lark_field']}: {val}")
 
     # Resolve the Release→sprint move BEFORE the early-return guard. A Release
     # change that maps to a sprint but not a fixVersion (or whose fixVersion

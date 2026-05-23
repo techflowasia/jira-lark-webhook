@@ -9,6 +9,12 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
+## 2026-05-22 — Fix reconcile→webhook echo burst (no-op rewrites)
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| `4d02d3b` | fix | **Reconcile-triggered echo burst re-pushed unchanged custom values to Jira (2026-05-20 17:20:35→17:21:02 burst, ~17 records).** Lark sends a *full* record snapshot in both `before_value` and `after_value` on every `record_edited` webhook — only a few `field_value`s actually differ. `_decode_after_value` iterated `after_value` alone, so a webhook in which only Release changed handed downstream a `decoded` dict populated with EVERY relevant field's current value (Title, dates, Assignee, Release, Parent, P. QA md). The custom-mapping loop in `_handle_update_impl` then wrote each one to Jira **without value-comparing** — system fields were already compared, custom fields were not — so reconcile's legitimate Release/date writes echoed back as a wave of `"Sprint: Beta 1.2"` / `"QA Manday: 1.0"` history rows pushing the same values Jira already had. Fix layer 1 (H1, root cause): `_decode_after_value` now accepts `before_value` and only decodes fields whose raw value actually changed; `process()` plumbs `before_value` through `_handle_update` → `_handle_update_impl`. Fix layer 2 (H2, defense in depth): the custom-mapping loop now value-compares to current `jira_fields[...]` before adding to updates, matching what system fields already do. 4 regression tests: webhook with only-Release-changed doesn't re-push QA Manday; gate skips a custom value Jira already has; real changes still propagate; legacy `before_value=None` callers fall back to the old (unfiltered) decoder behavior. Data: burst was a noisy no-op — values written equalled Jira's current values, so nothing was corrupted, just rate-limit pressure |
+
 ## 2026-05-19 — CRITICAL: fix one-day date drift + runaway rewrite loop
 
 | Commit | Type | Summary |
