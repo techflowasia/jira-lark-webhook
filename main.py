@@ -28,6 +28,12 @@ app = FastAPI()
 _sync_enabled: bool = True
 _reconcile_enabled: bool = True
 
+# F_PARENT writes don't round-trip with get_record's read-shape; register it
+# so update_record invalidates the cache entry instead of merging a wrong-shape
+# parent value (which would trigger redundant parent re-writes on next update).
+from config import F_PARENT as _F_PARENT
+lark_api._uncacheable_write_keys.add(_F_PARENT)
+
 # Store last 20 raw payloads for debugging
 _raw_payloads: deque = deque(maxlen=20)
 
@@ -39,12 +45,15 @@ def _load_toggle_states() -> None:
         if not client:
             return
         rows = client.table("settings").select("key,value") \
-            .in_("key", ["sync_enabled", "reconcile_enabled"]).execute()
+            .in_("key", ["sync_enabled", "reconcile_enabled",
+                          "lark_value_cache_enabled"]).execute()
         for r in (rows.data or []):
             if r["key"] == "sync_enabled":
                 _sync_enabled = r["value"].lower() != "false"
             elif r["key"] == "reconcile_enabled":
                 _reconcile_enabled = r["value"].lower() != "false"
+            elif r["key"] == "lark_value_cache_enabled":
+                lark_api.set_value_cache_enabled(r["value"].lower() != "false")
     except Exception as e:
         logging.getLogger(__name__).warning(f"Could not load toggle states: {e}")
 
@@ -270,6 +279,9 @@ async def set_table(request: Request):
 
     set_active_table(table_id, table_name)
     lark_api.invalidate_fields_cache()
+    # Cached field values from the previous table aren't portable — purge them
+    # before any handler reads cached state for the new table.
+    lark_api.invalidate_record_cache()
 
     # Persist to Supabase
     client = history._get_client()
@@ -431,6 +443,25 @@ async def toggle_reconcile():
     return RedirectResponse("/", status_code=303)
 
 
+@app.post("/toggle/lark-value-cache")
+async def toggle_lark_value_cache():
+    """Layer-1 rollback for the Lark record-value cache (no redeploy needed)."""
+    new_state = not lark_api._value_cache_enabled
+    lark_api.set_value_cache_enabled(new_state)
+    state = "enabled" if new_state else "disabled"
+    logging.getLogger(__name__).info(f"Lark value cache {state} via dashboard toggle")
+    history.record(direction="system", event="config",
+                   description=f"Lark value cache {state} via dashboard")
+    client = history._get_client()
+    if client:
+        try:
+            client.table("settings").upsert(
+                {"key": "lark_value_cache_enabled", "value": str(new_state).lower()}).execute()
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not persist lark_value_cache_enabled: {e}")
+    return RedirectResponse("/", status_code=303)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     from datetime import timezone, timedelta
@@ -545,6 +576,8 @@ async def dashboard(request: Request):
     status_sub   = "Sync active" if _sync_enabled else "Webhooks received but not processed"
     reconcile_label = "Disable Reconcile" if _reconcile_enabled else "Enable Reconcile"
     reconcile_color = "#f59e0b" if _reconcile_enabled else "#22c55e"
+    cache_label = "Disable Lark Cache" if lark_api._value_cache_enabled else "Enable Lark Cache"
+    cache_color = "#f59e0b" if lark_api._value_cache_enabled else "#22c55e"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -731,6 +764,9 @@ async def dashboard(request: Request):
     </form>
     <form method="post" action="/toggle/reconcile">
       <button class="toggle-btn" style="background:{reconcile_color}" type="submit">{reconcile_label}</button>
+    </form>
+    <form method="post" action="/toggle/lark-value-cache">
+      <button class="toggle-btn" style="background:{cache_color}" type="submit">{cache_label}</button>
     </form>
   </div>
 </div>

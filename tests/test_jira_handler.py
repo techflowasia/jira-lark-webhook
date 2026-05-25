@@ -71,7 +71,7 @@ def test_update_pushes_summary_to_lark(mock_lark):
     index._jira_to_lark["PROJ-1"] = "recABC"
     index._lark_to_jira["recABC"] = "PROJ-1"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {"Title": "Old title"}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"Title": "Old title"}}
 
     changelog = {"items": [{"field": "summary", "toString": "New title", "to": None}]}
     import jira_handler
@@ -87,7 +87,7 @@ def test_update_skips_when_value_matches(mock_lark):
     """Value-comparison loop prevention: if Lark already has the new value, no write."""
     index._jira_to_lark["PROJ-1"] = "recABC"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {"Title": "X"}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"Title": "X"}}
     changelog = {"items": [{"field": "summary", "toString": "X", "to": None}]}
     import jira_handler
     jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
@@ -122,7 +122,7 @@ def test_story_points_formatted_correctly(mock_lark):
     """Lark number field requires numeric value — strings raise NumberFieldConvFail."""
     index._jira_to_lark["PROJ-1"] = "recSP"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {"R. MD": 0}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"R. MD": 0}}
     changelog = {"items": [{"field": "customfield_10016", "toString": "5.0", "to": None}]}
     import jira_handler
     jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
@@ -136,7 +136,7 @@ def test_story_points_skipped_when_value_matches(mock_lark):
     """Don't write when current Lark value already matches Jira value."""
     index._jira_to_lark["PROJ-1"] = "recSP"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {"R. MD": 5}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"R. MD": 5}}
     changelog = {"items": [{"field": "customfield_10016", "toString": "5.0", "to": None}]}
     import jira_handler
     jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
@@ -161,7 +161,7 @@ def test_release_reconciles_from_jira_current_sprint(mock_lark):
     index._jira_to_lark["PROJ-1"] = "rec1"
     index._lark_to_jira["rec1"] = "PROJ-1"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {"Release": []}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"Release": []}}
     changelog = {"items": [{"field": "Sprint", "fieldId": "customfield_10020",
                             "toString": "VR Sprint 2, Beta 1", "to": None}]}
 
@@ -181,7 +181,7 @@ def test_release_no_redundant_write_when_set_matches(mock_lark):
     index._jira_to_lark["PROJ-1"] = "rec1"
     index._lark_to_jira["rec1"] = "PROJ-1"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {"Release": ["Beta 1", "VR Sprint 2"]}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"Release": ["Beta 1", "VR Sprint 2"]}}
     changelog = {"items": [{"field": "Sprint", "fieldId": "customfield_10020",
                             "toString": "VR Sprint 2, Beta 1", "to": None}]}
 
@@ -202,7 +202,7 @@ def test_non_sprint_edit_corrects_diverged_release(mock_lark):
     index._jira_to_lark["PROJ-1"] = "rec1"
     index._lark_to_jira["rec1"] = "PROJ-1"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {"Release": ["Beta 1.4"]}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"Release": ["Beta 1.4"]}}
     # Changelog has NO sprint item — only a summary change.
     changelog = {"items": [{"field": "summary", "fieldId": "summary",
                             "toString": "new title", "to": None}]}
@@ -234,7 +234,7 @@ def test_duedate_changelog_syncs_to_lark_end(mock_lark):
     index._jira_to_lark["PROJ-1"] = "rec1"
     index._lark_to_jira["rec1"] = "PROJ-1"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {}}
     changelog = {"items": [{"field": "duedate", "fieldId": "duedate",
                             "to": "2026-06-05", "toString": "2026-06-05 00:00:00.0"}]}
 
@@ -252,7 +252,7 @@ def test_startdate_changelog_syncs_to_lark_start(mock_lark):
     index._jira_to_lark["PROJ-1"] = "rec1"
     index._lark_to_jira["rec1"] = "PROJ-1"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {}}
     changelog = {"items": [{"field": "Start date", "fieldId": "customfield_10015",
                             "to": "2026-06-05", "toString": "5/Jun/26"}]}
 
@@ -272,7 +272,7 @@ def test_startdate_no_redundant_write_when_already_matching(mock_lark):
     index._lark_to_jira["rec1"] = "PROJ-1"
     same = _jira_date_to_lark_ts("2026-06-05")
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {"Timeline - Start": same}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"Timeline - Start": same}}
     changelog = {"items": [{"field": "Start date", "fieldId": "customfield_10015",
                             "to": "2026-06-05", "toString": "5/Jun/26"}]}
 
@@ -302,7 +302,7 @@ def test_parent_change_syncs_via_issueparentassociation(mock_lark):
     index._jira_to_lark["VR-257"] = "recParent"
     index._lark_to_jira["recParent"] = "VR-257"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {"Parent items": []}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"Parent items": []}}
     changelog = {"items": [{"field": "IssueParentAssociation", "fieldId": None,
                             "from": "13453", "to": "13438",
                             "fromString": "VR-270", "toString": "VR-257"}]}
@@ -325,7 +325,7 @@ def test_parent_change_deferred_is_logged_not_silent(mock_lark):
     index._lark_to_jira["rec1"] = "PROJ-1"
     # VR-999 NOT in index
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {"Parent items": []}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"Parent items": []}}
     changelog = {"items": [{"field": "IssueParentAssociation", "fieldId": None,
                             "from": "1", "to": "2",
                             "fromString": "VR-1", "toString": "VR-999"}]}
@@ -357,7 +357,7 @@ def test_custom_only_changelog_passes_gate_and_syncs_as_number(mock_lark, _gm):
     index._jira_to_lark["PROJ-1"] = "rec1"
     index._lark_to_jira["rec1"] = "PROJ-1"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {}}
     changelog = {"items": [{"field": "QA Man day", "fieldId": "customfield_10178",
                             "to": "5", "toString": "5"}]}
 
@@ -377,7 +377,7 @@ def test_custom_number_no_redundant_write_when_equal(mock_lark, _gm):
     index._jira_to_lark["PROJ-1"] = "rec1"
     index._lark_to_jira["rec1"] = "PROJ-1"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {"P. QA md": 5}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"P. QA md": 5}}
     changelog = {"items": [{"field": "QA Man day", "fieldId": "customfield_10178",
                             "to": "5", "toString": "5"}]}
 
@@ -393,7 +393,7 @@ def test_custom_number_float_value(mock_lark, _gm):
     index._jira_to_lark["PROJ-1"] = "rec1"
     index._lark_to_jira["rec1"] = "PROJ-1"
     mock_lark.get_token.return_value = "tok"
-    mock_lark.get_record.return_value = {"fields": {"P. QA md": 1}}
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"P. QA md": 1}}
     changelog = {"items": [{"field": "QA Man day", "fieldId": "customfield_10178",
                             "to": "0.5", "toString": "0.5"}]}
 

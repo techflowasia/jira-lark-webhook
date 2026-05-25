@@ -114,9 +114,12 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
 
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
 
-    # Fetch current Lark state — only write a field if the value actually differs
+    # Fetch current Lark state — only write a field if the value actually differs.
+    # Goes through the value cache (populated by every read/write/webhook path);
+    # the call falls through to get_record on cache miss or expiry.
     try:
-        lark_rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], record_id)
+        lark_rec = lark_api.get_cached_or_fetch_record(
+            token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], record_id)
         lark_fields = lark_rec.get("fields", {})
     except Exception as e:
         log.warning(f"jira_handler: could not fetch Lark {record_id}: {e} — skipping comparison")
@@ -272,7 +275,10 @@ def _handle_delete(key: str, itype: str, cfg: dict) -> None:
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     title = ""
     try:
-        rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], record_id)
+        # Decorative-only fetch for the log/history row — route through the
+        # cache; on a hit we get title + type without a Lark API call.
+        rec = lark_api.get_cached_or_fetch_record(
+            token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], record_id)
         title = _lark_text(rec["fields"].get(F_TITLE)) or ""
         if not itype:
             itype = _lark_select(rec["fields"].get(F_TYPE)) or ""

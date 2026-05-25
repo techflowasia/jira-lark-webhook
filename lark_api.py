@@ -45,6 +45,49 @@ def call_stats() -> dict:
 _fields_cache: dict = {}
 _FIELDS_TTL = 60.0
 
+# In-memory cache of Lark record values, populated as a free side effect of
+# every read/write/webhook path. Eliminates the get_record call on the
+# Jira→Lark update hot path (jira_handler._handle_update line 119) — the
+# dominant remaining consumer of the Lark Basic 10k/month quota after the
+# prior optimizations in CHANGELOG (599c342, 44ee5a3, 672e4b4).
+# Entry shape: {record_id: {"fields": {<same as get_record returns>},
+#                           "expires_at": float}}
+_record_cache: dict = {}
+_RECORD_CACHE_TTL = 300.0  # 5 min; conservative, bump after monitoring
+
+# Field names whose write-shape doesn't round-trip with get_record's read-shape
+# (e.g., Lark link fields are written as [rid_string] but returned as
+# [{"record_ids": [rid_string], ...}]). Writing such a field invalidates the
+# cache entry entirely instead of merging — next read refetches fresh.
+# Callers register their field names at startup; lark_api stays decoupled
+# from domain field constants in config.py.
+_uncacheable_write_keys: set = set()
+
+# Layer-1 rollback kill switch (per the rollback plan in the work's handoff).
+# When False, get_cached_or_fetch_record skips the cache entry and goes
+# straight to get_record — flipping this in Supabase does not require a
+# redeploy. Populates still run on the side so a flip back to True comes
+# online warm.
+_value_cache_enabled: bool = True
+
+
+def set_value_cache_enabled(enabled: bool) -> None:
+    """Toggle the value cache. Read by get_cached_or_fetch_record."""
+    global _value_cache_enabled
+    _value_cache_enabled = bool(enabled)
+
+
+def invalidate_record_cache(record_id: "str | None" = None) -> None:
+    """Drop one record's cache entry, or the whole cache when record_id=None.
+
+    Called on table switch (per-table cache contents are not portable) and
+    on per-record deletes.
+    """
+    if record_id is None:
+        _record_cache.clear()
+    else:
+        _record_cache.pop(record_id, None)
+
 # Retry policy for transient Lark API failures (429 + 5xx). Active editing
 # generates bursts of record_edited webhooks that each spawn a background
 # handler hitting Lark — without backoff the bitable QPS cap (≈20/sec) trips
@@ -115,8 +158,15 @@ def fetch_all_records(token: str, base_token: str, table_id: str) -> list:
         data = resp.json()
         if data.get("code") != 0:
             raise RuntimeError(f"Lark API error: {data.get('msg')}")
+        now_expires = time.time() + _RECORD_CACHE_TTL
         for item in data["data"]["items"]:
-            records.append({"record_id": item["record_id"], "fields": item.get("fields", {})})
+            fields = item.get("fields", {})
+            records.append({"record_id": item["record_id"], "fields": fields})
+            # Bulk-populate the value cache. Reconcile uses this as its drift
+            # repair: overwriting any stale entries with the live Lark state.
+            _record_cache[item["record_id"]] = {
+                "fields": fields, "expires_at": now_expires,
+            }
         if not data["data"].get("has_more"):
             break
         page_token = data["data"].get("page_token")
@@ -170,8 +220,13 @@ def search_records_modified_since(token: str, base_token: str, table_id: str,
         data = resp.json()
         if data.get("code") != 0:
             raise RuntimeError(f"Lark search error: {data.get('msg')}")
+        now_expires = time.time() + _RECORD_CACHE_TTL
         for item in data.get("data", {}).get("items", []):
-            records.append({"record_id": item["record_id"], "fields": item.get("fields", {})})
+            fields = item.get("fields", {})
+            records.append({"record_id": item["record_id"], "fields": fields})
+            _record_cache[item["record_id"]] = {
+                "fields": fields, "expires_at": now_expires,
+            }
         if not data.get("data", {}).get("has_more"):
             break
         page_token = data.get("data", {}).get("page_token")
@@ -187,7 +242,40 @@ def get_record(token: str, base_token: str, table_id: str, record_id: str) -> di
     if data.get("code") != 0:
         raise RuntimeError(f"Lark get_record error: {data.get('msg')}")
     item = data["data"]["record"]
-    return {"record_id": item["record_id"], "fields": item.get("fields", {})}
+    fields = item.get("fields", {})
+    _record_cache[item["record_id"]] = {
+        "fields": fields, "expires_at": time.time() + _RECORD_CACHE_TTL,
+    }
+    return {"record_id": item["record_id"], "fields": fields}
+
+
+def _cache_merge(record_id: str, fields: dict) -> None:
+    """Merge read-shape fields into an existing cache entry (TTL refreshed).
+
+    No-op if no entry exists — we never seed a new entry from a partial
+    update, because partial data would mislead value-compares for the
+    fields we don't have. Assumes `fields` are already in get_record's
+    read-shape (e.g. from a webhook decode, or from get_record itself).
+    """
+    entry = _record_cache.get(record_id)
+    if entry is not None:
+        entry["fields"].update(fields)
+        entry["expires_at"] = time.time() + _RECORD_CACHE_TTL
+
+
+def get_cached_or_fetch_record(token: str, base_token: str, table_id: str,
+                               record_id: str) -> dict:
+    """Return the Lark record dict, preferring the in-memory cache.
+
+    On a fresh cache hit, returns without making any Lark API call. On miss
+    or stale entry, falls back to get_record. Output shape matches get_record:
+    {"record_id": ..., "fields": {...}}.
+    """
+    if _value_cache_enabled:
+        entry = _record_cache.get(record_id)
+        if entry is not None and time.time() < entry["expires_at"]:
+            return {"record_id": record_id, "fields": entry["fields"]}
+    return get_record(token, base_token, table_id, record_id)
 
 
 def create_record(token: str, base_token: str, table_id: str, fields: dict) -> str:
@@ -210,6 +298,20 @@ def update_record(token: str, base_token: str, table_id: str,
     data = resp.json()
     if data.get("code") != 0:
         raise RuntimeError(f"Lark update error: {data.get('msg')}")
+    # Merge written fields into existing cache entry so the next read sees
+    # them without a get_record fetch. We do NOT seed a new entry from a
+    # write alone — partial data would mislead value-compares for fields
+    # we didn't write. Some field types (e.g. Lark link fields, written as
+    # [rid_string] but returned by get_record as [{"record_ids":[...]}])
+    # don't round-trip cleanly; those keys are registered in
+    # _uncacheable_write_keys and invalidate the entire entry instead.
+    entry = _record_cache.get(record_id)
+    if entry is not None:
+        if any(k in _uncacheable_write_keys for k in fields):
+            _record_cache.pop(record_id, None)
+        else:
+            entry["fields"].update(fields)
+            entry["expires_at"] = time.time() + _RECORD_CACHE_TTL
 
 
 def delete_record(token: str, base_token: str, table_id: str, record_id: str) -> None:
@@ -220,6 +322,9 @@ def delete_record(token: str, base_token: str, table_id: str, record_id: str) ->
     data = resp.json()
     if data.get("code") != 0:
         raise RuntimeError(f"Lark delete error: {data.get('msg')}")
+    # Drop the cache entry so a future read for this record_id can't return a
+    # ghost value from the deleted record.
+    _record_cache.pop(record_id, None)
 
 
 def list_tables(token: str, base_token: str) -> list:

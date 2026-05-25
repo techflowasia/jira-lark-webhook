@@ -179,7 +179,7 @@ def _decode_one(ftype, raw, options):
     return None, False  # unhandled type in sync scope → force safe fallback
 
 
-def _decode_after_value(after_value, token, cfg, before_value=None):
+def _decode_after_value(after_value, token, cfg, before_value=None, record_id=None):
     """Translate webhook [{field_id, field_value}] → {field_name: value}.
 
     Lark sends a *full* record snapshot in both before_value and after_value
@@ -228,6 +228,12 @@ def _decode_after_value(after_value, token, cfg, before_value=None):
             log.info(f"lark_handler: can't decode '{fname}' (type {m['type']}) — fall back to get_record")
             return None
         fields[fname] = value
+    # Populate the value cache so a subsequent Jira→Lark webhook for this
+    # same record reads fresh values without a get_record fetch. Skipped
+    # when no record_id was supplied (legacy callers) or when no relevant
+    # fields changed (nothing to merge).
+    if record_id is not None and fields:
+        lark_api._cache_merge(record_id, fields)
     return fields
 
 
@@ -378,7 +384,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     # the single biggest Lark API-call saving on the webhook hot path.
     if jira_key and after_value:
         decoded = _decode_after_value(after_value, token, cfg,
-                                      before_value=before_value)
+                                      before_value=before_value, record_id=rid)
         if decoded is not None:
             if not decoded:
                 log.info(f"lark_handler: {rid} no synced fields changed — skipping (no get_record)")

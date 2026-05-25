@@ -9,6 +9,14 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
+## 2026-05-25 — Lark API call reduction via in-memory record cache
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| _pending_ | perf | **Eliminate `get_record` on the Jira→Lark update hot path** (the dominant remaining consumer of the Lark Basic 10k/month quota after `599c342`, `44ee5a3`, `672e4b4`). New `lark_api._record_cache` (5-min TTL) is populated as a free side-effect of every existing read path (`get_record`, `fetch_all_records`, `search_records_modified_since`) AND every write path (`update_record` merges fields, `delete_record` invalidates) AND the Lark→Jira webhook decode (`lark_handler._decode_after_value` now takes `record_id` and merges decoded fields). `jira_handler._handle_update:119` and decorative `_handle_delete:275` swap `get_record` for new `get_cached_or_fetch_record` (delegates to `get_record` on miss/expiry). Lark link fields (`F_PARENT`) don't round-trip between write-shape and read-shape, so they're registered as `_uncacheable_write_keys` and a write to those invalidates the cache entry instead of merging a wrong-shape value. Layer-1 kill switch (`lark_value_cache_enabled` setting + dashboard toggle + `POST /toggle/lark-value-cache`) bypasses cache reads without a redeploy. Table-switch handler also invalidates the entire cache (`main.py:272`, alongside `invalidate_fields_cache()`). 11 new tests in `tests/test_lark_value_cache.py` cover: cache-hit-skips-get_record, miss-falls-back-and-populates, TTL-expiry-refetches, VR-272 loop-guard regression preserved, update_record merges, uncacheable-key invalidates, webhook decode populates, fetch_all_records drift-repair, kill switch, invalidate_record_cache, delete invalidates. Existing `test_jira_handler.py` updated: 15 mock attributes renamed `get_record.return_value` → `get_cached_or_fetch_record.return_value`. Migration `002_add_lark_value_cache_setting.sql` seeds the kill-switch flag (default true). Suite: 109 passed |
+
+---
+
 ## 2026-05-22 — Fix reconcile→webhook echo burst (no-op rewrites)
 
 | Commit | Type | Summary |
