@@ -9,6 +9,14 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
+## 2026-05-28 — Per-call-type + retry instrumentation on the Lark counter
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| _pending_ | feat | **Measure-before-cut: break down Lark API usage by call type and count retries.** The `record_value` cache shipped 2026-05-25 didn't lower daily volume (still ~540/day real → ~16k/month, over the 10k Basic cap), and the global counter couldn't say WHICH calls dominate. It also under-reported by ~20%: `_request` incremented `_call_counts` once per logical call, before the retry loop, so 429-backoff retries (real HTTP calls Lark's admin counts) were invisible. Added `_classify(method, url)` mapping each Lark URL+method to a stable label (get_token / fetch_all_records / get_record / search_records / create_record / update_record / delete_record / list_fields / list_tables), and `_calls_by_type` + `_retries_by_type` counters incremented per actual HTTP attempt inside the retry loop (so totals now reconcile with the Lark console). `call_stats()` / `GET /debug/lark-calls` gains `by_type`, `retries_total`, `retries_by_type` (sorted desc). Existing `by_day` / `today` / `this_month` fields unchanged (backward compatible). No behavior change to sync — pure instrumentation to identify the dominant consumer (suspected: the reconcile loop's reads, 4×/day) before cutting. 4 new tests in `tests/test_lark_call_instrumentation.py`: classify maps all 9 URL patterns, attempt counted by type, retries counted by type (429→200), call_stats exposes breakdown. Suite: 113 passed |
+
+---
+
 ## 2026-05-25 — Lark API call reduction via in-memory record cache
 
 | Commit | Type | Summary |

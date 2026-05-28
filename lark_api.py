@@ -18,8 +18,37 @@ _token_cache = {"token": None, "expires_at": 0}
 # at GET /debug/lark-calls to watch the quota-reduction work land.
 _BKK = timezone(timedelta(hours=7))
 _call_counts: dict = defaultdict(int)
+# Per-call-type attempt counts (cumulative since restart). Counts every actual
+# HTTP attempt INCLUDING retries, so the totals reconcile with the Lark admin
+# console figure — the logical-call counter above misses retries. Lets us see
+# which operations dominate the monthly quota.
+_calls_by_type: dict = defaultdict(int)
+_retries_by_type: dict = defaultdict(int)
 _call_counts_lock = threading.Lock()
 _process_start = time.time()
+
+
+def _classify(method: str, url: str) -> str:
+    """Map a Lark API method+URL to a stable call-type label for the counter."""
+    if "app_access_token" in url:
+        return "get_token"
+    if "/records/search" in url:
+        return "search_records"
+    if "/records" in url:
+        has_id = url.split("/records", 1)[1].startswith("/")
+        if method == "GET":
+            return "get_record" if has_id else "fetch_all_records"
+        if method == "POST":
+            return "create_record"
+        if method == "PUT":
+            return "update_record"
+        if method == "DELETE":
+            return "delete_record"
+    if "/fields" in url:
+        return "list_fields"
+    if url.rstrip("/").endswith("/tables"):
+        return "list_tables"
+    return f"{method.lower()}_other"
 
 
 def call_stats() -> dict:
@@ -27,12 +56,17 @@ def call_stats() -> dict:
     today = datetime.now(_BKK).strftime("%Y-%m-%d")
     with _call_counts_lock:
         by_day = dict(_call_counts)
+        by_type = dict(_calls_by_type)
+        retries_by_type = dict(_retries_by_type)
     month_prefix = today[:7]
     return {
         "today": by_day.get(today, 0),
         "this_month": sum(v for k, v in by_day.items() if k.startswith(month_prefix)),
         "total_since_start": sum(by_day.values()),
         "by_day": dict(sorted(by_day.items())),
+        "by_type": dict(sorted(by_type.items(), key=lambda kv: -kv[1])),
+        "retries_total": sum(retries_by_type.values()),
+        "retries_by_type": dict(sorted(retries_by_type.items(), key=lambda kv: -kv[1])),
         "process_started": datetime.fromtimestamp(_process_start, tz=_BKK)
                             .strftime("%Y-%m-%d %H:%M:%S +07"),
     }
@@ -111,9 +145,14 @@ def _sleep_for(resp: requests.Response, attempt: int) -> float:
 def _request(method: str, url: str, **kwargs) -> requests.Response:
     """requests.request wrapper with retry/backoff on 429 + 5xx."""
     day = datetime.now(_BKK).strftime("%Y-%m-%d")
+    call_type = _classify(method, url)
     with _call_counts_lock:
         _call_counts[day] += 1
     for attempt in range(_MAX_RETRIES):
+        with _call_counts_lock:
+            _calls_by_type[call_type] += 1   # every actual HTTP attempt
+            if attempt > 0:
+                _retries_by_type[call_type] += 1
         resp = requests.request(method, url, timeout=30, **kwargs)
         if resp.status_code not in _RETRY_STATUSES:
             return resp
