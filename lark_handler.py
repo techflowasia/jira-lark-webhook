@@ -5,7 +5,8 @@ import threading
 import logging
 import lark_api, jira_api, index, dedup, history, field_mappings, config
 from config import (F_TITLE, F_START, F_END, F_ASSIGNEE, F_JIRA_KEY, F_JIRA_URL,
-                    F_TYPE, F_PARENT, F_RELEASE, LARK_TO_JIRA_ASSIGNEE)
+                    F_TYPE, F_PARENT, F_RELEASE, F_JIRA_STATUS,
+                    LARK_TO_JIRA_ASSIGNEE)
 from utils import _lark_text, _lark_select, _lark_ts_to_jira_date, _norm, _lark_link_rid
 
 log = logging.getLogger(__name__)
@@ -112,8 +113,16 @@ def _relevant_lark_fields() -> set:
     Anything not in this set (e.g. a recomputed formula field that Lark
     bundles into the same webhook) is ignored during decode so it doesn't
     needlessly force a get_record fallback.
+
+    `F_JIRA_STATUS` is included only when its configured direction covers
+    Lark→Jira (`both` or `lark_to_jira`). The default is `jira_to_lark` — for
+    users who didn't opt in, decoding the status from the webhook would be
+    wasted work (the value-compare in the update branch would still skip
+    the write, but it would force a get_record on every Jira-status webhook).
     """
     names = {F_TITLE, F_START, F_END, F_ASSIGNEE, F_RELEASE, F_PARENT}
+    if field_mappings.get_direction(F_JIRA_STATUS) in ("both", "lark_to_jira"):
+        names.add(F_JIRA_STATUS)
     names.update(m["lark_field"] for m in field_mappings.get_custom_lark_to_jira())
     return names
 
@@ -466,6 +475,21 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
             updates["parent"] = {"key": parent_jira_key}
             changed.append(f"Parent: {parent_jira_key}")
 
+    # Jira status (Lark → Jira). Honored only when the field's configured
+    # direction covers Lark→Jira (default 'jira_to_lark' is skipped — a
+    # Lark→Jira status push against a user who didn't opt in would silently
+    # transition Jira issues). The transition itself is done via the workflow
+    # API (not update_issue — Jira rejects status writes outside the workflow),
+    # so we track the target in `status_change_target` and fire it after the
+    # normal update_issue / move_to_sprint path below. Value-compare against
+    # current Jira status: same value → skip, no Jira call.
+    status_change_target = None
+    if field_mappings.get_direction(F_JIRA_STATUS) in ("both", "lark_to_jira"):
+        new_status = _lark_text(rec["fields"].get(F_JIRA_STATUS))
+        cur_status = (jira_fields.get("status") or {}).get("name") or ""
+        if new_status and new_status != cur_status:
+            status_change_target = new_status
+
     # Apply custom (non-system) Lark → Jira mappings.
     # Value-compare each one against current Jira state before adding to updates.
     # System fields (Title, dates, etc.) already do this; custom mappings used
@@ -521,7 +545,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
             if sid in current_sprint_ids:
                 sid = None  # already in that sprint — skip the redundant Jira call
 
-    if not updates and not sid:
+    if not updates and not sid and not status_change_target:
         log.info(f"lark_handler: no relevant updates for {jira_key}")
         return
 
@@ -542,6 +566,23 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
             changed.append(f"Sprint: {release_raw}")
         except Exception as e:
             log.warning(f"Sprint move {jira_key}: {e}")
+
+    if status_change_target:
+        # Fire after update_issue/move_to_sprint so a "Jira status push" bug
+        # doesn't blow up a successful normal-field write. `False` return =
+        # workflow has no transition to the target (e.g. Done → To Do) — log
+        # and skip, never force a path the workflow forbids.
+        try:
+            if jira_api.transition_issue(cfg, jira_key, status_change_target):
+                changed.append(f"Status: {status_change_target}")
+            else:
+                log.warning(
+                    f"lark_handler: no Jira transition for {jira_key} → "
+                    f"{status_change_target} (workflow forbids it; not pushing)")
+        except Exception as e:
+            log.warning(
+                f"lark_handler: Jira transition {jira_key} → "
+                f"{status_change_target} failed: {e}")
 
     desc = ", ".join(changed)
     log.info(f"lark_handler: updated Jira {jira_key} — {desc}")

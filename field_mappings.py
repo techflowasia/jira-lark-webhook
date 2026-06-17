@@ -42,6 +42,27 @@ def get_all() -> list:
     return list(_cache)
 
 
+def get_direction(lark_field: str) -> "str | None":
+    """Direction configured for a specific Lark field (system or custom).
+
+    Returns 'jira_to_lark', 'lark_to_jira', 'both', or None if the field has
+    no mapping (e.g. a lark-only field). The system field mappings (e.g.
+    'Jira status' with default direction 'jira_to_lark') are included — the
+    direction is user-editable in the dashboard and must be honored by the
+    system-field branches in lark_handler._handle_update_impl.
+
+    Used by:
+      - lark_handler._relevant_lark_fields() — gates whether to decode a
+        system field's value from the webhook payload.
+      - lark_handler._handle_update_impl() — gates whether to write a system
+        field to Jira on update.
+    """
+    for m in _cache:
+        if m.get("lark_field") == lark_field:
+            return m.get("direction")
+    return None
+
+
 def get_custom_lark_to_jira() -> list:
     """Non-system active mappings that sync Lark → Jira."""
     return [m for m in _cache

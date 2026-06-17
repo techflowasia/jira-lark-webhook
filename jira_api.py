@@ -143,6 +143,58 @@ def move_to_sprint(cfg: dict, sprint_id: int, issue_key: str) -> None:
     resp.raise_for_status()
 
 
+def get_transitions(cfg: dict, key: str) -> list:
+    """Available workflow transitions for an issue.
+
+    Returns [{"id": "...", "name": "...", "to": {"name": "...", "id": "..."}}, ...]
+    — every transition the issue's workflow currently permits from its current
+    status. Each `to.name` is the destination status the transition ends in.
+
+    Used by `transition_issue()` to resolve a human-readable target status name
+    to the workflow-specific transition ID Jira requires for status changes.
+    """
+    resp = requests.get(_url(cfg, f"/rest/api/3/issue/{key}/transitions"),
+                        auth=_auth(cfg))
+    resp.raise_for_status()
+    return resp.json().get("transitions", [])
+
+
+def transition_issue(cfg: dict, key: str, target_status_name: str) -> bool:
+    """Move an issue to the given status via Jira's workflow transitions API.
+
+    Returns:
+        True  — a matching transition was found and the issue was moved.
+        False — the issue's workflow has NO transition to `target_status_name`
+                (e.g. Done → To Do is forbidden by most workflows, or the
+                target name doesn't match any transition's `to.name`). Caller
+                should log and skip — a force-push through the workflow would
+                surprise the user.
+
+    Raises:
+        requests.HTTPError on transport / non-204 response (5xx, auth, etc.).
+
+    Why a separate API: `PUT /rest/api/3/issue/{key}` with `{"status": ...}`
+    is rejected by Jira — status changes MUST go through the workflow, which
+    is enforced server-side as the transition ID.
+    """
+    transitions = get_transitions(cfg, key)
+    target = None
+    for t in transitions:
+        if (t.get("to") or {}).get("name") == target_status_name:
+            target = t
+            break
+    if not target:
+        return False
+    resp = requests.post(_url(cfg, f"/rest/api/3/issue/{key}/transitions"),
+                         json={"transition": {"id": target["id"]}},
+                         auth=_auth(cfg))
+    if not resp.ok:
+        raise requests.HTTPError(
+            f"{resp.status_code} {resp.reason} transitioning {key} → "
+            f"{target_status_name}: {resp.text[:600]}", response=resp)
+    return True
+
+
 def get_all_fields(cfg: dict) -> list:
     """Return [{id, name, custom}, ...] for every Jira field."""
     resp = requests.get(_url(cfg, "/rest/api/3/field"), auth=_auth(cfg))

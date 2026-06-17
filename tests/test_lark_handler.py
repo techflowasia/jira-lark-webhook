@@ -884,3 +884,388 @@ def test_fast_path_title_writes_plain_text_not_json(mock_lark, mock_jira):
     summary = mock_jira.update_issue.call_args[0][2]["summary"]
     assert summary == "All chat list / create direct / group chat"
     assert "{" not in summary  # no JSON wrapper leaked through
+
+
+# ---- Jira status (Lark → Jira) sync: VR-256/258 ----
+# Bug: when the user sets the 'Jira status' field direction to 'both' on the
+# dashboard, status changes in Lark do NOT propagate to Jira — only date
+# changes sync. Evidence: webhook log shows only date events for VR-256 while
+# the Jira history shows the user toggling status back and forth. Root cause
+# was three-fold: (1) the fast-path decoder excluded 'Jira status' from the
+# relevant fields set, (2) _handle_update_impl had no status branch at all,
+# (3) even if it had, Jira's status can't be set via PUT issue — it requires
+# the workflow transitions API.
+#
+# Fix tested below:
+#   - jira_api.transition_issue + get_transitions added
+#   - field_mappings.get_direction helper added (returns config direction)
+#   - lark_handler._relevant_lark_fields() now includes F_JIRA_STATUS only
+#     when direction is 'both' or 'lark_to_jira' (default jira_to_lark stays
+#     no-op — don't surprise users who didn't opt in)
+#   - lark_handler._handle_update_impl() detects a status change, calls
+#     transition_issue, value-compares against current Jira status (loop
+#     guard), and skips silently if the workflow has no matching transition
+
+_STATUS_META = {
+    "fldStatus": {"name": "Jira status", "type": 3,
+                  "options": {"optTodo": "To Do", "optInProg": "In Progress",
+                              "optDev": "To do - Dev"}},
+    "fldTitle":  {"name": "Title", "type": 1, "options": {}},
+}
+
+
+def _seed_jira_status_map():
+    """Default field_mappings cache with 'Jira status' → 'status' direction=jira_to_lark.
+
+    Tests that need a different direction patch `field_mappings._cache[0]['direction']`
+    (or replace the list) and call this in a finally to restore the default.
+    """
+    import field_mappings
+    field_mappings._cache = [
+        {"id": 12, "lark_field": "Jira status", "jira_field": "status",
+         "jira_label": "Status", "direction": "jira_to_lark",
+         "field_type": "select", "is_system": True, "active": True},
+    ]
+    return field_mappings
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_status_sync_direction_both_fires_transition(mock_lark, mock_jira):
+    """direction=both: a Lark status change must call transition_issue, not update_issue."""
+    fm = _seed_jira_status_map()
+    fm._cache[0]["direction"] = "both"
+    try:
+        index._lark_to_jira["recS1"] = "PROJ-256"
+        index._jira_to_lark["PROJ-256"] = "recS1"
+        mock_lark.get_token.return_value = "tok"
+        mock_lark.get_field_meta_by_id.return_value = _STATUS_META
+        mock_jira.get_issue.return_value = {"fields": {"status": {"name": "To Do"}}}
+        mock_jira.get_account_ids.return_value = {}
+        mock_jira.get_project_versions.return_value = []
+        mock_jira.get_board_id.return_value = None
+        mock_jira.get_transitions.return_value = [
+            {"id": "21", "name": "Start Progress", "to": {"name": "In Progress"}},
+            {"id": "31", "name": "Send to Dev",    "to": {"name": "To do - Dev"}},
+        ]
+        mock_jira.transition_issue.return_value = True
+
+        import lark_handler
+        lark_handler.process({
+            "action": "record_edited", "record_id": "recS1",
+            "after_value": [{"field_id": "fldStatus", "field_value": "optInProg"}],
+            "before_value": [{"field_id": "fldStatus", "field_value": "optTodo"}],
+        }, "tbl", CFG)
+
+        # Status must go through the transitions API, not update_issue
+        mock_jira.transition_issue.assert_called_once_with(CFG, "PROJ-256", "In Progress")
+        mock_jira.update_issue.assert_not_called()
+    finally:
+        fm._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_status_sync_direction_lark_to_jira_fires_transition(mock_lark, mock_jira):
+    """direction=lark_to_jira: also pushes to Jira (not just jira_to_lark or both)."""
+    fm = _seed_jira_status_map()
+    fm._cache[0]["direction"] = "lark_to_jira"
+    try:
+        index._lark_to_jira["recS2"] = "PROJ-257"
+        index._jira_to_lark["PROJ-257"] = "recS2"
+        mock_lark.get_token.return_value = "tok"
+        mock_lark.get_field_meta_by_id.return_value = _STATUS_META
+        mock_jira.get_issue.return_value = {"fields": {"status": {"name": "To Do"}}}
+        mock_jira.get_account_ids.return_value = {}
+        mock_jira.get_project_versions.return_value = []
+        mock_jira.get_board_id.return_value = None
+        mock_jira.get_transitions.return_value = [
+            {"id": "21", "name": "Start Progress", "to": {"name": "In Progress"}},
+        ]
+        mock_jira.transition_issue.return_value = True
+
+        import lark_handler
+        lark_handler.process({
+            "action": "record_edited", "record_id": "recS2",
+            "after_value": [{"field_id": "fldStatus", "field_value": "optInProg"}],
+            "before_value": [{"field_id": "fldStatus", "field_value": "optTodo"}],
+        }, "tbl", CFG)
+
+        mock_jira.transition_issue.assert_called_once_with(CFG, "PROJ-257", "In Progress")
+        mock_jira.update_issue.assert_not_called()
+    finally:
+        fm._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_status_sync_direction_default_skips_lark_to_jira(mock_lark, mock_jira):
+    """direction=jira_to_lark (the default): a Lark status change must NOT
+    fire a transition. The dashboard hasn't been changed to opt in, so a
+    user editing status in Lark should be a local-only edit — pushing to
+    Jira would surprise them. This is the safe default that protects
+    users who never touched the field mappings table."""
+    fm = _seed_jira_status_map()  # direction stays jira_to_lark
+    try:
+        index._lark_to_jira["recS3"] = "PROJ-258"
+        index._jira_to_lark["PROJ-258"] = "recS3"
+        mock_lark.get_token.return_value = "tok"
+        mock_lark.get_field_meta_by_id.return_value = _STATUS_META
+        mock_jira.get_issue.return_value = {"fields": {"status": {"name": "To Do"}}}
+        mock_jira.get_account_ids.return_value = {}
+        mock_jira.get_project_versions.return_value = []
+        mock_jira.get_board_id.return_value = None
+
+        import lark_handler
+        lark_handler.process({
+            "action": "record_edited", "record_id": "recS3",
+            "after_value": [{"field_id": "fldStatus", "field_value": "optInProg"}],
+            "before_value": [{"field_id": "fldStatus", "field_value": "optTodo"}],
+        }, "tbl", CFG)
+
+        # No transition, no update — the change is local-only.
+        mock_jira.transition_issue.assert_not_called()
+        mock_jira.update_issue.assert_not_called()
+    finally:
+        fm._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_status_sync_skipped_when_value_matches_jira(mock_lark, mock_jira):
+    """Value-compare loop guard: if the new Lark status equals current Jira
+    status, NO Jira call. Without this, every webhook (e.g. a date change
+    that also re-fires the status field in the same payload) would push
+    a no-op transition and feed a sync loop."""
+    fm = _seed_jira_status_map()
+    fm._cache[0]["direction"] = "both"
+    try:
+        index._lark_to_jira["recS4"] = "PROJ-259"
+        index._jira_to_lark["PROJ-259"] = "recS4"
+        mock_lark.get_token.return_value = "tok"
+        mock_lark.get_field_meta_by_id.return_value = _STATUS_META
+        # Jira already at "In Progress" — Lark change is to the same value
+        mock_jira.get_issue.return_value = {"fields": {"status": {"name": "In Progress"}}}
+        mock_jira.get_account_ids.return_value = {}
+        mock_jira.get_project_versions.return_value = []
+        mock_jira.get_board_id.return_value = None
+
+        import lark_handler
+        lark_handler.process({
+            "action": "record_edited", "record_id": "recS4",
+            "after_value": [{"field_id": "fldStatus", "field_value": "optInProg"}],
+            "before_value": [{"field_id": "fldStatus", "field_value": "optInProg"}],
+        }, "tbl", CFG)
+
+        mock_jira.transition_issue.assert_not_called()
+        mock_jira.update_issue.assert_not_called()
+    finally:
+        fm._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_status_sync_no_matching_transition_logged_not_raised(mock_lark, mock_jira):
+    """Workflow has no transition to the target status (e.g. Done → To Do is
+    forbidden by most Jira workflows). transition_issue returns False →
+    handler logs a warning and skips. The webhook must NOT 500 — a real
+    user change is recorded, just not auto-pushed through a forbidden path."""
+    fm = _seed_jira_status_map()
+    fm._cache[0]["direction"] = "both"
+    try:
+        index._lark_to_jira["recS5"] = "PROJ-260"
+        index._jira_to_lark["PROJ-260"] = "recS5"
+        mock_lark.get_token.return_value = "tok"
+        mock_lark.get_field_meta_by_id.return_value = _STATUS_META
+        mock_jira.get_issue.return_value = {"fields": {"status": {"name": "Done"}}}
+        mock_jira.get_account_ids.return_value = {}
+        mock_jira.get_project_versions.return_value = []
+        mock_jira.get_board_id.return_value = None
+        # Workflow only has forward transitions — no Done → To Do
+        mock_jira.get_transitions.return_value = []
+        mock_jira.transition_issue.return_value = False
+
+        import lark_handler
+        # Must not raise
+        lark_handler.process({
+            "action": "record_edited", "record_id": "recS5",
+            "after_value": [{"field_id": "fldStatus", "field_value": "optTodo"}],
+            "before_value": [{"field_id": "fldStatus", "field_value": "optDone"}],
+        }, "tbl", CFG)
+
+        mock_jira.transition_issue.assert_called_once()
+    finally:
+        fm._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_status_sync_transition_failure_does_not_block_other_fields(mock_lark, mock_jira):
+    """If the transition raises (5xx, auth, etc.), the rest of the sync
+    must not be rolled back — Title / dates written in the same call should
+    still land. Tested via the success log: a failed transition just isn't
+    added to the 'changed' list (the user sees the failure in the Render
+    logs but the rest of the update went through)."""
+    fm = _seed_jira_status_map()
+    fm._cache[0]["direction"] = "both"
+    try:
+        index._lark_to_jira["recS6"] = "PROJ-261"
+        index._jira_to_lark["PROJ-261"] = "recS6"
+        mock_lark.get_token.return_value = "tok"
+        mock_lark.get_field_meta_by_id.return_value = _STATUS_META
+        mock_jira.get_issue.return_value = {"fields": {
+            "summary": "Old", "status": {"name": "To Do"}}}
+        mock_jira.get_account_ids.return_value = {}
+        mock_jira.get_project_versions.return_value = []
+        mock_jira.get_board_id.return_value = None
+        mock_jira.get_transitions.return_value = [
+            {"id": "21", "to": {"name": "In Progress"}},
+        ]
+        mock_jira.transition_issue.side_effect = RuntimeError("Jira 500")
+
+        import lark_handler
+        # Must not raise
+        lark_handler.process({
+            "action": "record_edited", "record_id": "recS6",
+            "after_value": [
+                {"field_id": "fldTitle",  "field_value": "New title"},
+                {"field_id": "fldStatus", "field_value": "optInProg"},
+            ],
+            "before_value": [
+                {"field_id": "fldTitle",  "field_value": "Old"},
+                {"field_id": "fldStatus", "field_value": "optTodo"},
+            ],
+        }, "tbl", CFG)
+
+        # Title update still went through
+        mock_jira.update_issue.assert_called_once()
+        assert mock_jira.update_issue.call_args[0][2]["summary"] == "New title"
+        # Transition was attempted and failed gracefully
+        mock_jira.transition_issue.assert_called_once()
+    finally:
+        fm._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_relevant_lark_fields_excludes_status_by_default(mock_lark, mock_jira):
+    """_relevant_lark_fields() must NOT include 'Jira status' when the
+    configured direction is the default 'jira_to_lark' — including it would
+    force a get_record on every Jira-status webhook for users who didn't
+    opt in, wasting Lark API quota."""
+    import lark_handler, field_mappings
+    field_mappings._cache = [
+        {"id": 12, "lark_field": "Jira status", "jira_field": "status",
+         "jira_label": "Status", "direction": "jira_to_lark",
+         "field_type": "select", "is_system": True, "active": True},
+    ]
+    try:
+        assert "Jira status" not in lark_handler._relevant_lark_fields()
+    finally:
+        field_mappings._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_relevant_lark_fields_includes_status_when_both(mock_lark, mock_jira):
+    """direction=both: 'Jira status' must be in the relevant set so the
+    fast-path decoder picks it up and skips get_record for status-only
+    webhooks."""
+    import lark_handler, field_mappings
+    field_mappings._cache = [
+        {"id": 12, "lark_field": "Jira status", "jira_field": "status",
+         "jira_label": "Status", "direction": "both",
+         "field_type": "select", "is_system": True, "active": True},
+    ]
+    try:
+        assert "Jira status" in lark_handler._relevant_lark_fields()
+    finally:
+        field_mappings._cache = []
+
+
+def test_field_mappings_get_direction_returns_configured():
+    """field_mappings.get_direction() reads the dashboard-configured direction
+    for a field, including system fields (whose direction is user-editable
+    even though is_system=True)."""
+    import field_mappings
+    field_mappings._cache = [
+        {"lark_field": "Jira status", "direction": "both"},
+        {"lark_field": "Title", "direction": "jira_to_lark"},
+    ]
+    try:
+        assert field_mappings.get_direction("Jira status") == "both"
+        assert field_mappings.get_direction("Title") == "jira_to_lark"
+        assert field_mappings.get_direction("No Such Field") is None
+    finally:
+        field_mappings._cache = []
+
+
+@patch("jira_api.requests")
+def test_transition_issue_returns_true_when_transition_found(mock_requests):
+    """transitions API returns a transition whose `to.name` matches the
+    target — we POST to /transitions with that ID and return True."""
+    import jira_api
+    get_resp = MagicMock()
+    get_resp.json.return_value = {"transitions": [
+        {"id": "21", "name": "Start", "to": {"name": "In Progress"}},
+        {"id": "31", "name": "Reopen", "to": {"name": "To Do"}},
+    ]}
+    get_resp.raise_for_status = MagicMock()
+    post_resp = MagicMock()
+    post_resp.ok = True
+    mock_requests.get.return_value = get_resp
+    mock_requests.post.return_value = post_resp
+
+    assert jira_api.transition_issue(CFG, "PROJ-1", "In Progress") is True
+    mock_requests.get.assert_called_once()
+    assert "/rest/api/3/issue/PROJ-1/transitions" in mock_requests.get.call_args[0][0]
+    mock_requests.post.assert_called_once()
+    assert mock_requests.post.call_args[1]["json"] == {"transition": {"id": "21"}}
+
+
+@patch("jira_api.requests")
+def test_transition_issue_returns_false_when_no_match(mock_requests):
+    """No transition in the workflow has `to.name` matching the target
+    (e.g. Done → To Do is forbidden). Returns False — the handler logs
+    and skips, never forces a path the workflow forbids."""
+    import jira_api
+    get_resp = MagicMock()
+    get_resp.json.return_value = {"transitions": [
+        {"id": "11", "name": "Done", "to": {"name": "Done"}},
+    ]}
+    get_resp.raise_for_status = MagicMock()
+    mock_requests.get.return_value = get_resp
+
+    assert jira_api.transition_issue(CFG, "PROJ-1", "To Do") is False
+    mock_requests.post.assert_not_called()  # never call POST if no match
+
+
+@patch("jira_api.requests")
+def test_transition_issue_raises_on_http_error(mock_requests):
+    """POST /transitions returned 5xx / 401 / 403 → re-raise so the outer
+    try/except in process() can log the error to sync_history. Verified by
+    checking the POST was called (we don't try to catch the exception class
+    because the patch makes `requests.HTTPError` a MagicMock)."""
+    import jira_api
+    get_resp = MagicMock()
+    get_resp.json.return_value = {"transitions": [
+        {"id": "21", "to": {"name": "In Progress"}},
+    ]}
+    get_resp.raise_for_status = MagicMock()
+    post_resp = MagicMock()
+    post_resp.ok = False
+    post_resp.status_code = 500
+    post_resp.reason = "Server Error"
+    post_resp.text = "internal"
+    mock_requests.get.return_value = get_resp
+    mock_requests.post.return_value = post_resp
+
+    raised = False
+    try:
+        jira_api.transition_issue(CFG, "PROJ-1", "In Progress")
+    except Exception:
+        raised = True
+    assert raised, "expected an exception when POST /transitions returns 5xx"
+    # Sanity: POST was called (proves the error came from the transitions POST,
+    # not the GET).
+    mock_requests.post.assert_called_once()
