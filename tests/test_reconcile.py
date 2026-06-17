@@ -164,6 +164,32 @@ def test_story_points_int_formatting(mock_lark, mock_jira):
     assert isinstance(fields["R. MD"], int)
 
 
+@patch("reconcile.jira_api")
+@patch("reconcile.lark_api")
+def test_no_phantom_write_when_lark_number_is_string(mock_lark, mock_jira):
+    """Lark's bitable API returns Number fields as STRINGS ('5'), not ints.
+
+    The value-compare must treat '5' == 5 so reconcile doesn't re-write R. MD
+    on a record that's already in sync. Before the fix, the old
+    `isinstance(int,float) else None` guard coerced '5' -> None, so 5 != None
+    re-wrote R. MD on every record with story points, every 6 h sweep — the
+    dominant Lark API-quota drain (~480 update_record/day). Regression guard
+    for CHANGELOG 2026-06-08. NB: a string current value is exactly what the
+    live API returns; the other reconcile tests use an int and so never caught
+    this."""
+    in_sync = {**LARK_RECORD, "fields": {**LARK_RECORD["fields"],
+                                         "Jira status": "In Progress",
+                                         "R. MD": "5"}}  # STRING, as the API returns
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.fetch_all_records.return_value = [in_sync]
+    mock_jira.fetch_all_issues.return_value = [JIRA_ISSUE]  # customfield_10016 = 5.0
+
+    import reconcile
+    reconcile.run(CFG)
+
+    mock_lark.update_record.assert_not_called()
+
+
 # ---- Change D: two-tier dispatcher (full daily, incremental in between) ----
 
 import time as _time

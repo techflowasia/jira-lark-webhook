@@ -143,6 +143,20 @@ def test_story_points_skipped_when_value_matches(mock_lark):
     mock_lark.update_record.assert_not_called()
 
 
+@patch("jira_handler.lark_api")
+def test_story_points_skipped_when_lark_value_is_string(mock_lark):
+    """Lark's API returns Number fields as STRINGS ('5'); '5' must compare equal
+    to Jira's 5 so a story-point-bearing Jira update doesn't re-write R. MD.
+    Same phantom-write class fixed in reconcile (CHANGELOG 2026-06-08)."""
+    index._jira_to_lark["PROJ-1"] = "recSP"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"R. MD": "5"}}  # string
+    changelog = {"items": [{"field": "customfield_10016", "toString": "5.0", "to": None}]}
+    import jira_handler
+    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+    mock_lark.update_record.assert_not_called()
+
+
 # ---- Regression: Release reconciled vs Jira CURRENT sprint, every update ----
 
 def _issue_with_sprint(sprint_names, summary="S"):

@@ -143,7 +143,10 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
         elif field == "customfield_10016":
             sp_num = _sp_to_num(to_str)
             cur = lark_fields.get(F_MD)
-            cur_num = cur if isinstance(cur, (int, float)) else None
+            # Lark returns Number fields as strings ("3"); parse via _sp_to_num
+            # so the value-compare converges (otherwise every story-point-bearing
+            # update re-wrote R. MD — same class of phantom write reconcile hit).
+            cur_num = _sp_to_num(cur)
             if sp_num != cur_num:
                 updates[F_MD] = sp_num  # may be None to clear
 
@@ -226,7 +229,9 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
         if ft == "number":
             val = _sp_to_num(raw if raw not in (None, "") else to_str)
             cur = lark_fields.get(name)
-            cur_num = cur if isinstance(cur, (int, float)) else None
+            # Lark returns Number fields as strings; parse current value the same
+            # way so a custom number mapping doesn't re-write every update.
+            cur_num = _sp_to_num(cur)
             if val != cur_num:
                 updates[name] = val  # may be None to clear
         elif ft == "date":

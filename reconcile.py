@@ -242,7 +242,13 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
         if lark_assignee and _lark_select(rec["fields"].get(F_ASSIGNEE)) != lark_assignee:
             updates[F_ASSIGNEE] = [lark_assignee]
         cur_md = rec["fields"].get(F_MD)
-        cur_md_num = cur_md if isinstance(cur_md, (int, float)) else None
+        # Lark's bitable API returns Number fields as STRINGS (e.g. "3"), so the
+        # old `isinstance(int,float)` guard coerced the current value to None and
+        # the compare never converged — reconcile re-wrote R. MD on every record
+        # with story points, every sweep (the dominant ~480/day update_record
+        # quota drain). Parse through _sp_to_num so "3" == 3 and the write is
+        # skipped when nothing actually changed.
+        cur_md_num = _sp_to_num(cur_md)
         if sp_num != cur_md_num:
             updates[F_MD] = sp_num
         if jira_status and _lark_text(rec["fields"].get(F_JIRA_STATUS)) != jira_status:
@@ -513,7 +519,9 @@ def backfill(cfg: dict) -> dict:
         if lark_assignee and _lark_select(cur.get(F_ASSIGNEE)) != lark_assignee:
             updates[F_ASSIGNEE] = [lark_assignee]
         cur_md = cur.get(F_MD)
-        cur_md_num = cur_md if isinstance(cur_md, (int, float)) else None
+        # See _sync_issue_to_lark: Lark returns Number fields as strings, so
+        # parse through _sp_to_num for a stable numeric compare (no phantom write).
+        cur_md_num = _sp_to_num(cur_md)
         if sp_num != cur_md_num:
             updates[F_MD] = sp_num
         if jira_status and _lark_text(cur.get(F_JIRA_STATUS)) != jira_status:
