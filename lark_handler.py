@@ -127,12 +127,20 @@ def _relevant_lark_fields() -> set:
     return names
 
 
-def _decode_one(ftype, raw, options):
+def _decode_one(ftype, raw, options, ui_type=None):
     """Decode one webhook field_value into the shape get_record returns.
 
     Returns (value, ok). ok=False means "can't safely decode — caller should
     fall back to get_record". An empty/cleared value decodes to (None, True);
     the update handler already skips None-valued fields.
+
+    IMPORTANT: For date-only DateTime fields (type 5 + ui_type "Date"), the
+    webhook delivers the timestamp in the Base's configured timezone, NOT UTC
+    midnight. Since _lark_ts_to_jira_date assumes UTC, a date-only timestamp
+    from a UTC+7 Base would be decoded as the *previous* day. Returning
+    (None, False) forces the caller to fall back to get_record, which
+    correctly returns UTC midnight. See utils.py module header for the full
+    UTC midnight rationale.
     """
     if raw is None or raw == "":
         return None, True
@@ -173,6 +181,15 @@ def _decode_one(ftype, raw, options):
             names.append(nm)
         return names, True  # matches get_record shape: ["Nurse", ...]
     if ftype == _FT_DATETIME:
+        # Date-only DateTime fields (ui_type "Date") deliver the timestamp
+        # in the Base's configured timezone, NOT UTC midnight. Since
+        # _lark_ts_to_jira_date assumes UTC, decoding a UTC+7 date-only
+        # timestamp here would shift it back by 1 day (the 2026-07 bug:
+        # 1 July in Bangkok = 30 June in UTC). Return ok=False so the
+        # caller falls back to get_record, which puts UTC midnight in the
+        # fields dict — the one shape _lark_ts_to_jira_date can handle.
+        if ui_type == "Date":
+            return None, False
         try:
             return int(raw), True
         except (ValueError, TypeError):
@@ -232,9 +249,10 @@ def _decode_after_value(after_value, token, cfg, before_value=None, record_id=No
         # "P. QA md is 1.0" and re-pushes QA Manday to Jira.
         if have_before and av.get("field_value") == before_by_fid.get(fid):
             continue
-        value, ok = _decode_one(m["type"], av.get("field_value"), m["options"])
+        value, ok = _decode_one(m["type"], av.get("field_value"), m["options"], ui_type=m.get("ui_type"))
         if not ok:
-            log.info(f"lark_handler: can't decode '{fname}' (type {m['type']}) — fall back to get_record")
+            reason = f"date-only field (ui_type={m.get('ui_type')})" if m.get("ui_type") == "Date" else f"type {m['type']}"
+            log.info(f"lark_handler: can't decode '{fname}' ({reason}) — fall back to get_record")
             return None
         fields[fname] = value
     # Populate the value cache so a subsequent Jira→Lark webhook for this

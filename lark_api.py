@@ -423,7 +423,13 @@ def get_select_options(token: str, base_token: str, table_id: str, field_name: s
 
 
 def get_field_meta_by_id(token: str, base_token: str, table_id: str) -> dict:
-    """Map field_id -> {name, type, options} for decoding webhook payloads.
+    """Map field_id -> {name, type, ui_type, options} for decoding webhook payloads.
+
+    `ui_type` distinguishes date-only (\"Date\") from datetime (\"DateTime\") for
+    type-5 fields — the webhook delivers date-only timestamps in the Base's
+    configured timezone, NOT UTC midnight like get_record does, so the decoder
+    must fall back to get_record for date-only fields to avoid a 1-day timezone
+    shift (see lark_handler._decode_one).
 
     `options` is {option_id: option_name} for single/multi-select fields,
     empty otherwise. Reuses the 60 s _fetch_field_items cache so this adds
@@ -439,6 +445,7 @@ def get_field_meta_by_id(token: str, base_token: str, table_id: str) -> dict:
         meta[fid] = {
             "name": f.get("field_name"),
             "type": f.get("type"),
+            "ui_type": f.get("ui_type"),
             "options": {o["id"]: o["name"] for o in options if o.get("id")},
         }
     return meta
