@@ -12,6 +12,70 @@ log = logging.getLogger(__name__)
 LARK_BASE_URL = "https://open.larksuite.com/open-apis"
 _token_cache = {"token": None, "expires_at": 0}
 
+# Cached Base timezone offset (hours from UTC). Populated by get_base_tz_hours().
+# If unavailable, defaults to 0 (UTC) preserving legacy behavior.
+_base_tz_cache: dict = {"offset": 0, "expires_at": 0}
+
+
+def _iana_to_offset(tz_name: str) -> float:
+    """Convert an IANA timezone name (e.g. 'Asia/Bangkok') to UTC offset in hours.
+
+    Uses zoneinfo (stdlib Python 3.9) if available, otherwise pytz, otherwise
+    falls back to 0 (UTC) with a warning.
+    """
+    if not tz_name:
+        return 0.0
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except (ImportError, ModuleNotFoundError):
+        try:
+            import pytz
+            tz = pytz.timezone(tz_name)
+        except (ImportError, ModuleNotFoundError):
+            log.warning(f"lark_api: no zoneinfo/pytz — can't resolve Base timezone '{tz_name}', assuming UTC")
+            return 0.0
+    except Exception:
+        log.warning(f"lark_api: failed to resolve timezone '{tz_name}', assuming UTC")
+        return 0.0
+    now = datetime.now(tz)
+    return now.utcoffset().total_seconds() / 3600
+
+
+def invalidate_base_tz_cache() -> None:
+    """Force re-fetch of the Base timezone on next call."""
+    _base_tz_cache["expires_at"] = 0
+
+
+def get_base_tz_hours(token: str, base_token: str) -> float:
+    """Fetch the Lark Base configured timezone offset from UTC (in hours).
+
+    Calls GET /bitable/v1/apps/{base_token} once and caches the result for 1 h.
+    Returns the offset (e.g. 7.0 for UTC+7 Bangkok), or 0.0 on error/unknown.
+    """
+    now = time.time()
+    if now < _base_tz_cache["expires_at"]:
+        return _base_tz_cache["offset"]
+    try:
+        url = f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}"
+        resp = _request("GET", url, headers=_headers(token))
+        if resp.status_code != 200:
+            return 0.0
+        data = resp.json()
+        if data.get("code") != 0:
+            return 0.0
+        tz_name = (data.get("data") or {}).get("app", {}).get("time_zone")
+        if tz_name:
+            offset = _iana_to_offset(tz_name)
+        else:
+            offset = 0.0
+        _base_tz_cache.update({"offset": offset, "expires_at": now + 3600})
+        log.info(f"lark_api: Base timezone = '{tz_name}' (offset UTC{offset:+g}h)")
+        return offset
+    except Exception as e:
+        log.warning(f"lark_api: failed to fetch Base timezone: {e}")
+        return 0.0
+
 # Per-day Lark API call counter (Bangkok day boundary, matching the rest of
 # the project's date handling). In-memory only — resets on process restart;
 # the Lark Developer Console is authoritative for the monthly quota. Exposed

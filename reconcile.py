@@ -318,6 +318,7 @@ def backfill(cfg: dict) -> dict:
     log.info("backfill: starting")
     try:
         token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+        tz_hours = lark_api.get_base_tz_hours(token, cfg["LARK_BASE_TOKEN"])
         lark_records = lark_api.fetch_all_records(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
         jira_issues = jira_api.fetch_all_issues(cfg, types=list(config.get_allowed_jira_types()))
     except Exception as e:
@@ -473,8 +474,8 @@ def backfill(cfg: dict) -> dict:
         assignee_lark = _lark_select(rec["fields"].get(F_ASSIGNEE))
         jira_name = LARK_TO_JIRA_ASSIGNEE.get(assignee_lark, "") if assignee_lark else ""
         assignee_id = account_ids.get(jira_name)
-        start = _lark_ts_to_jira_date(rec["fields"].get(F_START))
-        end   = _lark_ts_to_jira_date(rec["fields"].get(F_END))
+        start = _lark_ts_to_jira_date(rec["fields"].get(F_START), tz_hours)
+        end   = _lark_ts_to_jira_date(rec["fields"].get(F_END), tz_hours)
         p_rid = _lark_link_rid(rec["fields"].get(F_PARENT))
         parent_jira_key = index._lark_to_jira.get(p_rid) if p_rid else None
         dedup.mark(f"lark:{rid}")

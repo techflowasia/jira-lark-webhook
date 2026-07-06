@@ -123,10 +123,27 @@ def _jira_datetime_to_lark_ts(dt_str: "str | None") -> "int | None":
         return None
 
 
-def _lark_ts_to_jira_date(ts_ms) -> "str | None":
+def _lark_ts_to_jira_date(ts_ms, tz_offset_hours=0) -> "str | None":
+    """Lark ms timestamp → Jira date string ("YYYY-MM-DD").
+
+    Lark Bitable returns timestamps at midnight in the **Base's configured
+    timezone** for date-only fields (NOT UTC midnight). To get the correct
+    calendar date, the timestamp must be shifted by the Base's UTC offset
+    before formatting.
+
+    Parameters:
+        ts_ms: Lark milliseconds timestamp
+        tz_offset_hours: Base timezone offset from UTC (e.g. 7 for UTC+7).
+                         0 (UTC) preserves the legacy behavior.
+
+    The _jira_date_to_lark_ts function writes UTC midnight (for round-trip
+    stability), but Lark's get_record returns *local* midnight. Without the
+    offset, a date-only timestamp from a UTC+7 Base would decode 1 day early.
+    """
     if not ts_ms:
         return None
     try:
-        return datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        seconds = int(ts_ms) / 1000 + tz_offset_hours * 3600
+        return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%d")
     except Exception:
         return None

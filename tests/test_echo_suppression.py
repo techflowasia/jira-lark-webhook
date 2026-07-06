@@ -101,6 +101,7 @@ def test_lark_handler_suppresses_echoed_end(mock_lark, mock_jira):
     index._lark_to_jira["rec002"] = "PROJ-5"
     index._jira_to_lark["PROJ-5"] = "rec002"
     mock_lark.get_token.return_value = "tok"
+    mock_lark.get_base_tz_hours.return_value = 0.0
     mock_lark.get_record.return_value = _lrec("2026-06-22")
     mock_jira.get_issue.return_value = {"fields": {
         "summary": "T", "duedate": "2026-01-01", "customfield_10015": None}}
@@ -121,6 +122,7 @@ def test_lark_handler_marks_after_writing_jira_duedate(mock_lark, mock_jira):
     index._lark_to_jira["rec002"] = "PROJ-5"
     index._jira_to_lark["PROJ-5"] = "rec002"
     mock_lark.get_token.return_value = "tok"
+    mock_lark.get_base_tz_hours.return_value = 0.0
     mock_lark.get_record.return_value = _lrec("2026-06-22")
     mock_jira.get_issue.return_value = {"fields": {
         "summary": "T", "duedate": "2026-01-01", "customfield_10015": None}}
@@ -145,6 +147,7 @@ def test_full_two_cycle_converges(mock_lh_lark, mock_lh_jira, mock_jh_lark):
     index._jira_to_lark["PROJ-1"] = "rec002"
     # Hop 1: Lark End=2026-06-22 → lark_handler writes Jira duedate + marks echo
     mock_lh_lark.get_token.return_value = "tok"
+    mock_lh_lark.get_base_tz_hours.return_value = 0.0
     mock_lh_lark.get_record.return_value = _lrec("2026-06-22")
     mock_lh_lark.get_record.return_value["fields"]["Jira Key"] = "PROJ-1"
     mock_lh_jira.get_issue.return_value = {"fields": {

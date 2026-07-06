@@ -312,6 +312,7 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
             return
 
         token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+        tz_hours = lark_api.get_base_tz_hours(token, cfg["LARK_BASE_TOKEN"])
         rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
         log.info(f"lark_handler: record fields keys={list(rec['fields'].keys())}")
 
@@ -334,8 +335,8 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
             return
 
         title = _lark_text(rec["fields"].get(F_TITLE)) or f"[Lark] {rid}"
-        start = _lark_ts_to_jira_date(rec["fields"].get(F_START))
-        end = _lark_ts_to_jira_date(rec["fields"].get(F_END))
+        start = _lark_ts_to_jira_date(rec["fields"].get(F_START), tz_hours)
+        end = _lark_ts_to_jira_date(rec["fields"].get(F_END), tz_hours)
         parent_jira_key = _resolve_parent(rec) if itype in ("Story", "Task") else None
 
         assignee_lark = _lark_select(rec["fields"].get(F_ASSIGNEE))
@@ -402,6 +403,7 @@ def _handle_update(rid: str, table_id: str, cfg: dict,
 def _handle_update_impl(rid: str, table_id: str, cfg: dict,
                         after_value=None, before_value=None) -> None:
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+    tz_hours = lark_api.get_base_tz_hours(token, cfg["LARK_BASE_TOKEN"])
 
     jira_key = index._lark_to_jira.get(rid)
     rec = None
@@ -454,13 +456,13 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
         updates["summary"] = title
         changed.append(f"Title: \"{title}\"")
 
-    start = _lark_ts_to_jira_date(rec["fields"].get(F_START))
+    start = _lark_ts_to_jira_date(rec["fields"].get(F_START), tz_hours)
     if (start and start != jira_fields.get("customfield_10015")
             and not dedup.is_ours(dedup.date_echo_key(jira_key, "start", start))):
         updates["customfield_10015"] = start
         changed.append(f"Start: {start}")
 
-    end = _lark_ts_to_jira_date(rec["fields"].get(F_END))
+    end = _lark_ts_to_jira_date(rec["fields"].get(F_END), tz_hours)
     if (end and end != jira_fields.get("duedate")
             and not dedup.is_ours(dedup.date_echo_key(jira_key, "end", end))):
         updates["duedate"] = end
@@ -523,7 +525,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
             continue
         ft = m.get("field_type", "text")
         if ft == "date":
-            val = _lark_ts_to_jira_date(raw)
+            val = _lark_ts_to_jira_date(raw, tz_hours)
         elif ft == "number":
             try:
                 val = float(raw) if raw else None
