@@ -87,6 +87,17 @@ def test_create_skips_if_already_in_flight(mock_lark, mock_jira):
 
 @patch("lark_handler.jira_api")
 @patch("lark_handler.lark_api")
+def test_process_ignores_events_from_other_tables(mock_lark, mock_jira):
+    """record_added on a table other than the configured one is ignored — no Lark calls."""
+    import lark_handler
+    lark_handler.process({"action": "record_added", "record_id": "rec999"}, "tblOTHER", CFG)
+    mock_lark.get_token.assert_not_called()
+    mock_lark.get_record.assert_not_called()
+    mock_jira.create_issue.assert_not_called()
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
 def test_concurrent_creates_only_one_jira_issue(mock_lark, mock_jira):
     """Two threads firing record_added for the same rid in parallel → only one Jira issue."""
     import threading
