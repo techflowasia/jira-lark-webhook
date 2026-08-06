@@ -267,6 +267,10 @@ def _decode_after_value(after_value, token, cfg, before_value=None, record_id=No
 def process(action: dict, table_id: str, cfg: dict) -> None:
     act = action.get("action")
     rid = action.get("record_id", "")
+    if table_id and table_id != cfg.get("LARK_TABLE_ID"):
+        log.info(f"lark_handler: ignoring {act} rid={rid} — table_id={table_id} "
+                 f"is not the configured table ({cfg.get('LARK_TABLE_ID')})")
+        return
     log.info(f"lark_handler: action={act} record_id={rid} table_id={table_id}")
     try:
         if act == "record_added":
