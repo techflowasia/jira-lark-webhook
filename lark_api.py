@@ -6,6 +6,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 import requests
+import field_mappings
 
 log = logging.getLogger(__name__)
 
@@ -410,7 +411,13 @@ def update_record(token: str, base_token: str, table_id: str,
     # _uncacheable_write_keys and invalidate the entire entry instead.
     entry = _record_cache.get(record_id)
     if entry is not None:
-        if any(k in _uncacheable_write_keys for k in fields):
+        # F_PARENT is checked dynamically (not just via the static
+        # _uncacheable_write_keys set) so a dashboard rename of the parent
+        # field (e.g. "Parent items" -> "Epic") is still caught correctly —
+        # the link field's write-shape never round-trips with get_record's
+        # read-shape regardless of what it's currently named.
+        if any(k in _uncacheable_write_keys or k == field_mappings.F_PARENT
+               for k in fields):
             _record_cache.pop(record_id, None)
         else:
             entry["fields"].update(fields)
