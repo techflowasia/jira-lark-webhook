@@ -1,9 +1,7 @@
 """Jira webhook events → Lark actions."""
 import logging
 import lark_api, index, dedup, history, field_mappings, config
-from config import (F_TITLE, F_JIRA_KEY, F_JIRA_URL, F_TYPE, F_ASSIGNEE,
-                    F_MD, F_JIRA_STATUS, F_ACTUAL_START, F_ACTUAL_END, F_PARENT,
-                    F_RELEASE, F_START, F_END, JIRA_TO_LARK_ASSIGNEE)
+from config import (JIRA_TO_LARK_ASSIGNEE)
 from utils import (_jira_datetime_to_lark_ts, _jira_date_to_lark_ts,
                    _lark_ts_to_jira_date, _lark_text, _lark_select,
                    _lark_link_rid, _lark_multi)
@@ -71,20 +69,20 @@ def _handle_create(issue: dict, cfg: dict) -> None:
     sprint_names = _sprint_names(sprint_data)
 
     fields = {
-        F_TITLE:    jf.get("summary", ""),
-        F_JIRA_KEY: key,
-        F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{key}",
-        F_TYPE:     itype,
+        field_mappings.F_TITLE:    jf.get("summary", ""),
+        field_mappings.F_JIRA_KEY: key,
+        field_mappings.F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{key}",
+        field_mappings.F_TYPE:     itype,
     }
-    if lark_assignee:        fields[F_ASSIGNEE]     = [lark_assignee]
-    if sp_num is not None:   fields[F_MD]           = sp_num
-    if jira_status:      fields[F_JIRA_STATUS]  = jira_status
-    if actual_start:     fields[F_ACTUAL_START] = actual_start
-    if actual_end:       fields[F_ACTUAL_END]   = actual_end
-    if start_ts:         fields[F_START]        = start_ts
-    if end_ts:           fields[F_END]          = end_ts
-    if parent_record_id: fields[F_PARENT]       = [parent_record_id]
-    if sprint_names:     fields[F_RELEASE]      = sprint_names
+    if lark_assignee:        fields[field_mappings.F_ASSIGNEE]     = [lark_assignee]
+    if sp_num is not None:   fields[field_mappings.F_MD]           = sp_num
+    if jira_status:      fields[field_mappings.F_JIRA_STATUS]  = jira_status
+    if actual_start:     fields[field_mappings.F_ACTUAL_START] = actual_start
+    if actual_end:       fields[field_mappings.F_ACTUAL_END]   = actual_end
+    if start_ts:         fields[field_mappings.F_START]        = start_ts
+    if end_ts:           fields[field_mappings.F_END]          = end_ts
+    if parent_record_id: fields[field_mappings.F_PARENT]       = [parent_record_id]
+    if sprint_names:     fields[field_mappings.F_RELEASE]      = sprint_names
 
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], fields)
@@ -132,51 +130,51 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
         to_raw = item.get("to")
 
         if field == "summary":
-            if to_str is not None and to_str != _lark_text(lark_fields.get(F_TITLE)):
-                updates[F_TITLE] = to_str
+            if to_str is not None and to_str != _lark_text(lark_fields.get(field_mappings.F_TITLE)):
+                updates[field_mappings.F_TITLE] = to_str
 
         elif field == "assignee":
             lark_a = JIRA_TO_LARK_ASSIGNEE.get(to_str) if to_str else None
-            if lark_a != _lark_select(lark_fields.get(F_ASSIGNEE)):
-                updates[F_ASSIGNEE] = [lark_a] if lark_a else None
+            if lark_a != _lark_select(lark_fields.get(field_mappings.F_ASSIGNEE)):
+                updates[field_mappings.F_ASSIGNEE] = [lark_a] if lark_a else None
 
         elif field == "customfield_10016":
             sp_num = _sp_to_num(to_str)
-            cur = lark_fields.get(F_MD)
+            cur = lark_fields.get(field_mappings.F_MD)
             # Lark returns Number fields as strings ("3"); parse via _sp_to_num
             # so the value-compare converges (otherwise every story-point-bearing
             # update re-wrote R. MD — same class of phantom write reconcile hit).
             cur_num = _sp_to_num(cur)
             if sp_num != cur_num:
-                updates[F_MD] = sp_num  # may be None to clear
+                updates[field_mappings.F_MD] = sp_num  # may be None to clear
 
         elif field == "customfield_10175":
             ts = _jira_datetime_to_lark_ts(to_raw or to_str)
-            if ts is not None and ts != lark_fields.get(F_ACTUAL_START):
-                updates[F_ACTUAL_START] = ts
+            if ts is not None and ts != lark_fields.get(field_mappings.F_ACTUAL_START):
+                updates[field_mappings.F_ACTUAL_START] = ts
 
         elif field == "customfield_10176":
             ts = _jira_datetime_to_lark_ts(to_raw or to_str)
-            if ts is not None and ts != lark_fields.get(F_ACTUAL_END):
-                updates[F_ACTUAL_END] = ts
+            if ts is not None and ts != lark_fields.get(field_mappings.F_ACTUAL_END):
+                updates[field_mappings.F_ACTUAL_END] = ts
 
         elif field == "status":
-            if to_str and to_str != _lark_select(lark_fields.get(F_JIRA_STATUS)):
-                updates[F_JIRA_STATUS] = to_str
+            if to_str and to_str != _lark_select(lark_fields.get(field_mappings.F_JIRA_STATUS)):
+                updates[field_mappings.F_JIRA_STATUS] = to_str
 
         elif field == "customfield_10015":  # Jira Start date → Timeline - Start
             ts = _jira_date_to_lark_ts(to_raw or to_str)
-            if (ts is not None and ts != lark_fields.get(F_START)
+            if (ts is not None and ts != lark_fields.get(field_mappings.F_START)
                     and not dedup.is_ours(
                         dedup.date_echo_key(key, "start", _lark_ts_to_jira_date(ts)))):
-                updates[F_START] = ts
+                updates[field_mappings.F_START] = ts
 
         elif field == "duedate":  # Jira Due date → Timeline - End
             ts = _jira_date_to_lark_ts(to_raw or to_str)
-            if (ts is not None and ts != lark_fields.get(F_END)
+            if (ts is not None and ts != lark_fields.get(field_mappings.F_END)
                     and not dedup.is_ours(
                         dedup.date_echo_key(key, "end", _lark_ts_to_jira_date(ts)))):
-                updates[F_END] = ts
+                updates[field_mappings.F_END] = ts
 
     # Reconcile parent on every update. Jira fires the parent-change changelog
     # as field 'IssueParentAssociation' (fieldId None) — `toString` is the new
@@ -191,8 +189,8 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
         parent_jira_key = parent_change.get("toString") or None
     parent_record_id = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
     parent_deferred = None
-    if parent_record_id and _lark_link_rid(lark_fields.get(F_PARENT)) != parent_record_id:
-        updates[F_PARENT] = [parent_record_id]
+    if parent_record_id and _lark_link_rid(lark_fields.get(field_mappings.F_PARENT)) != parent_record_id:
+        updates[field_mappings.F_PARENT] = [parent_record_id]
     elif parent_change and parent_jira_key and not parent_record_id:
         # Parent changed but its Lark record isn't linked yet — never silently
         # drop it (a parent that's set in Jira but missing in Lark is exactly
@@ -210,8 +208,8 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     # is left alone here (clearing is a separate, bidirectionally-ambiguous
     # case — see Data Integrity note in the report).
     jira_sprints = _sprint_names(issue["fields"].get("customfield_10020"))
-    if jira_sprints and set(jira_sprints) != set(_lark_multi(lark_fields.get(F_RELEASE))):
-        updates[F_RELEASE] = jira_sprints
+    if jira_sprints and set(jira_sprints) != set(_lark_multi(lark_fields.get(field_mappings.F_RELEASE))):
+        updates[field_mappings.F_RELEASE] = jira_sprints
 
     # Apply custom (dashboard-configured) Jira → Lark mappings from changelog.
     # Coerce by the mapping's field_type — writing a raw string to a Lark
@@ -259,7 +257,7 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     # Echo-suppress: the Lark write above will fire a Lark→Jira webhook for
     # these exact dates; mark them so lark_handler skips re-propagating (breaks
     # a bidirectional conflict ping-pong). Keyed on the canonical Jira date.
-    for slot, fld in (("start", F_START), ("end", F_END)):
+    for slot, fld in (("start", field_mappings.F_START), ("end", field_mappings.F_END)):
         if fld in updates:
             dedup.mark(dedup.date_echo_key(key, slot, _lark_ts_to_jira_date(updates[fld])))
     desc = ", ".join(f"{item.get('field')}: {item.get('toString','')}" for item in items
@@ -284,9 +282,9 @@ def _handle_delete(key: str, itype: str, cfg: dict) -> None:
         # cache; on a hit we get title + type without a Lark API call.
         rec = lark_api.get_cached_or_fetch_record(
             token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], record_id)
-        title = _lark_text(rec["fields"].get(F_TITLE)) or ""
+        title = _lark_text(rec["fields"].get(field_mappings.F_TITLE)) or ""
         if not itype:
-            itype = _lark_select(rec["fields"].get(F_TYPE)) or ""
+            itype = _lark_select(rec["fields"].get(field_mappings.F_TYPE)) or ""
     except Exception:
         pass
     dedup.mark(f"lark_delete:{record_id}")

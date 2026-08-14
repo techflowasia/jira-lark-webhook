@@ -4,9 +4,7 @@ import time
 import threading
 import logging
 import lark_api, jira_api, index, dedup, history, field_mappings, config
-from config import (F_TITLE, F_START, F_END, F_ASSIGNEE, F_JIRA_KEY, F_JIRA_URL,
-                    F_TYPE, F_PARENT, F_RELEASE, F_JIRA_STATUS,
-                    LARK_TO_JIRA_ASSIGNEE)
+from config import (LARK_TO_JIRA_ASSIGNEE)
 from utils import _lark_text, _lark_select, _lark_ts_to_jira_date, _norm, _lark_link_rid
 
 log = logging.getLogger(__name__)
@@ -92,7 +90,7 @@ def _resolve_id(cache: dict, getter, cfg: dict, name: str):
 
 
 def _resolve_parent(rec: dict) -> "str | None":
-    parent_data = rec["fields"].get(F_PARENT) or []
+    parent_data = rec["fields"].get(field_mappings.F_PARENT) or []
     for item in parent_data:
         rid = _lark_link_rid([item])
         if rid:
@@ -114,15 +112,15 @@ def _relevant_lark_fields() -> set:
     bundles into the same webhook) is ignored during decode so it doesn't
     needlessly force a get_record fallback.
 
-    `F_JIRA_STATUS` is included only when its configured direction covers
+    `field_mappings.F_JIRA_STATUS` is included only when its configured direction covers
     Lark→Jira (`both` or `lark_to_jira`). The default is `jira_to_lark` — for
     users who didn't opt in, decoding the status from the webhook would be
     wasted work (the value-compare in the update branch would still skip
     the write, but it would force a get_record on every Jira-status webhook).
     """
-    names = {F_TITLE, F_START, F_END, F_ASSIGNEE, F_RELEASE, F_PARENT}
-    if field_mappings.get_direction(F_JIRA_STATUS) in ("both", "lark_to_jira"):
-        names.add(F_JIRA_STATUS)
+    names = {field_mappings.F_TITLE, field_mappings.F_START, field_mappings.F_END, field_mappings.F_ASSIGNEE, field_mappings.F_RELEASE, field_mappings.F_PARENT}
+    if field_mappings.get_direction(field_mappings.F_JIRA_STATUS) in ("both", "lark_to_jira"):
+        names.add(field_mappings.F_JIRA_STATUS)
     names.update(m["lark_field"] for m in field_mappings.get_custom_lark_to_jira())
     return names
 
@@ -293,7 +291,7 @@ def process(action: dict, table_id: str, cfg: dict) -> None:
             try:
                 token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
                 rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
-                itype = _lark_select(rec["fields"].get(F_TYPE)) or ""
+                itype = _lark_select(rec["fields"].get(field_mappings.F_TYPE)) or ""
             except Exception:
                 pass
         history.record(direction="lark→jira", event=act or "unknown",
@@ -320,13 +318,13 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
         rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
         log.info(f"lark_handler: record fields keys={list(rec['fields'].keys())}")
 
-        existing_key = _lark_text(rec["fields"].get(F_JIRA_KEY))
+        existing_key = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
         if existing_key:
             log.info(f"lark_handler: skipping create {rid} — Jira Key already set ({existing_key})")
             index.add(existing_key, rid)  # backfill the index so future edits sync
             return
 
-        itype = _lark_select(rec["fields"].get(F_TYPE))
+        itype = _lark_select(rec["fields"].get(field_mappings.F_TYPE))
         allowed = config.get_allowed_lark_types()
         if not itype:
             log.info(f"lark_handler: deferring create {rid} — Type not set yet")
@@ -338,12 +336,12 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
                            status="skipped", type=itype)
             return
 
-        title = _lark_text(rec["fields"].get(F_TITLE)) or f"[Lark] {rid}"
-        start = _lark_ts_to_jira_date(rec["fields"].get(F_START), tz_hours)
-        end = _lark_ts_to_jira_date(rec["fields"].get(F_END), tz_hours)
+        title = _lark_text(rec["fields"].get(field_mappings.F_TITLE)) or f"[Lark] {rid}"
+        start = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_START), tz_hours)
+        end = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_END), tz_hours)
         parent_jira_key = _resolve_parent(rec) if itype in ("Story", "Task") else None
 
-        assignee_lark = _lark_select(rec["fields"].get(F_ASSIGNEE))
+        assignee_lark = _lark_select(rec["fields"].get(field_mappings.F_ASSIGNEE))
         jira_name = LARK_TO_JIRA_ASSIGNEE.get(assignee_lark, "")
         assignee_id = _get_account_ids(cfg).get(jira_name)
 
@@ -359,8 +357,8 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
         index.add(new_key, rid)
 
         lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid, {
-            F_JIRA_KEY: new_key,
-            F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{new_key}",
+            field_mappings.F_JIRA_KEY: new_key,
+            field_mappings.F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{new_key}",
         })
         log.info(f"lark_handler: created Jira {new_key} from Lark {rid}")
         history.record(direction="lark→jira", event="created", lark_id=rid,
@@ -432,7 +430,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
 
     if not jira_key:
         # Not in index — check if the record itself has a Jira Key (auto-discover)
-        jira_key = _lark_text(rec["fields"].get(F_JIRA_KEY))
+        jira_key = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
         if jira_key:
             index.add(jira_key, rid)
             log.info(f"lark_handler: auto-discovered link {rid} → {jira_key}")
@@ -455,24 +453,24 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     updates: dict = {}
     changed: list = []
 
-    title = _lark_text(rec["fields"].get(F_TITLE))
+    title = _lark_text(rec["fields"].get(field_mappings.F_TITLE))
     if title and title != jira_fields.get("summary"):
         updates["summary"] = title
         changed.append(f"Title: \"{title}\"")
 
-    start = _lark_ts_to_jira_date(rec["fields"].get(F_START), tz_hours)
+    start = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_START), tz_hours)
     if (start and start != jira_fields.get("customfield_10015")
             and not dedup.is_ours(dedup.date_echo_key(jira_key, "start", start))):
         updates["customfield_10015"] = start
         changed.append(f"Start: {start}")
 
-    end = _lark_ts_to_jira_date(rec["fields"].get(F_END), tz_hours)
+    end = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_END), tz_hours)
     if (end and end != jira_fields.get("duedate")
             and not dedup.is_ours(dedup.date_echo_key(jira_key, "end", end))):
         updates["duedate"] = end
         changed.append(f"Due: {end}")
 
-    assignee_lark = _lark_select(rec["fields"].get(F_ASSIGNEE))
+    assignee_lark = _lark_select(rec["fields"].get(field_mappings.F_ASSIGNEE))
     if assignee_lark:
         jira_name = LARK_TO_JIRA_ASSIGNEE.get(assignee_lark, "")
         account_id = _get_account_ids(cfg).get(jira_name)
@@ -482,8 +480,8 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
                 updates["assignee"] = {"id": account_id}
                 changed.append(f"Assignee: {assignee_lark}")
 
-    release_raw = (_lark_text(rec["fields"].get(F_RELEASE))
-                   or _lark_select(rec["fields"].get(F_RELEASE)))
+    release_raw = (_lark_text(rec["fields"].get(field_mappings.F_RELEASE))
+                   or _lark_select(rec["fields"].get(field_mappings.F_RELEASE)))
     if release_raw:
         vid = _resolve_id(_version_cache, _get_version_map, cfg, _norm(release_raw))
         if vid:
@@ -508,8 +506,8 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     # normal update_issue / move_to_sprint path below. Value-compare against
     # current Jira status: same value → skip, no Jira call.
     status_change_target = None
-    if field_mappings.get_direction(F_JIRA_STATUS) in ("both", "lark_to_jira"):
-        new_status = _lark_text(rec["fields"].get(F_JIRA_STATUS))
+    if field_mappings.get_direction(field_mappings.F_JIRA_STATUS) in ("both", "lark_to_jira"):
+        new_status = _lark_text(rec["fields"].get(field_mappings.F_JIRA_STATUS))
         cur_status = (jira_fields.get("status") or {}).get("name") or ""
         if new_status and new_status != cur_status:
             status_change_target = new_status
@@ -610,7 +608,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
 
     desc = ", ".join(changed)
     log.info(f"lark_handler: updated Jira {jira_key} — {desc}")
-    itype_now = _lark_select(rec["fields"].get(F_TYPE)) or ""
+    itype_now = _lark_select(rec["fields"].get(field_mappings.F_TYPE)) or ""
     history.record(direction="lark→jira", event="updated", lark_id=rid,
                    jira_key=jira_key, description=desc, type=itype_now)
 

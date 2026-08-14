@@ -1,10 +1,55 @@
 """Field mapping cache — loads from Supabase, falls back to hardcoded defaults."""
 import logging
+import config
 import history
 
 log = logging.getLogger(__name__)
 
 _cache: list = []
+
+# jira_field is the STABLE identity of a system mapping — it never changes
+# when a user renames the Lark-side field via the dashboard (only lark_field
+# does). This maps each config.py constant name to that stable key, so
+# module.__getattr__ below can resolve the CURRENT lark_field for it.
+_SYSTEM_JIRA_KEYS = {
+    "F_TITLE":        "summary",
+    "F_START":        "customfield_10015",
+    "F_END":          "duedate",
+    "F_ASSIGNEE":     "assignee",
+    "F_JIRA_KEY":     "key",
+    "F_JIRA_URL":     "url",
+    "F_TYPE":         "issuetype",
+    "F_PARENT":       "parent",
+    "F_MD":           "customfield_10016",
+    "F_RELEASE":      "fixVersions",
+    "F_ACTUAL_START": "customfield_10175",
+    "F_ACTUAL_END":   "customfield_10176",
+    "F_JIRA_STATUS":  "status",
+}
+
+
+def __getattr__(name: str):
+    """PEP 562 dynamic module attribute: `field_mappings.F_PARENT` (etc.)
+    resolves to the CURRENT Lark field name for that system mapping, read
+    fresh from the dashboard-editable cache on every access (module
+    attribute lookups aren't cached the way `from x import y` bindings are,
+    so this re-resolves every single call — no stale, import-time-frozen
+    value). Falls back to the config.py default when the cache has no
+    matching row (Supabase unreachable, row deleted, or cache not yet
+    loaded) — same resilience contract as get_all()/load().
+
+    This is what makes a dashboard field-name rename (e.g. "Parent items" ->
+    "Epic") take effect immediately, with no code change or redeploy: every
+    call site now does `field_mappings.F_PARENT` instead of importing a
+    frozen string from config.py.
+    """
+    jira_field = _SYSTEM_JIRA_KEYS.get(name)
+    if jira_field is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    for m in _cache:
+        if m.get("jira_field") == jira_field and m.get("is_system"):
+            return m.get("lark_field")
+    return getattr(config, name)
 
 # Hardcoded fallback (matches Supabase seed data)
 _DEFAULTS = [

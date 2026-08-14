@@ -28,11 +28,11 @@ app = FastAPI()
 _sync_enabled: bool = True
 _reconcile_enabled: bool = True
 
-# F_PARENT writes don't round-trip with get_record's read-shape; register it
-# so update_record invalidates the cache entry instead of merging a wrong-shape
-# parent value (which would trigger redundant parent re-writes on next update).
-from config import F_PARENT as _F_PARENT
-lark_api._uncacheable_write_keys.add(_F_PARENT)
+# F_PARENT writes don't round-trip with get_record's read-shape — update_record
+# invalidates the cache entry instead of merging a wrong-shape parent value
+# (which would trigger redundant parent re-writes on next update). Checked
+# dynamically in lark_api.update_record() via field_mappings.F_PARENT, so a
+# dashboard rename of the parent field is still caught with no restart needed.
 
 # Store last 20 raw payloads for debugging
 _raw_payloads: deque = deque(maxlen=20)
