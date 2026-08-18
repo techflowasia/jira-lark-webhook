@@ -163,18 +163,23 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
                 updates[field_mappings.F_JIRA_STATUS] = to_str
 
         elif field == "customfield_10015":  # Jira Start date → Timeline - Start
+            # `ts` may legitimately be None here (Jira Start date cleared) — a
+            # changelog item for this field only exists because it actually
+            # changed, so None is as authoritative a "new value" as a real
+            # timestamp. Requiring `ts is not None` used to silently drop
+            # clears (mirrors the equivalent lark_handler bug for Lark→Jira).
             ts = _jira_date_to_lark_ts(to_raw or to_str)
-            if (ts is not None and ts != lark_fields.get(field_mappings.F_START)
+            if (ts != lark_fields.get(field_mappings.F_START)
                     and not dedup.is_ours(
                         dedup.date_echo_key(key, "start", _lark_ts_to_jira_date(ts)))):
-                updates[field_mappings.F_START] = ts
+                updates[field_mappings.F_START] = ts  # may be None to clear
 
         elif field == "duedate":  # Jira Due date → Timeline - End
             ts = _jira_date_to_lark_ts(to_raw or to_str)
-            if (ts is not None and ts != lark_fields.get(field_mappings.F_END)
+            if (ts != lark_fields.get(field_mappings.F_END)
                     and not dedup.is_ours(
                         dedup.date_echo_key(key, "end", _lark_ts_to_jira_date(ts)))):
-                updates[field_mappings.F_END] = ts
+                updates[field_mappings.F_END] = ts  # may be None to clear
 
     # Reconcile parent on every update. Jira fires the parent-change changelog
     # as field 'IssueParentAssociation' (fieldId None) — `toString` is the new

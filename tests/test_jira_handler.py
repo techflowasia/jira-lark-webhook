@@ -296,6 +296,50 @@ def test_startdate_no_redundant_write_when_already_matching(mock_lark):
     mock_lark.update_record.assert_not_called()
 
 
+# ---- Regression: clearing a Jira date must clear the Lark date, not no-op ----
+
+@patch("jira_handler.lark_api")
+def test_duedate_cleared_in_jira_clears_lark_end(mock_lark):
+    """Jira changelog for a cleared date carries to/toString = None. The old
+    `ts is not None` guard treated that as 'nothing to sync' and left Lark's
+    stale Timeline - End in place — mirror of the lark_handler bug for the
+    opposite direction."""
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_cached_or_fetch_record.return_value = {
+        "fields": {"Timeline - End": 1749513600000}}  # a real, now-stale value
+    changelog = {"items": [{"field": "duedate", "fieldId": "duedate",
+                            "to": None, "toString": None}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+
+    mock_lark.update_record.assert_called_once()
+    fields = mock_lark.update_record.call_args[0][4]
+    assert "Timeline - End" in fields
+    assert fields["Timeline - End"] is None
+
+
+@patch("jira_handler.lark_api")
+def test_startdate_cleared_in_jira_clears_lark_start(mock_lark):
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_cached_or_fetch_record.return_value = {
+        "fields": {"Timeline - Start": 1749081600000}}
+    changelog = {"items": [{"field": "Start date", "fieldId": "customfield_10015",
+                            "to": None, "toString": None}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", ISSUE, changelog, CFG)
+
+    mock_lark.update_record.assert_called_once()
+    fields = mock_lark.update_record.call_args[0][4]
+    assert "Timeline - Start" in fields
+    assert fields["Timeline - Start"] is None
+
+
 # ---- Regression: Bug 1 — parent change fires 'IssueParentAssociation' ----
 
 def _issue_with_parent(parent_key):
