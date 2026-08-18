@@ -129,8 +129,9 @@ def _decode_one(ftype, raw, options, ui_type=None):
     """Decode one webhook field_value into the shape get_record returns.
 
     Returns (value, ok). ok=False means "can't safely decode — caller should
-    fall back to get_record". An empty/cleared value decodes to (None, True);
-    the update handler already skips None-valued fields.
+    fall back to get_record". An empty/cleared value decodes to (None, True) —
+    callers that need to tell "cleared" apart from "not present in this
+    webhook" check field-key presence in the returned dict, not truthiness.
 
     IMPORTANT: For date-only DateTime fields (type 5 + ui_type "Date"), the
     webhook delivers the timestamp in the Base's configured timezone, NOT UTC
@@ -425,6 +426,12 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
                 f"lark_handler: {rid} fast-path update — {len(decoded)} field(s) "
                 f"from webhook, no get_record")
 
+    # Whether `rec["fields"]` is a full snapshot (get_record: every currently-
+    # populated field, so a missing key unambiguously means "empty right now")
+    # or a partial webhook decode (only fields whose raw value changed THIS
+    # event are present — a missing key means "no info this round", not empty).
+    # Needed below to tell "field cleared" apart from "field wasn't touched".
+    full_snapshot = rec is None
     if rec is None:
         rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
 
@@ -458,17 +465,26 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
         updates["summary"] = title
         changed.append(f"Title: \"{title}\"")
 
-    start = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_START), tz_hours)
-    if (start and start != jira_fields.get("customfield_10015")
-            and not dedup.is_ours(dedup.date_echo_key(jira_key, "start", start))):
-        updates["customfield_10015"] = start
-        changed.append(f"Start: {start}")
+    # `start`/`end` may legitimately be None here — that means the user cleared
+    # the date in Lark, not "nothing to report". A prior version of this code
+    # required `start`/`end` to be truthy before writing, which silently
+    # dropped clears (they decode to None the same as "field wasn't in this
+    # webhook"). Gate on presence instead: a full snapshot always has an
+    # authoritative answer for every field; a partial fast-path decode only
+    # has one for fields whose raw value actually changed this event.
+    if full_snapshot or field_mappings.F_START in rec["fields"]:
+        start = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_START), tz_hours)
+        if (start != jira_fields.get("customfield_10015")
+                and not dedup.is_ours(dedup.date_echo_key(jira_key, "start", start))):
+            updates["customfield_10015"] = start
+            changed.append(f"Start: {start or '(cleared)'}")
 
-    end = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_END), tz_hours)
-    if (end and end != jira_fields.get("duedate")
-            and not dedup.is_ours(dedup.date_echo_key(jira_key, "end", end))):
-        updates["duedate"] = end
-        changed.append(f"Due: {end}")
+    if full_snapshot or field_mappings.F_END in rec["fields"]:
+        end = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_END), tz_hours)
+        if (end != jira_fields.get("duedate")
+                and not dedup.is_ours(dedup.date_echo_key(jira_key, "end", end))):
+            updates["duedate"] = end
+            changed.append(f"Due: {end or '(cleared)'}")
 
     assignee_lark = _lark_select(rec["fields"].get(field_mappings.F_ASSIGNEE))
     if assignee_lark:

@@ -215,6 +215,7 @@ def test_update_pushes_to_jira(mock_lark, mock_jira):
 _META = {
     "fldTitle":  {"name": "Title",            "type": 1,  "options": {}},
     "fldStart":  {"name": "Timeline - Start",  "type": 5,  "options": {}},
+    "fldEnd":    {"name": "Timeline - End",    "type": 5,  "options": {}},
     "fldType":   {"name": "Type",              "type": 3,
                   "options": {"optEpic": "Epic", "optStory": "Story"}},
     "fldAssign": {"name": "Assignee",          "type": 4,
@@ -317,6 +318,99 @@ def test_decode_after_value_date_string(mock_lark):
         [{"field_id": "fldStart", "field_value": "1779037200000"}], "tok", CFG)
     assert out == {"Timeline - Start": 1779037200000}
     assert isinstance(out["Timeline - Start"], int)
+
+
+# ---- Regression: deleting Timeline - Start/End in Lark must clear Jira ----
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_update_clears_jira_start_date_fast_path(mock_lark, mock_jira):
+    """Deleting Timeline - Start in Lark decodes to (None, True) on the fast
+    path — field present, value now empty. The old `start and ...` truthy
+    guard treated that the same as 'field absent from this webhook' and
+    silently dropped the clear. Jira's Start date must end up None."""
+    index._lark_to_jira["recClearStart"] = "PROJ-90"
+    index._jira_to_lark["PROJ-90"] = "recClearStart"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_base_tz_hours.return_value = 0
+    mock_lark.get_field_meta_by_id.return_value = _META
+    mock_jira.get_issue.return_value = {"fields": {"customfield_10015": "2026-06-05"}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
+    import lark_handler
+    lark_handler.process({
+        "action": "record_edited", "record_id": "recClearStart",
+        "before_value": [{"field_id": "fldStart", "field_value": "1749081600000"}],
+        "after_value": [{"field_id": "fldStart", "field_value": ""}],
+    }, "tbl", CFG)
+
+    mock_jira.update_issue.assert_called_once()
+    fields = mock_jira.update_issue.call_args[0][2]
+    assert "customfield_10015" in fields
+    assert fields["customfield_10015"] is None
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_update_clears_jira_dates_full_snapshot(mock_lark, mock_jira):
+    """get_record path: Lark omits empty fields from the record entirely
+    (verified live against the Bitable API) — so a full snapshot with NO
+    'Timeline - Start'/'Timeline - End' keys means both are genuinely empty
+    right now, and Jira's stale dates must be cleared."""
+    index._lark_to_jira["recFullClear"] = "PROJ-91"
+    index._jira_to_lark["PROJ-91"] = "recFullClear"
+    rec = {"record_id": "recFullClear",
+           "fields": {"Title": "Cleared dates", "Type": "Story",
+                      "Jira Key": "PROJ-91"}}  # no Timeline keys at all
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_base_tz_hours.return_value = 0
+    mock_lark.get_record.return_value = rec
+    mock_jira.get_issue.return_value = {
+        "fields": {"summary": "Cleared dates",
+                   "customfield_10015": "2026-06-05", "duedate": "2026-06-10"}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
+    import lark_handler
+    lark_handler.process({"action": "record_edited", "record_id": "recFullClear"}, "tbl", CFG)
+
+    mock_jira.update_issue.assert_called_once()
+    fields = mock_jira.update_issue.call_args[0][2]
+    assert fields["customfield_10015"] is None
+    assert fields["duedate"] is None
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_update_unrelated_field_change_does_not_clear_dates(mock_lark, mock_jira):
+    """Regression guard: an unrelated field changing (Title) on the fast path
+    must NOT be misread as 'dates were cleared'. Timeline - Start/End are
+    simply absent from the webhook's changed-fields decode — that must stay
+    a no-op for dates, not a false clear of real Jira dates."""
+    index._lark_to_jira["recUnrelated"] = "PROJ-92"
+    index._jira_to_lark["PROJ-92"] = "recUnrelated"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_base_tz_hours.return_value = 0
+    mock_lark.get_field_meta_by_id.return_value = _META
+    mock_jira.get_issue.return_value = {
+        "fields": {"summary": "old title",
+                   "customfield_10015": "2026-06-05", "duedate": "2026-06-10"}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
+    import lark_handler
+    lark_handler.process({
+        "action": "record_edited", "record_id": "recUnrelated",
+        "after_value": [{"field_id": "fldTitle", "field_value": "new title"}],
+    }, "tbl", CFG)
+
+    mock_jira.update_issue.assert_called_once()
+    fields = mock_jira.update_issue.call_args[0][2]
+    assert fields == {"summary": "new title"}  # no date keys at all
 
 
 @patch("lark_handler.lark_api")
