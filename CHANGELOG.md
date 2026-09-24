@@ -9,6 +9,14 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
+## 2026-09-24 — Deleting P. QA md in Lark never cleared Jira's QA Manday
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| _pending_ | fix | **Clearing `P. QA md` in Lark left Jira's `QA Manday` (`customfield_10178`) untouched.** Live payloads confirm a cleared Lark Number arrives in `after_value` as `field_value: ""` (field present), which `_decode_one` correctly decodes to `(None, True)`. The custom-mapping loop in `lark_handler._handle_update_impl` then hit `if raw is None: continue` and `if not val: continue`, so the clear was dropped — the exact truthy-vs-presence conflation flagged (unfixed) in the 2026-08-18 entry. Side effect of the same guard: a value of `0` could never sync either. Fix: gate on presence (`full_snapshot or lark_field in rec["fields"]`) like Timeline Start/End, send `None` to Jira when the Lark value is empty, and treat an empty Jira value as `None` in the compare so a clear against an already-empty Jira is a no-op (echo convergence). Undecodable numbers skip rather than clear. Jira→Lark already handled clears. Audit at fix time: 28 issues had Lark empty / Jira set (27 `[Web]` VR-447/501/533–559 written to Jira 2026-08-13 by the sync; VR-258 set directly in Jira 2026-05-18), 4 had Lark set / Jira empty (VR-459/473/474/489, no Jira history). 5 new tests (`test_custom_number_*`). Suite: 138 passed. |
+
+---
+
 ## 2026-08-18 — Deleting Timeline - Start/End in Lark never cleared the Jira date
 
 | Commit | Type | Summary |
