@@ -930,6 +930,125 @@ def test_custom_mapping_writes_when_value_differs(mock_lark, mock_jira):
         field_mappings._cache = []
 
 
+_QA_MAPPING = {"id": 99, "lark_field": "P. QA md", "jira_field": "customfield_10178",
+               "jira_label": "QA Manday", "direction": "both", "field_type": "number",
+               "is_system": False, "active": True}
+
+
+def _qa_clear_mocks(mock_lark, mock_jira, rid, key, jira_qa):
+    index._lark_to_jira[rid] = key
+    index._jira_to_lark[key] = rid
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_base_tz_hours.return_value = 0
+    mock_lark.get_field_meta_by_id.return_value = {
+        "fldTitle": {"name": "Title", "type": 1, "options": {}},
+        "fldQA": {"name": "P. QA md", "type": 2, "options": {}},
+    }
+    mock_jira.get_issue.return_value = {"fields": {
+        "summary": "T", "customfield_10178": jira_qa}}
+    mock_jira.get_account_ids.return_value = {}
+    mock_jira.get_project_versions.return_value = []
+    mock_jira.get_board_id.return_value = None
+
+
+# ---- Regression: deleting P. QA md in Lark must clear Jira QA Manday ----
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_custom_number_clear_fast_path(mock_lark, mock_jira):
+    """Live payload shape: a cleared Lark Number arrives as "" in after_value.
+    The custom-mapping loop's `if raw is None: continue` dropped it, so Jira
+    kept the old QA Manday forever."""
+    import lark_handler, field_mappings
+    field_mappings._cache = [_QA_MAPPING]
+    try:
+        _qa_clear_mocks(mock_lark, mock_jira, "recQA1", "PROJ-300", 1.5)
+        lark_handler.process({
+            "action": "record_edited", "record_id": "recQA1",
+            "before_value": [{"field_id": "fldQA", "field_value": "1.5"}],
+            "after_value": [{"field_id": "fldQA", "field_value": ""}],
+        }, "tbl", CFG)
+        mock_jira.update_issue.assert_called_once()
+        sent = mock_jira.update_issue.call_args[0][2]
+        assert "customfield_10178" in sent and sent["customfield_10178"] is None
+    finally:
+        field_mappings._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_custom_number_clear_full_snapshot(mock_lark, mock_jira):
+    """get_record omits empty fields, so no 'P. QA md' key = empty now."""
+    import lark_handler, field_mappings
+    field_mappings._cache = [_QA_MAPPING]
+    try:
+        _qa_clear_mocks(mock_lark, mock_jira, "recQA2", "PROJ-301", 2.0)
+        mock_lark.get_record.return_value = {
+            "record_id": "recQA2", "fields": {"Title": "T", "Jira Key": "PROJ-301"}}
+        lark_handler.process(
+            {"action": "record_edited", "record_id": "recQA2"}, "tbl", CFG)
+        mock_jira.update_issue.assert_called_once()
+        assert mock_jira.update_issue.call_args[0][2] == {"customfield_10178": None}
+    finally:
+        field_mappings._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_custom_number_zero_syncs(mock_lark, mock_jira):
+    """0 is a real value — the old `if not val` guard silently dropped it."""
+    import lark_handler, field_mappings
+    field_mappings._cache = [_QA_MAPPING]
+    try:
+        _qa_clear_mocks(mock_lark, mock_jira, "recQA3", "PROJ-302", 1.0)
+        lark_handler.process({
+            "action": "record_edited", "record_id": "recQA3",
+            "before_value": [{"field_id": "fldQA", "field_value": "1"}],
+            "after_value": [{"field_id": "fldQA", "field_value": "0"}],
+        }, "tbl", CFG)
+        assert mock_jira.update_issue.call_args[0][2] == {"customfield_10178": 0.0}
+    finally:
+        field_mappings._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_custom_number_untouched_is_not_cleared(mock_lark, mock_jira):
+    """Guard: a Title-only edit on the fast path must not false-clear QA Manday."""
+    import lark_handler, field_mappings
+    field_mappings._cache = [_QA_MAPPING]
+    try:
+        _qa_clear_mocks(mock_lark, mock_jira, "recQA4", "PROJ-303", 1.5)
+        lark_handler.process({
+            "action": "record_edited", "record_id": "recQA4",
+            "before_value": [{"field_id": "fldTitle", "field_value": "T"},
+                             {"field_id": "fldQA", "field_value": "1.5"}],
+            "after_value": [{"field_id": "fldTitle", "field_value": "T2"},
+                            {"field_id": "fldQA", "field_value": "1.5"}],
+        }, "tbl", CFG)
+        assert mock_jira.update_issue.call_args[0][2] == {"summary": "T2"}
+    finally:
+        field_mappings._cache = []
+
+
+@patch("lark_handler.jira_api")
+@patch("lark_handler.lark_api")
+def test_custom_number_clear_when_jira_already_empty_is_noop(mock_lark, mock_jira):
+    """Echo convergence: Lark empty + Jira empty → no Jira write."""
+    import lark_handler, field_mappings
+    field_mappings._cache = [_QA_MAPPING]
+    try:
+        _qa_clear_mocks(mock_lark, mock_jira, "recQA5", "PROJ-304", None)
+        lark_handler.process({
+            "action": "record_edited", "record_id": "recQA5",
+            "before_value": [{"field_id": "fldQA", "field_value": "1"}],
+            "after_value": [{"field_id": "fldQA", "field_value": ""}],
+        }, "tbl", CFG)
+        mock_jira.update_issue.assert_not_called()
+    finally:
+        field_mappings._cache = []
+
+
 @patch("lark_handler.lark_api")
 def test_decode_after_value_no_before_disables_filter(mock_lark):
     """When before_value isn't supplied (legacy / coalesced re-run), the

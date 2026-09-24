@@ -538,36 +538,40 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
         if m["jira_field"] == "customfield_10020":
             # Sprint is set via Agile API (move_to_sprint) — issue update rejects text values
             continue
-        raw = rec["fields"].get(m["lark_field"])
-        if raw is None:
+        # Gate on presence, not truthiness — same fix as Timeline Start/End
+        # above. A cleared Lark value decodes to None, which the old
+        # `if raw is None` / `if not val` checks treated as "not touched", so
+        # deleting e.g. P. QA md in Lark never cleared Jira's QA Manday (and a
+        # value of 0 could never be synced either).
+        if not (full_snapshot or m["lark_field"] in rec["fields"]):
             continue
+        raw = rec["fields"].get(m["lark_field"])
         ft = m.get("field_type", "text")
         if ft == "date":
-            val = _lark_ts_to_jira_date(raw, tz_hours)
+            val = _lark_ts_to_jira_date(raw, tz_hours) if raw not in (None, "") else None
         elif ft == "number":
             try:
-                val = float(raw) if raw else None
+                val = float(raw) if raw not in (None, "") else None
             except (TypeError, ValueError):
-                val = None
+                continue  # undecodable — don't risk clearing Jira on garbage
         else:
-            val = _lark_text(raw) or _lark_select(raw)
-        if not val:
-            continue
+            val = (_lark_text(raw) or _lark_select(raw)) or None
         cur = jira_fields.get(m["jira_field"])
         if ft == "number":
             cur_num = float(cur) if isinstance(cur, (int, float)) else None
             if val == cur_num:
                 continue
         elif ft == "date":
-            if val == cur:  # both canonical "YYYY-MM-DD"
+            if val == (cur or None):  # both canonical "YYYY-MM-DD"
                 continue
         else:
             if isinstance(cur, dict):
                 cur = cur.get("value") or cur.get("name")
-            if val == cur:
+            if val == (cur or None):
                 continue
         updates[m["jira_field"]] = val
-        changed.append(f"{m['jira_label'] or m['lark_field']}: {val}")
+        changed.append(f"{m['jira_label'] or m['lark_field']}: "
+                       f"{'(cleared)' if val is None else val}")
 
     # Resolve the Release→sprint move BEFORE the early-return guard. A Release
     # change that maps to a sprint but not a fixVersion (or whose fixVersion
