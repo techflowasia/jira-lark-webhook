@@ -209,12 +209,20 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     # (sub-task add, man-day change) leaves a stale Lark Release; the
     # Lark→Jira sprint-move path then pushes that wrong value back and moves
     # the Jira card to the wrong sprint (silent data corruption). Value-compare
-    # as a set so this can't cause a redundant write / loop. Empty Jira sprint
-    # is left alone here (clearing is a separate, bidirectionally-ambiguous
-    # case — see Data Integrity note in the report).
+    # as a set so this can't cause a redundant write / loop. An empty Jira
+    # sprint on its own is ambiguous (Lark Release may hold a value with no
+    # matching sprint), so it only clears Lark when THIS event carries a
+    # Sprint changelog item — i.e. the card was actually moved to the backlog.
+    # Gating on `if jira_sprints` alone silently dropped every sprint→backlog
+    # move (VR-741 et al., Beta 1.6, 2026-09-30).
     jira_sprints = _sprint_names(issue["fields"].get("customfield_10020"))
-    if jira_sprints and set(jira_sprints) != set(_lark_multi(lark_fields.get(field_mappings.F_RELEASE))):
+    lark_release = _lark_multi(lark_fields.get(field_mappings.F_RELEASE))
+    sprint_changed = any((it.get("fieldId") or it.get("field")) == "customfield_10020"
+                         for it in items)
+    if jira_sprints and set(jira_sprints) != set(lark_release):
         updates[field_mappings.F_RELEASE] = jira_sprints
+    elif not jira_sprints and sprint_changed and lark_release:
+        updates[field_mappings.F_RELEASE] = None  # moved to backlog → clear
 
     # Apply custom (dashboard-configured) Jira → Lark mappings from changelog.
     # Coerce by the mapping's field_type — writing a raw string to a Lark

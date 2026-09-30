@@ -231,6 +231,68 @@ def test_non_sprint_edit_corrects_diverged_release(mock_lark):
     assert fields["Release"] == ["Beta 1.3"]  # corrected to Jira's truth
 
 
+# ---- Regression: sprint → backlog must clear Lark Release ----
+
+_TO_BACKLOG = {"items": [{"field": "Sprint", "fieldId": "customfield_10020",
+                          "fromString": "Beta 1.6", "from": "276",
+                          "toString": "", "to": ""}]}
+
+
+@patch("jira_handler.lark_api")
+def test_move_to_backlog_clears_lark_release(mock_lark):
+    """THE BUG (VR-741 et al., 2026-09-30): moving a card from sprint Beta 1.6
+    to the backlog fires a Sprint changelog item with an empty `to` and an
+    empty customfield_10020. The `if jira_sprints` gate dropped it, so Lark
+    kept Release = Beta 1.6 forever."""
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"Release": ["Beta 1.6"]}}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", _issue_with_sprint([]),
+                         _TO_BACKLOG, CFG)
+
+    mock_lark.update_record.assert_called_once()
+    fields = mock_lark.update_record.call_args[0][4]
+    assert "Release" in fields and fields["Release"] is None
+
+
+@patch("jira_handler.lark_api")
+def test_move_to_backlog_no_write_when_release_already_empty(mock_lark):
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {}}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated", _issue_with_sprint([]),
+                         _TO_BACKLOG, CFG)
+
+    mock_lark.update_record.assert_not_called()
+
+
+@patch("jira_handler.lark_api")
+def test_non_sprint_edit_with_no_sprint_keeps_lark_release(mock_lark):
+    """Without an explicit Sprint changelog item, an empty Jira sprint stays
+    ambiguous (e.g. Lark Release set to a value with no matching sprint) —
+    a summary edit must not wipe Lark's Release."""
+    index._jira_to_lark["PROJ-1"] = "rec1"
+    index._lark_to_jira["rec1"] = "PROJ-1"
+    mock_lark.get_token.return_value = "tok"
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {"Release": ["Beta 1.6"]}}
+    changelog = {"items": [{"field": "summary", "fieldId": "summary",
+                            "toString": "new title", "to": None}]}
+
+    import jira_handler
+    jira_handler.process("jira:issue_updated",
+                         _issue_with_sprint([], summary="new title"),
+                         changelog, CFG)
+
+    fields = mock_lark.update_record.call_args[0][4]
+    assert "Release" not in fields
+
+
 # ---- Regression: Bug 2 — Jira Start/End date → Lark (was unrecognized) ----
 
 def test_jira_date_to_lark_ts_round_trips_utc():

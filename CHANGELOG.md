@@ -9,6 +9,14 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
+## 2026-09-30 — Moving a Jira card from a sprint to the backlog never cleared Lark Release
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| _pending_ | fix | **Jira sprint → backlog left Lark `Release` on the old sprint.** Live `/debug/payloads` showed 9 cards (VR-447/692/717/726/727/728/741/742/750) moved out of `Beta 1.6`: changelog `Sprint` item `from "276" → to ""`, `customfield_10020` = `[]`. `jira_handler` reconciled Release only under `if jira_sprints and …`, so an empty sprint list was always dropped — the same truthy-vs-presence class as the 2026-06 and 2026-08 bugs. Fix: when the current sprint list is empty **and** this event carries a `customfield_10020` changelog item (an explicit move to backlog), write `Release = None`. A non-sprint edit on a sprint-less card still leaves Release alone (keeps the old ambiguity guard). Clearing Release in Lark doesn't echo back: `lark_handler` skips fixVersion/sprint pushes when Release is empty. The reconcile sweep still skips empty sprints, so any backlog move that happened before this deploy needs a one-off repair. 3 new tests (`test_move_to_backlog_*`, `test_non_sprint_edit_with_no_sprint_keeps_lark_release`). Suite: 141 passed. |
+
+---
+
 ## 2026-09-24 — Deleting P. QA md in Lark never cleared Jira's QA Manday
 
 | Commit | Type | Summary |
