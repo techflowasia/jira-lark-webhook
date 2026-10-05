@@ -1,5 +1,7 @@
 """Jira REST API v3 client."""
 import requests
+from config import (JF_START, JF_STORY_POINTS, JF_ACTUAL_START, JF_ACTUAL_END, JF_SPRINT,
+                    DEFAULT_SYNC_TYPES)
 from requests.auth import HTTPBasicAuth
 
 
@@ -20,10 +22,10 @@ def fetch_all_issues(cfg: dict, types: "list | None" = None,
     incremental reconcile path to avoid a full-project scan every run.
     """
     issues, next_token = [], None
-    type_list = ", ".join(types) if types else "Epic, Story, Task"
-    fields = ["summary", "issuetype", "assignee", "customfield_10015",
-              "duedate", "customfield_10016", "parent", "status",
-              "customfield_10175", "customfield_10176", "customfield_10020"]
+    type_list = ", ".join(types) if types else ", ".join(DEFAULT_SYNC_TYPES)
+    fields = ["summary", "issuetype", "assignee", JF_START,
+              "duedate", JF_STORY_POINTS, "parent", "status",
+              JF_ACTUAL_START, JF_ACTUAL_END, JF_SPRINT]
     jql = f"project={cfg['JIRA_PROJECT']} AND issuetype in ({type_list})"
     if updated_since:
         jql += f' AND updated >= "{updated_since}"'
@@ -72,7 +74,7 @@ def create_issue(cfg: dict, issuetype: str, summary: str,
         "issuetype": {"name": issuetype},
         "summary": summary,
     }
-    if start_date:  fields["customfield_10015"] = start_date
+    if start_date:  fields[JF_START] = start_date
     if due_date:    fields["duedate"] = due_date
     if assignee_id: fields["assignee"] = {"id": assignee_id}
     if parent_key:  fields["parent"] = {"key": parent_key}

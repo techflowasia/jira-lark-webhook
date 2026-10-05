@@ -2,10 +2,11 @@
 incremental path between daily full sweeps to stay under the Lark API quota."""
 import logging
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from collections import Counter
 import lark_api, jira_api, index, dedup, config, history, field_mappings
-from config import (JIRA_TO_LARK_ASSIGNEE, LARK_TO_JIRA_ASSIGNEE)
+from config import (JIRA_TO_LARK_ASSIGNEE, LARK_TO_JIRA_ASSIGNEE, LOCAL_TZ,
+                    JF_START, JF_STORY_POINTS, JF_ACTUAL_START, JF_ACTUAL_END, JF_SPRINT)
 from utils import (_lark_text, _lark_select, _jira_datetime_to_lark_ts,
                    _jira_date_to_lark_ts, _lark_ts_to_jira_date,
                    _lark_link_rid, _lark_multi)
@@ -43,9 +44,9 @@ def _set_setting(key: str, value: str) -> None:
 
 
 def _ms_to_jira_jql(ts_ms: int) -> str:
-    # Jira JQL accepts "yyyy-MM-dd HH:mm" in the instance timezone. Bangkok
-    # (UTC+7) matches the rest of this project's date handling.
-    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone(timedelta(hours=7)))
+    # Jira JQL accepts "yyyy-MM-dd HH:mm" in the instance timezone. LOCAL_TZ
+    # (default UTC+7) matches the rest of this project's date handling.
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=LOCAL_TZ)
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
@@ -220,14 +221,14 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
 
     assignee_name = (jf.get("assignee") or {}).get("displayName")
     lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
-    sp_num = _sp_to_num(jf.get("customfield_10016"))
+    sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
     jira_status = (jf.get("status") or {}).get("name")
-    actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
-    actual_end = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
-    start_ts = _jira_date_to_lark_ts(jf.get("customfield_10015"))
+    actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
+    actual_end = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_END))
+    start_ts = _jira_date_to_lark_ts(jf.get(JF_START))
     end_ts = _jira_date_to_lark_ts(jf.get("duedate"))
 
-    sprint_names = [s.get("name") for s in (jf.get("customfield_10020") or [])
+    sprint_names = [s.get("name") for s in (jf.get(JF_SPRINT) or [])
                     if s.get("name")]
     parent_jira_key = (jf.get("parent") or {}).get("key")
     parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
@@ -417,13 +418,13 @@ def backfill(cfg: dict) -> dict:
             continue
         assignee_name = (jf.get("assignee") or {}).get("displayName")
         lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
-        sp_num = _sp_to_num(jf.get("customfield_10016"))
+        sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
         jira_status = (jf.get("status") or {}).get("name")
-        actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
-        actual_end   = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
-        start_ts = _jira_date_to_lark_ts(jf.get("customfield_10015"))
+        actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
+        actual_end   = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_END))
+        start_ts = _jira_date_to_lark_ts(jf.get(JF_START))
         end_ts   = _jira_date_to_lark_ts(jf.get("duedate"))
-        sprint_names = [s.get("name") for s in (jf.get("customfield_10020") or [])
+        sprint_names = [s.get("name") for s in (jf.get(JF_SPRINT) or [])
                         if s.get("name")]
         parent_jira_key = (jf.get("parent") or {}).get("key")
         parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
@@ -503,13 +504,13 @@ def backfill(cfg: dict) -> dict:
         cur = lark_rec["fields"]
         assignee_name = (jf.get("assignee") or {}).get("displayName")
         lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
-        sp_num = _sp_to_num(jf.get("customfield_10016"))
+        sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
         jira_status  = (jf.get("status") or {}).get("name")
-        actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
-        actual_end   = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
-        start_ts     = _jira_date_to_lark_ts(jf.get("customfield_10015"))
+        actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
+        actual_end   = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_END))
+        start_ts     = _jira_date_to_lark_ts(jf.get(JF_START))
         end_ts       = _jira_date_to_lark_ts(jf.get("duedate"))
-        sprint_data  = jf.get("customfield_10020") or []
+        sprint_data  = jf.get(JF_SPRINT) or []
         sprint_names = [s.get("name") for s in sprint_data if s.get("name")]
         parent_jira_key = (jf.get("parent") or {}).get("key")
         parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None

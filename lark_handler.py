@@ -4,7 +4,8 @@ import time
 import threading
 import logging
 import lark_api, jira_api, index, dedup, history, field_mappings, config
-from config import (LARK_TO_JIRA_ASSIGNEE)
+from config import (LARK_TO_JIRA_ASSIGNEE, LARK_API_HOST,
+                    JF_START, JF_SPRINT)
 from utils import _lark_text, _lark_select, _lark_ts_to_jira_date, _norm, _lark_link_rid
 
 log = logging.getLogger(__name__)
@@ -288,7 +289,7 @@ def process(action: dict, table_id: str, cfg: dict) -> None:
         # Don't re-call Lark to recover Type when the failure was itself a Lark
         # API error — that just adds more load to an already rate-limited API.
         itype = ""
-        if "larksuite.com" not in str(e):
+        if LARK_API_HOST not in str(e):
             try:
                 token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
                 rec = lark_api.get_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
@@ -474,9 +475,9 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     # has one for fields whose raw value actually changed this event.
     if full_snapshot or field_mappings.F_START in rec["fields"]:
         start = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_START), tz_hours)
-        if (start != jira_fields.get("customfield_10015")
+        if (start != jira_fields.get(JF_START)
                 and not dedup.is_ours(dedup.date_echo_key(jira_key, "start", start))):
-            updates["customfield_10015"] = start
+            updates[JF_START] = start
             changed.append(f"Start: {start or '(cleared)'}")
 
     if full_snapshot or field_mappings.F_END in rec["fields"]:
@@ -535,7 +536,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     # the same custom values to Jira (the 2026-05 QA-Manday echo burst, layered
     # on top of the decoder fix as defense in depth).
     for m in field_mappings.get_custom_lark_to_jira():
-        if m["jira_field"] == "customfield_10020":
+        if m["jira_field"] == JF_SPRINT:
             # Sprint is set via Agile API (move_to_sprint) — issue update rejects text values
             continue
         # Gate on presence, not truthiness — same fix as Timeline Start/End
@@ -583,7 +584,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
         sid = _resolve_id(_sprint_cache, _get_sprint_map, cfg, _norm(release_raw))
         if sid:
             current_sprint_ids = [s.get("id") for s in
-                                  (jira_fields.get("customfield_10020") or [])]
+                                  (jira_fields.get(JF_SPRINT) or [])]
             if sid in current_sprint_ids:
                 sid = None  # already in that sprint — skip the redundant Jira call
 
@@ -597,8 +598,8 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
         # Echo-suppress: the Jira write fires a Jira→Lark webhook for these
         # exact dates; mark them so jira_handler skips re-propagating (breaks
         # the bidirectional conflict ping-pong). Symmetric with jira_handler.
-        if "customfield_10015" in updates:
-            dedup.mark(dedup.date_echo_key(jira_key, "start", updates["customfield_10015"]))
+        if JF_START in updates:
+            dedup.mark(dedup.date_echo_key(jira_key, "start", updates[JF_START]))
         if "duedate" in updates:
             dedup.mark(dedup.date_echo_key(jira_key, "end", updates["duedate"]))
 

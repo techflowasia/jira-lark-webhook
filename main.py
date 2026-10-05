@@ -13,11 +13,7 @@ import lark_handler, jira_handler
 import config as _cfg_mod
 from config import get_cfg, set_active_table
 
-LARK_APP_ID     = "cli_a9772fc461e1de15"
-LARK_APP_SECRET = "c8umFVp63U25n9USaljMjeKOOAp0uenw"
-LARK_BASE_TOKEN = "DdwQbYcA3aMpeKs6gTcjk7n2pnf"
-BOT_OPEN_ID     = "ou_6c4fb657f0b844228990210a8fc789b5"
-REDIRECT_URI    = "https://jira-lark-webhook.onrender.com/auth/callback"
+REDIRECT_URI = f"{_cfg_mod.PUBLIC_URL}/auth/callback"
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -159,12 +155,12 @@ async def _reconcile_loop() -> None:
 async def auth_start():
     """Step 1 — redirect user to Lark OAuth to get a user access token."""
     params = urllib.parse.urlencode({
-        "app_id":       LARK_APP_ID,
+        "app_id":       get_cfg()["LARK_APP_ID"],
         "redirect_uri": REDIRECT_URI,
         "scope":        "drive:drive",
         "state":        "add_bot",
     })
-    return RedirectResponse(f"https://open.larksuite.com/open-apis/authen/v1/authorize?{params}")
+    return RedirectResponse(f"{lark_api.LARK_BASE_URL}/authen/v1/authorize?{params}")
 
 
 @app.get("/auth/callback", response_class=HTMLResponse)
@@ -174,10 +170,11 @@ async def auth_callback(request: Request):
     if not code:
         return HTMLResponse("<h2>Error: no code in callback</h2>", status_code=400)
 
+    cfg = get_cfg()
     # Step 1 — get app_access_token
     r0 = urllib.request.Request(
-        "https://open.larksuite.com/open-apis/auth/v3/app_access_token/internal",
-        data=json.dumps({"app_id": LARK_APP_ID, "app_secret": LARK_APP_SECRET}).encode(),
+        f"{lark_api.LARK_BASE_URL}/auth/v3/app_access_token/internal",
+        data=json.dumps({"app_id": cfg["LARK_APP_ID"], "app_secret": cfg["LARK_APP_SECRET"]}).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -185,7 +182,7 @@ async def auth_callback(request: Request):
 
     # Step 2 — exchange auth code for user access token
     req = urllib.request.Request(
-        "https://open.larksuite.com/open-apis/authen/v1/access_token",
+        f"{lark_api.LARK_BASE_URL}/authen/v1/access_token",
         data=json.dumps({"grant_type": "authorization_code", "code": code}).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {app_token}"},
         method="POST",
@@ -197,10 +194,10 @@ async def auth_callback(request: Request):
 
     # Add bot as editor on the Base using the user's token
     req2 = urllib.request.Request(
-        f"https://open.larksuite.com/open-apis/drive/v1/permissions/{LARK_BASE_TOKEN}/members?type=bitable",
+        f"{lark_api.LARK_BASE_URL}/drive/v1/permissions/{cfg['LARK_BASE_TOKEN']}/members?type=bitable",
         data=json.dumps({
             "member_type": "openid",
-            "member_id":   BOT_OPEN_ID,
+            "member_id":   _cfg_mod.LARK_BOT_OPEN_ID,
             "perm":        "edit",
             "perm_type":   "container",
             "notify_lark": False,
@@ -222,7 +219,7 @@ async def auth_callback(request: Request):
     sub_msg = ""
     try:
         req3 = urllib.request.Request(
-            f"https://open.larksuite.com/open-apis/drive/v1/files/{LARK_BASE_TOKEN}/subscribe?file_type=bitable",
+            f"{lark_api.LARK_BASE_URL}/drive/v1/files/{cfg['LARK_BASE_TOKEN']}/subscribe?file_type=bitable",
             data=json.dumps({"event_types": ["drive.file.bitable_record_changed_v1"]}).encode(),
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {user_token}"},
             method="POST",
@@ -370,7 +367,7 @@ async def api_lark_type_options():
         cfg = get_cfg()
         token = await asyncio.to_thread(lark_api.get_token, cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
         options = await asyncio.to_thread(
-            lark_api.get_select_options, token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], "Type")
+            lark_api.get_select_options, token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], field_mappings.F_TYPE)
         return {"options": options}
     except Exception as e:
         return {"options": [], "error": str(e)}
@@ -808,9 +805,9 @@ async def dashboard(request: Request):
             <div id="table-picker" style="display:none;margin-top:8px"></div>
           </td></tr>
       <tr><td class="cfg-key">Jira Webhook URL</td>
-          <td class="cfg-val">https://jira-lark-webhook.onrender.com/webhook/jira</td></tr>
+          <td class="cfg-val">{_cfg_mod.PUBLIC_URL}/webhook/jira</td></tr>
       <tr><td class="cfg-key">Lark Webhook URL</td>
-          <td class="cfg-val">https://jira-lark-webhook.onrender.com/webhook/lark</td></tr>
+          <td class="cfg-val">{_cfg_mod.PUBLIC_URL}/webhook/lark</td></tr>
     </table>
   </div>
 
