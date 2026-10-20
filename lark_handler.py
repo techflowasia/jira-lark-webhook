@@ -398,6 +398,10 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
         history.record(direction="lark→jira", event="created", lark_id=rid,
                        jira_key=new_key, description=f"Created {itype}: \"{title}\"",
                        type=itype)
+        if assignee_lark and not jira_name:
+            history.warn_unmapped_assignee(
+                jira_key=new_key, name=assignee_lark, lark_id=rid, type=itype,
+                outcome="Jira Assignee unchanged", direction="lark→jira")
     finally:
         with _create_lock:
             _create_in_flight.discard(rid)
@@ -529,6 +533,12 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
                      if field_mappings.reads_for_jira(field_mappings.F_ASSIGNEE) else None)
     if assignee_lark:
         jira_name = config.lark_to_jira_assignee().get(assignee_lark, "")
+        if not jira_name:
+            # Jira stays as-is; one warning per event that carries this person.
+            history.warn_unmapped_assignee(
+                jira_key=jira_key, name=assignee_lark, lark_id=rid,
+                outcome="Jira Assignee unchanged", direction="lark→jira",
+                type=_lark_select(rec["fields"].get(field_mappings.F_TYPE)) or "")
         account_id = _get_account_ids(cfg).get(jira_name)
         if account_id:
             current_account_id = (jira_fields.get("assignee") or {}).get("accountId")

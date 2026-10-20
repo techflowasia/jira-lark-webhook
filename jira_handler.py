@@ -66,7 +66,7 @@ def _handle_create(issue: dict, cfg: dict) -> None:
         return
 
     assignee_name = (jf.get("assignee") or {}).get("displayName")
-    lark_assignee = config.jira_to_lark_assignee().get(assignee_name) if assignee_name else None
+    lark_assignee, assignee_unmapped = config.lark_assignee_for(assignee_name)
     sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
     jira_status = (jf.get("status") or {}).get("name")
     actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
@@ -102,6 +102,9 @@ def _handle_create(issue: dict, cfg: dict) -> None:
     history.record(direction="jira→lark", event="created", jira_key=key, lark_id=rid,
                    description=f"Created {itype}: \"{jf.get('summary', '')}\"",
                    type=itype)
+    if assignee_unmapped and field_mappings.F_ASSIGNEE:
+        history.warn_unmapped_assignee(jira_key=key, name=assignee_name, lark_id=rid,
+                                       outcome="Lark Assignee left empty", type=itype)
 
 
 def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
@@ -134,6 +137,7 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
         lark_fields = {}
 
     updates: dict = {}
+    unmapped_assignee = None
     for item in items:
         field = item.get("fieldId") or item.get("field")
         to_str = item.get("toString")
@@ -144,9 +148,12 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
                 put(updates, field_mappings.F_TITLE, to_str)
 
         elif field == "assignee":
-            lark_a = config.jira_to_lark_assignee().get(to_str) if to_str else None
+            # Unassigned or not in the people list -> clear the Lark Assignee.
+            lark_a, unmapped = config.lark_assignee_for(to_str)
             if lark_a != _lark_select(lark_fields.get(field_mappings.F_ASSIGNEE)):
                 put(updates, field_mappings.F_ASSIGNEE, [lark_a] if lark_a else None)
+                if unmapped and field_mappings.F_ASSIGNEE in updates:
+                    unmapped_assignee = to_str
 
         elif field == JF_STORY_POINTS:
             sp_num = _sp_to_num(to_str)
@@ -291,6 +298,9 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     itype = ((issue.get("fields") or {}).get("issuetype") or {}).get("name", "")
     history.record(direction="jira→lark", event="updated", jira_key=key, lark_id=record_id,
                    description=desc or "updated", type=itype)
+    if unmapped_assignee:
+        history.warn_unmapped_assignee(jira_key=key, name=unmapped_assignee,
+                                       lark_id=record_id, type=itype)
 
 
 def _handle_delete(key: str, itype: str, cfg: dict) -> None:

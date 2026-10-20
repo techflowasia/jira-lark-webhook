@@ -105,6 +105,16 @@ def lark_to_jira_assignee() -> dict:
     return {v: k for k, v in jira_to_lark_assignee().items()}
 
 
+def lark_assignee_for(display_name: "str | None") -> "tuple[str | None, bool]":
+    """(lark_name_or_None, is_unmapped) for a Jira assignee display name in
+    the CURRENT project. Unassigned -> (None, False); a person absent from the
+    project's people list -> (None, True)."""
+    if not display_name:
+        return None, False
+    lark_name = jira_to_lark_assignee().get(display_name)
+    return lark_name, lark_name is None
+
+
 def get_cfg() -> dict:
     import projects
     return projects.cfg_for(projects.current())
