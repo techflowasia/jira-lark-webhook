@@ -592,3 +592,31 @@ def get_field_meta_by_id(token: str, base_token: str, table_id: str) -> dict:
             "options": {o["id"]: o["name"] for o in options if o.get("id")},
         }
     return meta
+
+
+def parse_base_link(token: str, url: str) -> "tuple[str, str | None]":
+    """(base_token, table_id | None) from a Lark Base link.
+
+    `/base/{token}?table=tbl…` is read directly. `/wiki/{node}` is resolved
+    through the wiki API (`token` is the tenant access token) and must point
+    at a bitable. Anything else raises ValueError("Not a Lark Base link").
+    """
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse((url or "").strip())
+    parts = [s for s in parsed.path.split("/") if s]
+    table = (parse_qs(parsed.query).get("table") or [None])[0]
+    if "base" in parts and parts.index("base") + 1 < len(parts):
+        return parts[parts.index("base") + 1], table
+    if "wiki" in parts and parts.index("wiki") + 1 < len(parts):
+        node = parts[parts.index("wiki") + 1]
+        resp = _request("GET", f"{LARK_BASE_URL}/wiki/v2/spaces/get_node",
+                        headers=_headers(token), params={"token": node})
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise ValueError(f"Could not resolve wiki link: {data.get('msg')}")
+        n = (data.get("data") or {}).get("node") or {}
+        if n.get("obj_type") != "bitable" or not n.get("obj_token"):
+            raise ValueError("Not a Lark Base link (the wiki page is not a Base)")
+        return n["obj_token"], table
+    raise ValueError("Not a Lark Base link")

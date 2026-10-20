@@ -9,7 +9,7 @@ from datetime import datetime
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
 import lark_api, jira_api, index, reconcile, history, field_mappings
-import lark_handler, jira_handler, projects, routing
+import lark_handler, jira_handler, projects, projects_api, routing
 import config as _cfg_mod
 from config import get_cfg, set_active_table
 
@@ -237,155 +237,76 @@ async def health():
                          for p in projects.all_projects()]}
 
 
+# Legacy unscoped endpoints: thin aliases for project #1 (the dashboard JS
+# still calls them). They share the project-scoped functions in projects_api.
+app.include_router(projects_api.router)
+_P1 = 1
+
+
 @app.get("/api/tables")
 async def api_tables():
-    """List all tables in the Lark Base."""
-    try:
-        cfg = get_cfg()
-        token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
-        tables = lark_api.list_tables(token, cfg["LARK_BASE_TOKEN"])
-        return {"tables": tables, "active_table_id": cfg["LARK_TABLE_ID"]}
-    except Exception as e:
-        return {"error": str(e), "tables": []}
+    return await asyncio.to_thread(projects_api.do_tables, _P1)
 
 
 @app.post("/settings/table")
 async def set_table(request: Request):
-    """Switch the active Lark table; index rebuild runs in background."""
+    """Switch project #1's Lark table; index rebuild runs in background."""
     body = await request.json()
-    table_id   = body.get("table_id", "").strip()
-    table_name = body.get("name", "").strip()
-    if not table_id:
-        return {"ok": False, "error": "table_id required"}
-
-    set_active_table(table_id, table_name)
-    lark_api.invalidate_fields_cache()
-    # Cached field values from the previous table aren't portable — purge them
-    # before any handler reads cached state for the new table.
-    lark_api.invalidate_record_cache()
-
-    # Persist to Supabase
-    client = history._get_client()
-    if client:
-        try:
-            client.table("settings").upsert({"key": "active_table_id",   "value": table_id}).execute()
-            client.table("settings").upsert({"key": "active_table_name", "value": table_name}).execute()
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"Could not persist table setting: {e}")
-
-    # Rebuild index in background so the response returns immediately
-    async def _rebuild():
-        cfg = get_cfg()
-        token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
-        records = await asyncio.to_thread(
-            lark_api.fetch_all_records, token, cfg["LARK_BASE_TOKEN"], table_id)
-        index.rebuild(records)
-        logging.getLogger(__name__).info(
-            f"Switched to table '{table_name}' ({table_id}), {len(index._jira_to_lark)} records indexed")
-        history.record(direction="system", event="config",
-                       description=f"Switched Lark table to '{table_name}' ({table_id})")
-
-    asyncio.create_task(_rebuild())
-    return {"ok": True, "table_id": table_id, "name": table_name, "rebuilding": True}
+    try:
+        return await asyncio.to_thread(
+            projects_api.do_set_table, _P1, body.get("table_id", ""), body.get("name", ""))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/api/fields")
 async def api_fields():
-    return {"mappings": field_mappings.get_all()}
+    return await asyncio.to_thread(projects_api.do_fields, _P1)
 
 
 @app.get("/api/lark-fields")
 async def api_lark_fields():
-    try:
-        cfg = get_cfg()
-        token = await asyncio.to_thread(lark_api.get_token, cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
-        fields = await asyncio.to_thread(lark_api.list_fields, token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
-        return {"fields": fields}
-    except Exception as e:
-        return {"fields": [], "error": str(e)}
+    return await asyncio.to_thread(projects_api.do_lark_fields, _P1)
 
 
 @app.get("/api/jira-fields")
 async def api_jira_fields():
-    try:
-        cfg = get_cfg()
-        fields = await asyncio.to_thread(jira_api.get_all_fields, cfg)
-        fields.sort(key=lambda f: (f["custom"], f["name"].lower()))
-        return {"fields": fields}
-    except Exception as e:
-        return {"fields": [], "error": str(e)}
+    return await asyncio.to_thread(projects_api.do_jira_fields, _P1)
 
 
 @app.post("/settings/fields")
 async def save_field(request: Request):
-    body = await request.json()
-    try:
-        saved = await asyncio.to_thread(field_mappings.upsert, body)
-        return {"ok": True, "mapping": saved}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    return await asyncio.to_thread(projects_api.do_save_field, _P1, await request.json())
 
 
 @app.delete("/settings/fields/{mapping_id}")
 async def delete_field(mapping_id: int):
-    try:
-        await asyncio.to_thread(field_mappings.delete, mapping_id)
-        return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    return await asyncio.to_thread(projects_api.do_delete_field, _P1, mapping_id)
 
 
 @app.get("/api/jira-issue-types")
 async def api_jira_issue_types():
-    try:
-        cfg = get_cfg()
-        types = await asyncio.to_thread(jira_api.get_project_issue_types, cfg)
-        return {"types": types}
-    except Exception as e:
-        return {"types": [], "error": str(e)}
+    return await asyncio.to_thread(projects_api.do_jira_issue_types, _P1)
 
 
 @app.get("/api/lark-type-options")
 async def api_lark_type_options():
-    try:
-        cfg = get_cfg()
-        token = await asyncio.to_thread(lark_api.get_token, cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
-        options = await asyncio.to_thread(
-            lark_api.get_select_options, token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], field_mappings.F_TYPE)
-        return {"options": options}
-    except Exception as e:
-        return {"options": [], "error": str(e)}
+    return await asyncio.to_thread(projects_api.do_lark_type_options, _P1)
 
 
 @app.get("/api/sync-types")
 async def api_sync_types():
-    return {
-        "allowed_jira": sorted(_cfg_mod.get_allowed_jira_types()),
-        "allowed_lark": sorted(_cfg_mod.get_allowed_lark_types()),
-    }
+    return await asyncio.to_thread(projects_api.do_sync_types, _P1)
 
 
 @app.post("/settings/sync-types")
 async def save_sync_types_endpoint(request: Request):
-    body = await request.json()
-    jira_types = body.get("jira_types", [])
-    lark_types = body.get("lark_types", [])
-    try:
-        await asyncio.to_thread(_cfg_mod.save_sync_types, jira_types, lark_types)
-        return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    return await asyncio.to_thread(projects_api.do_save_sync_types, _P1, await request.json())
 
 
 @app.post("/api/backfill")
 async def api_backfill():
-    cfg = get_cfg()
-    try:
-        result = await asyncio.to_thread(reconcile.backfill, cfg)
-        return result
-    except Exception as e:
-        return {"removed_duplicates": 0, "matched": 0, "skipped_ambiguous": 0,
-                "created_lark": 0, "created_jira": 0, "synced": 0, "pairs": [], "error": str(e)}
+    return await asyncio.to_thread(projects_api.do_backfill, _P1)
 
 
 def _flip(pid: int, field: str, label: str) -> None:

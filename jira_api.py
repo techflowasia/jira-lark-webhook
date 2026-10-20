@@ -214,3 +214,30 @@ def get_project_issue_types(cfg: dict) -> list:
                         auth=_auth(cfg))
     resp.raise_for_status()
     return [t["name"] for t in resp.json().get("issueTypes", [])]
+
+
+def get_project(cfg: dict, key: str) -> "dict | None":
+    """The Jira project (REST v3 JSON), or None when it does not exist."""
+    resp = requests.get(_url(cfg, f"/rest/api/3/project/{key}"), auth=_auth(cfg))
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_boards(cfg: dict, project_key: str) -> list:
+    """[{id, name}, ...] for the boards of a Jira project (read-only)."""
+    boards, start_at = [], 0
+    while True:
+        resp = requests.get(_url(cfg, "/rest/agile/1.0/board"),
+                            params={"projectKeyOrId": project_key, "startAt": start_at,
+                                    "maxResults": 50},
+                            auth=_auth(cfg))
+        if not resp.ok:
+            return boards
+        data = resp.json()
+        values = data.get("values", [])
+        boards += [{"id": b["id"], "name": b["name"]} for b in values]
+        if data.get("isLast", True) or not values:
+            return boards
+        start_at += len(values)

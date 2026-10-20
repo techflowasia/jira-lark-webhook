@@ -285,10 +285,13 @@ _COPY_COLS = ("lark_field", "jira_field", "jira_label", "direction",
 
 def copy_from(src_pid: int, dst_pid: int) -> int:
     """Copy every mapping row of project src_pid into project dst_pid.
-    Returns the number of rows copied. Project src_pid is left untouched."""
+    Returns the number of rows copied. Project src_pid is left untouched.
+    Not idempotent, so it refuses (ValueError) when dst_pid already has rows."""
     client = history._get_client()
     if not client:
         raise RuntimeError("Supabase not configured")
+    if (client.table("field_mappings").select("id").eq("project_id", dst_pid).execute().data):
+        raise ValueError(f"project {dst_pid} already has field mappings")
     src = (client.table("field_mappings").select("*")
            .eq("project_id", src_pid).order("id").execute().data or [])
     if src:
