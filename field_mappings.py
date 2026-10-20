@@ -92,12 +92,17 @@ def syncs(lark_field: "str | None", direction: str) -> bool:
 def reads_for_jira(lark_field: "str | None") -> bool:
     """Whether a SYSTEM field's Lark value may be read to write Jira.
 
-    Mapped (an active row) is required; direction is NOT consulted, because
-    the spec says direction is "honoured as today" and today only Jira status
-    honours it for system fields (production project #1 has Assignee set to
-    jira_to_lark yet pushes Lark assignee edits to Jira). This is the single
-    switch point if system-field direction should be honoured later:
-    return syncs(lark_field, "lark_to_jira").
+    Mapped (an active row) is required; direction is NOT consulted (ruling
+    R7): the spec says direction is "honoured as today", and today only Jira
+    status honours it for system fields. Production project #1 has Assignee
+    set to jira_to_lark yet pushes Lark assignee edits to Jira.
+
+    Switching this to direction gating (return syncs(lark_field,
+    "lark_to_jira")) would break tests/test_unmapped_fields.py::
+    test_prod_rows_lark_to_jira_unchanged — on production's rows it would
+    silently stop the Lark→Jira assignee push (and reconcile would then
+    revert Lark assignee edits to Jira's value). Only do it with the user's
+    explicit decision and a data plan for project #1.
     """
     return lark_field is not None
 
@@ -216,10 +221,17 @@ def _stored_row(client, mapping_id, pid: int) -> "dict | None":
     return rows[0] if rows else None
 
 
+def _is_required(m: "dict | None") -> bool:
+    """A SYSTEM row for a required Jira field. A custom row that happens to
+    map summary/key/issuetype is an extra and stays editable/deletable."""
+    return bool(m) and bool(m.get("is_system")) and m.get("jira_field") in REQUIRED_JIRA_FIELDS
+
+
 def upsert(row: dict) -> dict:
     """Insert or update a field mapping of the CURRENT project. Returns the
-    saved row (empty when the id belongs to another project). Deactivating a
-    required mapping, or moving it to another Jira field, raises ValueError."""
+    saved row (empty when the id belongs to another project). On a required
+    system row, deactivating it, moving it to another Jira field or clearing
+    is_system raises ValueError."""
     client = history._get_client()
     if not client:
         raise RuntimeError("Supabase not configured")
@@ -229,9 +241,10 @@ def upsert(row: dict) -> dict:
             if k in row}
     if row.get("id"):
         cur = _stored_row(client, row["id"], pid)
-        if cur and cur.get("jira_field") in REQUIRED_JIRA_FIELDS and (
+        if _is_required(cur) and (
                 data.get("active", True) is False
-                or data.get("jira_field", cur["jira_field"]) != cur["jira_field"]):
+                or data.get("jira_field", cur["jira_field"]) != cur["jira_field"]
+                or not data.get("is_system", True)):
             raise ValueError(f"{cur.get('lark_field') or cur['jira_field']} mapping is required")
         res = (client.table("field_mappings").update(data)
                .eq("id", row["id"]).eq("project_id", pid).execute())
@@ -249,7 +262,7 @@ def delete(mapping_id: int) -> None:
         raise RuntimeError("Supabase not configured")
     pid = projects.current_id()
     cur = _stored_row(client, mapping_id, pid)
-    if cur and cur.get("jira_field") in REQUIRED_JIRA_FIELDS:
+    if _is_required(cur):
         raise ValueError(f"{cur.get('lark_field') or cur['jira_field']} mapping is required")
     client.table("field_mappings").delete().eq("id", mapping_id).eq("project_id", pid).execute()
     load(pid)

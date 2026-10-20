@@ -24,7 +24,8 @@ FOUR = {"Title", "Jira Key", "Type", "Assignee"}
 
 def _row(lark, jira, direction="both", system=True, active=True, **kw):
     return {"id": kw.pop("id", 0), "lark_field": lark, "jira_field": jira,
-            "jira_label": lark, "direction": direction, "field_type": "text",
+            "jira_label": lark, "direction": direction,
+            "field_type": kw.pop("field_type", "text"),
             "is_system": system, "active": active, **kw}
 
 
@@ -367,9 +368,11 @@ def mock_requests():
         return _resp({"code": 0, "data": {"record": {"record_id": "recX"}}})
 
     lark_api.invalidate_fields_cache()
+    lark_api._skip_warned.clear()
     with patch("lark_api._request", side_effect=fake):
         yield sent
     lark_api.invalidate_fields_cache()
+    lark_api._skip_warned.clear()
 
 
 def test_write_drops_unknown_lark_column(mock_requests):
@@ -399,3 +402,142 @@ def test_create_refuses_without_jira_key_column(mock_requests):
 def test_update_with_only_unknown_columns_sends_nothing(mock_requests):
     lark_api.update_record("tok", "bX", "tX", "rec1", {"R. MD": 3})
     assert mock_requests == []
+
+
+def test_unknown_column_history_is_rate_limited(mock_requests):
+    lark_api.update_record("tok", "bX", "tX", "rec1", {"Title": "x", "R. MD": 3})
+    lark_api.update_record("tok", "bX", "tX", "rec2", {"Title": "y", "R. MD": 4})
+    rows = [r for r in history._fallback if r["status"] == "skipped"]
+    assert len(rows) == 1
+    # Both writes still drop the column.
+    assert [j for _, j in mock_requests] == [{"fields": {"Title": "x"}}, {"fields": {"Title": "y"}}]
+    # Another table (or an expired TTL) warns again.
+    lark_api.update_record("tok", "bX", "tY", "rec3", {"Title": "z", "R. MD": 5})
+    assert len([r for r in history._fallback if r["status"] == "skipped"]) == 2
+    lark_api._skip_warned[("bX", "tX", "R. MD")] = 0  # expired
+    lark_api.update_record("tok", "bX", "tX", "rec4", {"Title": "w", "R. MD": 6})
+    assert len([r for r in history._fallback if r["status"] == "skipped"]) == 3
+
+
+def test_schema_fetch_paginates():
+    pages = {
+        None: {"code": 0, "data": {"has_more": True, "page_token": "p2", "items": [
+            {"field_name": "Title", "field_id": "f1"}]}},
+        "p2": {"code": 0, "data": {"has_more": False, "items": [
+            {"field_name": "R. MD", "field_id": "f2"}]}},
+    }
+    seen = []
+
+    def fake(method, url, **kw):
+        tok = (kw.get("params") or {}).get("page_token")
+        seen.append(tok)
+        return _resp(pages[tok])
+
+    lark_api.invalidate_fields_cache()
+    try:
+        with patch("lark_api._request", side_effect=fake):
+            names = [f["field_name"] for f in lark_api.list_fields("tok", "bP", "tP")]
+        assert names == ["Title", "R. MD"] and seen == [None, "p2"]
+    finally:
+        lark_api.invalidate_fields_cache()
+
+
+def test_required_system_row_cannot_change_identity(fake_supabase):
+    key_row = fake_supabase.insert_row("field_mappings", dict(_row("Jira Key", "key"), id=None, project_id=1))
+    with pytest.raises(ValueError, match="required"):
+        field_mappings.upsert({"id": key_row["id"], "is_system": False})
+    with pytest.raises(ValueError, match="required"):
+        field_mappings.upsert({"id": key_row["id"], "jira_field": "customfield_1", "is_system": True})
+    assert fake_supabase.rows("field_mappings")[0]["is_system"] is True
+
+
+def test_custom_row_on_required_jira_field_is_deletable(fake_supabase):
+    fake_supabase.insert_row("field_mappings", dict(_row("Title", "summary"), id=None, project_id=1))
+    custom = fake_supabase.insert_row("field_mappings", dict(
+        _row("Title copy", "summary", system=False), id=None, project_id=1))
+    field_mappings.upsert({"id": custom["id"], "active": False})
+    field_mappings.delete(custom["id"])
+    assert [r["lark_field"] for r in fake_supabase.rows("field_mappings")] == ["Title"]
+
+
+# ── R7: production project #1 config (direction not honoured for system
+#    Lark→Jira fields; mapped is enough) ─────────────────────────────────
+
+def _prod_rows():
+    rows = []
+    for d in field_mappings._DEFAULTS:
+        r = dict(d)
+        if r["jira_field"] == "parent":
+            r["lark_field"] = "Epic"
+        elif r["jira_field"] == "assignee":
+            r["direction"] = "jira_to_lark"
+        elif r["jira_field"] == "status":
+            r["direction"] = "both"
+        rows.append(r)
+    assert next(r for r in rows if r["jira_field"] == "fixVersions")["direction"] == "lark_to_jira"
+    rows += [
+        _row("Release", config.JF_SPRINT, "both", system=False, field_type="select"),
+        _row("Plan Assignee", "assignee", "lark_to_jira", system=False, active=False, field_type="user"),
+        dict(_row("P. QA md", "customfield_10178", "both", system=False), field_type="number"),
+    ]
+    return rows
+
+
+def test_prod_rows_lark_to_jira_unchanged(lark_mocks):
+    ml, mj = lark_mocks
+    field_mappings._cache = _prod_rows()
+    index.add("PROJ-10", "recEpic")
+    index.add("PROJ-11", "rec11")
+    mj.get_account_ids.return_value = {"Tawan Vongsombun": "acc-tawan"}
+    mj.get_project_versions.return_value = []
+    mj.get_board_sprints.return_value = [{"id": 5, "name": "Beta 1"}]
+    mj.transition_issue.return_value = True
+    ml.get_record.return_value = {"record_id": "rec11", "fields": {
+        "Title": "New title", "Type": "Story", "Jira Key": "PROJ-11",
+        "Assignee": [{"text": "Tawan"}], "Plan Assignee": [{"text": "Lin"}],
+        "Epic": [{"record_ids": ["recEpic"]}], "Jira status": "In Progress",
+        "Release": "Beta 1", "P. QA md": "2",
+        "Timeline - Start": _jira_date_to_lark_ts("2026-01-01"),
+        "Timeline - End": _jira_date_to_lark_ts("2026-01-31"),
+    }}
+    mj.get_issue.return_value = {"fields": {
+        "summary": "Old", "assignee": {"accountId": "acc-other"}, "parent": None,
+        "status": {"name": "To Do"}, "customfield_10178": 1.0, "fixVersions": [],
+        config.JF_SPRINT: [], config.JF_START: "2026-01-01", "duedate": "2026-01-31"}}
+    lark_handler.process({"action": "record_edited", "record_id": "rec11"}, "tbl", CFG)
+    assert mj.update_issue.call_args[0][2] == {
+        "summary": "New title",
+        "assignee": {"id": "acc-tawan"},      # pushed although direction is jira_to_lark (R7)
+        "parent": {"key": "PROJ-10"},         # read from the "Epic" column
+        "customfield_10178": 2.0,             # P. QA md custom write
+    }
+    mj.transition_issue.assert_called_once_with(CFG, "PROJ-11", "In Progress")
+    mj.move_to_sprint.assert_called_once_with(CFG, 5, "PROJ-11")
+
+
+def test_prod_rows_jira_to_lark_unchanged(mock_lark):
+    field_mappings._cache = _prod_rows()
+    index.add("PROJ-10", "recEpic")
+    index.add("PROJ-11", "rec11")
+    mock_lark.get_cached_or_fetch_record.return_value = {"fields": {
+        "Title": "Old", "Assignee": [{"text": "Lin"}], "Jira status": "To Do",
+        "R. MD": "3", "Epic": [], "Release": [], "P. QA md": "1"}}
+    issue = _full_issue("PROJ-11", "Story", "Tawan Vongsombun", parent="PROJ-10")
+    issue["fields"][config.JF_SPRINT] = [{"id": 5, "name": "Beta 1"}]
+    changelog = {"items": [
+        {"field": "summary", "fieldId": "summary", "toString": "S PROJ-11"},
+        {"field": "assignee", "fieldId": "assignee", "toString": "Tawan Vongsombun"},
+        {"field": "status", "fieldId": "status", "toString": "In Progress"},
+        {"field": "Story Points", "fieldId": config.JF_STORY_POINTS, "toString": "5"},
+        {"field": "QA", "fieldId": "customfield_10178", "to": "3", "toString": "3"},
+    ]}
+    jira_handler.process("jira:issue_updated", issue, changelog, CFG)
+    assert mock_lark.update_record.call_args[0][4] == {
+        "Title": "S PROJ-11",
+        "Assignee": ["Tawan"],
+        "Jira status": "In Progress",
+        "R. MD": 5,
+        "Epic": ["recEpic"],
+        "Release": ["Beta 1"],
+        "P. QA md": 3,
+    }

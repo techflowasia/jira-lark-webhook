@@ -125,11 +125,13 @@ def _relevant_lark_fields() -> set:
     bundles into the same webhook) is ignored during decode so it doesn't
     needlessly force a get_record fallback.
 
-    `field_mappings.F_JIRA_STATUS` is included only when its configured direction covers
-    Lark→Jira (`both` or `lark_to_jira`). The default is `jira_to_lark` — for
-    users who didn't opt in, decoding the status from the webhook would be
-    wasted work (the value-compare in the update branch would still skip
-    the write, but it would force a get_record on every Jira-status webhook).
+    Only MAPPED system fields are included (an unmapped one is None and is
+    never read — see field_mappings.reads_for_jira; direction is not checked
+    for them, ruling R7). `F_JIRA_STATUS` additionally needs an active row
+    whose direction covers Lark→Jira (`both` / `lark_to_jira`, via
+    field_mappings.syncs) — for users who didn't opt in, decoding status
+    would force a get_record on every Jira-status webhook for nothing.
+    Active custom Lark→Jira mappings are included as well.
     """
     names = {n for n in (field_mappings.F_TITLE, field_mappings.F_START, field_mappings.F_END,
                          field_mappings.F_ASSIGNEE, field_mappings.F_RELEASE, field_mappings.F_PARENT)

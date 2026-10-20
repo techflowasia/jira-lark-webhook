@@ -386,11 +386,19 @@ def get_cached_or_fetch_record(token: str, base_token: str, table_id: str,
     return get_record(token, base_token, table_id, record_id)
 
 
+# (base_token, table_id, column) -> time before which a missing-column
+# warning is not repeated.
+_skip_warned: dict = {}
+_skip_warned_lock = threading.Lock()
+_SKIP_WARN_TTL = 3600
+
+
 def _known_columns(token: str, base_token: str, table_id: str, fields: dict,
                    event: str, record_id: str = "") -> dict:
     """`fields` minus keys that are not columns of the table (a mapping that
     names a Lark column which doesn't exist, e.g. renamed in Lark). Each
-    dropped key is logged and recorded in history as skipped. When the schema
+    dropped key is logged and recorded in history as skipped (at most once an
+    hour per base/table/column). When the schema
     can't be read (error or empty), `fields` is returned unchanged — Lark
     then rejects an unknown column itself, as before. Uses the 60 s schema
     cache, so this adds no Lark call on the hot path."""
@@ -406,10 +414,19 @@ def _known_columns(token: str, base_token: str, table_id: str, fields: dict,
         if k in names:
             kept[k] = v
             continue
-        msg = f"Lark column '{k}' not found — field not synced"
-        log.warning(f"lark_api: {msg} (table {table_id}, record {record_id or 'new'})")
-        history.record(direction="jira→lark", event=event, lark_id=record_id,
-                       description=msg, status="skipped")
+        # Warn + history once per (base, table, column) per hour, so every
+        # write/sweep naming a missing column doesn't flood sync_history.
+        wkey = (base_token, table_id, k)
+        now = time.time()
+        with _skip_warned_lock:
+            due = now >= _skip_warned.get(wkey, 0)
+            if due:
+                _skip_warned[wkey] = now + _SKIP_WARN_TTL
+        if due:
+            msg = f"Lark column '{k}' not found — field not synced"
+            log.warning(f"lark_api: {msg} (table {table_id}, record {record_id or 'new'})")
+            history.record(direction="jira→lark", event=event, lark_id=record_id,
+                           description=msg, status="skipped")
     return kept
 
 
@@ -500,14 +517,26 @@ def _fetch_field_items(token: str, base_token: str, table_id: str) -> list:
     now = time.time()
     if entry and now < entry["expires_at"]:
         return entry["items"]
-    resp = _request("GET",
-        f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
-        headers=_headers(token), params={"page_size": 300})
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code") != 0:
-        raise RuntimeError(f"Lark fields error: {data.get('msg')}")
-    items = data.get("data", {}).get("items", [])
+    # Paginate: a column missing from a truncated first page would otherwise
+    # be treated as unknown and dropped from writes by _known_columns.
+    items: list = []
+    page_token = None
+    while True:
+        params = {"page_size": 300}
+        if page_token:
+            params["page_token"] = page_token
+        resp = _request("GET",
+            f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
+            headers=_headers(token), params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Lark fields error: {data.get('msg')}")
+        page = data.get("data") or {}
+        items.extend(page.get("items") or [])
+        page_token = page.get("page_token")
+        if not page.get("has_more") or not page_token:
+            break
     _fields_cache[key] = {"items": items, "expires_at": now + _FIELDS_TTL}
     return items
 
