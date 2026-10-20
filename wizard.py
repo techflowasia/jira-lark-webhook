@@ -216,11 +216,14 @@ async function runCheck() {
           '<button class="sec" onclick="repoint(' + pr.mapping_id + ',' + i + ')">Re-point</button>' +
           '<button class="danger" onclick="dropMap(' + pr.mapping_id + ')">Delete mapping</button>';
       } else if (pr.jira_field && REQUIRED[pr.jira_field]) {
-        html += '<button class="sec" onclick="addDefault(\'' + esc(pr.jira_field) + '\')">Add default mapping</button>';
+        html += '<button class="sec add-default" data-jira-field="' + esc(pr.jira_field) + '">Add default mapping</button>';
       }
       html += '</td></tr>';
     });
     $('chtable').innerHTML = html ? '<table><tr><th>Problem</th><th>Fix</th></tr>' + html + '</table>' : '';
+    Array.prototype.forEach.call(document.querySelectorAll('#chtable .add-default'), function (b) {
+      b.addEventListener('click', function () { addDefault(b.getAttribute('data-jira-field')); });
+    });
     var warn = '';
     if (j.people && (j.people.unmapped_jira.length || j.people.unknown_lark.length))
       warn = 'People still to review in step 6: ' + j.people.unmapped_jira.length + ' Jira user(s) unmapped, ' + j.people.unknown_lark.length + ' mapped name(s) not in the Lark Assignee options.';

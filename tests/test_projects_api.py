@@ -21,6 +21,7 @@ def env(monkeypatch):
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(lark_api, "get_token", lambda *a: "tok")
     monkeypatch.setattr(projects_api, "_start_rebuild", lambda pid: None)
+    monkeypatch.setattr(jira_api, "get_project", lambda cfg, key: {"key": key})
     saved = (projects._projects, projects._persisted)
     projects._projects, projects._persisted = {}, False
     projects.load_all()
@@ -182,6 +183,7 @@ def _check_env(monkeypatch, lark_cols, jira_ids, accounts=None, options=None):
                         lambda cfg: [{"id": i, "name": i, "custom": True} for i in jira_ids])
     monkeypatch.setattr(jira_api, "get_account_ids", lambda cfg: accounts or {})
     monkeypatch.setattr(lark_api, "get_select_options", lambda *a: options or [])
+    monkeypatch.setattr(lark_api, "fetch_all_records", lambda *a, **k: [])
 
 
 def test_check_flags_missing_lark_column_and_jira_field(monkeypatch):

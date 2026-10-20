@@ -24,6 +24,7 @@ import jira_api
 import lark_api
 import projects
 import reconcile
+from utils import _lark_text
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -238,16 +239,6 @@ def do_patch(pid: int, body: dict) -> "projects.Project":
     if "setup_state" in body:
         if body["setup_state"] not in SETUP_STATES:
             raise ValueError(f"setup_state must be one of {', '.join(SETUP_STATES)}")
-        if body["setup_state"] == "active":
-            with projects.use(pid):
-                missing = field_mappings.missing_required()
-            if missing:
-                raise ValueError("required mapping missing: " + ", ".join(missing))
-            # Server-side gate for wizard step 5: every mapping must check out.
-            chk = do_check(pid)
-            if not chk["ready"]:
-                raise ValueError("field check failed: " + "; ".join(
-                    pr["problem"] for pr in chk["fields"]))
         changes["setup_state"] = body["setup_state"]
     for k in ("sync_enabled", "reconcile_enabled"):
         if k in body:
@@ -262,17 +253,33 @@ def do_patch(pid: int, body: dict) -> "projects.Project":
     table_changed = False
     if body.get("lark_table_id"):
         cur = projects.get(pid)
-        table_changed = body["lark_table_id"] != cur.lark_table_id
         changes["lark_table_id"] = str(body["lark_table_id"]).strip()
         changes["lark_table_name"] = str(body.get("lark_table_name", "")).strip()
+        table_changed = changes["lark_table_id"] != cur.lark_table_id
     if going_live:
+        if table_changed:
+            # Apply the new table first so the check and the index rebuild
+            # below use it (the project is still draft with sync off).
+            projects.update(pid, {k: changes.pop(k) for k in ("lark_table_id", "lark_table_name")})
+            _on_table_changed()
+            table_changed = False
+        with projects.use(pid):
+            missing = field_mappings.missing_required()
+        if missing:
+            raise ValueError("required mapping missing: " + ", ".join(missing))
+        # Server-side gate for wizard step 5: every mapping must check out.
+        chk = do_check(pid)
+        if not chk["ready"]:
+            raise ValueError("field check failed: " + "; ".join(
+                pr["problem"] for pr in chk["fields"]))
         # The index must exist before sync turns on. Build it now; on failure
-        # nothing is changed and the project stays draft with sync off.
+        # nothing else is changed and the project stays draft with sync off.
         try:
             _rebuild_now(pid)
         except Exception as e:
-            log.error(f"Go-live index rebuild failed for project {pid}: {e}")
-            raise ValueError(f"could not build the index, project left as draft: {e}")
+            log.error(f"Go-live index rebuild failed for project {pid}: {e}", exc_info=True)
+            raise ValueError("could not build the index (see server log); "
+                             "project left as draft")
     p = projects.update(pid, changes)  # raises ValueError on duplicate table
     if table_changed:
         _on_table_changed()
@@ -378,9 +385,34 @@ def do_check(pid: int) -> dict:
             problems.append({"mapping_id": None, "lark_field": None, "jira_field": jf,
                              "problem": f"required mapping missing for Jira field '{jf}'"})
 
+        # Rows whose Jira Key names another Jira project (a Base duplicated
+        # with its data): sync would never touch them, but they block go-live
+        # so the user clears/fixes them knowingly.
+        foreign = {"count": 0, "examples": []}
+        f_key = field_mappings.F_JIRA_KEY
+        if token and f_key and lark_cols is not None and f_key in lark_cols:
+            try:
+                records = lark_api.fetch_all_records(token, cfg["LARK_BASE_TOKEN"],
+                                                     cfg["LARK_TABLE_ID"])
+                bad = [k for k in (_lark_text(r["fields"].get(f_key)) for r in records)
+                       if k and not projects.owns_key(k)]
+                foreign = {"count": len(bad), "examples": sorted(set(bad))[:5]}
+            except Exception as e:
+                problems.append({"mapping_id": None, "lark_field": None, "jira_field": None,
+                                 "problem": f"could not read the Lark records: {e}"})
+        if foreign["count"]:
+            p = projects.current()
+            problems.append({
+                "mapping_id": None, "lark_field": f_key, "jira_field": None,
+                "problem": (f"{foreign['count']} Lark row(s) have a '{f_key}' of another Jira "
+                            f"project (e.g. {', '.join(foreign['examples'])}), not "
+                            f"{p.jira_project_key}. Sync ignores them; clear or fix them in "
+                            f"Lark before going live")})
+
         people = {"unmapped_jira": [], "unknown_lark": []}
         amap = config.jira_to_lark_assignee()
-        out = {"fields": problems, "people": people, "ready": not problems}
+        out = {"fields": problems, "people": people, "ready": not problems,
+               "foreign_keys": foreign}
         try:
             accounts = jira_api.get_account_ids(cfg)
             people["unmapped_jira"] = sorted(n for n in accounts if n not in amap)
@@ -422,6 +454,9 @@ def do_create(body: dict) -> dict:
     key = (body.get("jira_project_key") or "").strip().upper()
     if not key:
         raise HTTPException(400, "jira_project_key is required")
+    if not projects.valid_jira_key(key):
+        raise HTTPException(400, "jira_project_key must be a Jira project key "
+                                 "(letters, digits, underscore; starting with a letter)")
     src = None
     if body.get("copy_from") is not None:
         src = projects.get(int(body["copy_from"]))
@@ -429,6 +464,14 @@ def do_create(body: dict) -> dict:
             raise HTTPException(404, f"copy_from project {body['copy_from']} not found")
     base, table = (body.get("lark_base_token") or "").strip(), (body.get("lark_table_id") or "").strip() or None
     cfg = projects.cfg_for(projects.get(min(p.id for p in projects.all_projects())))
+    try:
+        exists = jira_api.get_project({**cfg, "JIRA_PROJECT": key}, key)
+    except Exception as e:
+        log.warning(f"create project: Jira lookup of {key} failed: {e}")
+        raise HTTPException(502, "Jira lookup failed (see server log)")
+    if exists is None:
+        raise HTTPException(400, f"Jira project {key} does not exist (or is not visible "
+                                 "to the sync account)")
     try:
         if body.get("lark_base_link"):
             base, link_table = lark_api.parse_base_link(_lark_token(cfg), body["lark_base_link"])
@@ -476,6 +519,9 @@ async def create_project(request: Request):
 
 @router.get("/api/jira/projects/{key}")
 async def jira_project(key: str):
+    key = key.strip().upper()
+    if not projects.valid_jira_key(key):
+        return _err(400, "not a valid Jira project key")
     cfg = projects.cfg_for(projects.get(min(p.id for p in projects.all_projects())))
     cfg["JIRA_PROJECT"] = key
 

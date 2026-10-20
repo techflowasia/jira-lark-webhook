@@ -22,6 +22,8 @@ def env(monkeypatch):
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(lark_api, "get_token", lambda *a: "tok")
     monkeypatch.setattr(history, "_get_client", lambda: None)
+    import jira_api
+    monkeypatch.setattr(jira_api, "get_project", lambda cfg, key: {"key": key})
     history._fallback.clear()
     saved = (projects._projects, projects._persisted, dict(field_mappings._by_project))
     projects._projects, projects._persisted = {}, False
@@ -72,7 +74,8 @@ def test_step3_shows_connect_link_and_automation_url():
 
 
 def test_step9_webhook_reminder_names_the_key_escaped():
-    p = _draft(key="A<B")
+    p = _draft(key="AB")
+    p.jira_project_key = "A<B"  # create() now rejects it; a stored row still must be escaped
     html = client.get(f"/p/{p.id}/setup?step=9").text
     assert "add <code>A&lt;B</code> to its filter in Jira" in html
     assert "<code>A<B</code>" not in html
@@ -210,7 +213,7 @@ def test_go_live_rebuild_failure_leaves_draft_off(monkeypatch):
     monkeypatch.setattr(projects_api, "_rebuild_now", boom)
     field_mappings._by_project[p.id] = [dict(d) for d in field_mappings._DEFAULTS]
     r = client.patch(f"/api/p/{p.id}", json={"setup_state": "active", "sync_enabled": True})
-    assert r.status_code == 400 and "lark down" in r.json()["error"]
+    assert r.status_code == 400 and "lark down" not in r.json()["error"]  # never echoed
     assert (projects.get(p.id).setup_state, projects.get(p.id).sync_enabled) == ("draft", False)
 
 

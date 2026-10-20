@@ -1,6 +1,18 @@
 """Shared fixtures. `fake_supabase` is an in-memory stand-in for the chained
 supabase-py calls the code base uses; later tasks reuse it."""
+import os
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _default_env(monkeypatch):
+    """Project #1's env (key PROJ) when a test sets none: _env_project now
+    refuses to run without it, and owns_key needs a real project key."""
+    for k, v in {"JIRA_PROJECT": "PROJ", "LARK_BASE_TOKEN": "base",
+                 "LARK_TABLE_ID": "tbl"}.items():
+        if not os.environ.get(k):
+            monkeypatch.setenv(k, v)
 
 
 class _Result:
@@ -194,6 +206,10 @@ def _fresh_field_mappings():
     import field_mappings
     saved = dict(field_mappings._by_project)
     field_mappings._by_project.clear()
+    field_mappings._retry_at.clear()
+    field_mappings._skip_reported.clear()
     yield
     field_mappings._by_project.clear()
+    field_mappings._retry_at.clear()
+    field_mappings._skip_reported.clear()
     field_mappings._by_project.update(saved)

@@ -39,6 +39,7 @@ def _process(event: str, issue: dict, changelog: dict, cfg: dict) -> None:
     if missing:
         log.warning(f"jira_handler: skipping {event} {key} — project "
                     f"{projects.current_id()} has no mapping for required {missing}")
+        field_mappings.report_skipped(missing, "jira_handler")
         return
     try:
         if event == "jira:issue_created":

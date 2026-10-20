@@ -48,27 +48,27 @@ def mock_lark():
         yield m
 
 
-def test_index_is_per_project():
+def test_index_is_per_project(two_projects):
     with projects.use(1):
-        index.add("VR-1", "recA")
+        index.add("PROJ-1", "recA")
     with projects.use(2):
-        assert "VR-1" not in index._jira_to_lark
+        assert "PROJ-1" not in index._jira_to_lark
         assert "recA" not in index._lark_to_jira
-        index.add("VR-1", "recB")
+        index.add("TWO-1", "recB")
     with projects.use(1):
-        assert index._jira_to_lark["VR-1"] == "recA"
+        assert index._jira_to_lark["PROJ-1"] == "recA"
     assert index.count(1) == 1 and index.count(2) == 1
 
 
-def test_index_rebuild_and_remove_touch_only_current_project():
+def test_index_rebuild_and_remove_touch_only_current_project(two_projects):
     field_mappings._by_project[2] = [dict(d) for d in field_mappings._DEFAULTS]
     with projects.use(1):
-        index.add("VR-1", "recA")
+        index.add("PROJ-1", "recA")
     with projects.use(2):
         index.rebuild([{"record_id": "recZ", "fields": {"Jira Key": "TWO-1"}}])
-        index.remove_by_jira("VR-1")
+        index.remove_by_jira("PROJ-1")
     with projects.use(1):
-        assert index._jira_to_lark == {"VR-1": "recA"}
+        assert index._jira_to_lark == {"PROJ-1": "recA"}
     with projects.use(2):
         assert index._jira_to_lark == {"TWO-1": "recZ"}
 
@@ -101,26 +101,26 @@ def test_sync_types_per_project(two_projects):
 
 
 def test_jira_create_uses_its_projects_mappings(two_projects, mock_lark):
-    jira_handler.process("jira:issue_created", _issue("NEW-1"), {}, CFG2)
+    jira_handler.process("jira:issue_created", _issue("TWO-1"), {}, CFG2)
     fields = mock_lark.create_record.call_args[0][3]
     assert "Name" in fields and "Title" not in fields
     assert mock_lark.create_record.call_args[0][1:3] == (P2_BASE, P2_TABLE)
     with projects.use(2):
-        assert index._jira_to_lark["NEW-1"] == "rec-NEW-1"
+        assert index._jira_to_lark["TWO-1"] == "rec-TWO-1"
     with projects.use(1):
-        assert "NEW-1" not in index._jira_to_lark
+        assert "TWO-1" not in index._jira_to_lark
 
 
 def test_jira_create_skips_types_not_allowed_in_its_project(two_projects, mock_lark):
     # Story is allowed in project 1 but not in project 2.
-    jira_handler.process("jira:issue_created", _issue("NEW-2", "Story"), {}, CFG2)
+    jira_handler.process("jira:issue_created", _issue("TWO-2", "Story"), {}, CFG2)
     mock_lark.create_record.assert_not_called()
 
 
 def test_cfg_without_project_id_uses_current_project(two_projects, mock_lark):
     with projects.use(2):
-        jira_handler.process("jira:issue_created", _issue("NEW-3"), {}, CFG2 | {"PROJECT_ID": 2})
-        jira_handler.process("jira:issue_created", _issue("NEW-4"), {},
+        jira_handler.process("jira:issue_created", _issue("TWO-3"), {}, CFG2 | {"PROJECT_ID": 2})
+        jira_handler.process("jira:issue_created", _issue("TWO-4"), {},
                              {k: v for k, v in CFG2.items() if k != "PROJECT_ID"})
     assert mock_lark.create_record.call_count == 2
     for call in mock_lark.create_record.call_args_list:
@@ -135,7 +135,7 @@ def test_concurrent_handlers_do_not_cross(two_projects, mock_lark):
 
     def run(i):
         if i % 2:
-            jira_handler.process("jira:issue_created", _issue(f"NEW-{100 + i}"), {}, CFG2)
+            jira_handler.process("jira:issue_created", _issue(f"TWO-{100 + i}"), {}, CFG2)
         else:
             jira_handler.process("jira:issue_created", _issue(f"PROJ-{100 + i}"), {}, CFG)
 
@@ -146,7 +146,7 @@ def test_concurrent_handlers_do_not_cross(two_projects, mock_lark):
     assert len(calls) == 20
     for c in calls:
         _, base, table, fields = c[0]
-        if fields["Jira Key"].startswith("NEW-"):
+        if fields["Jira Key"].startswith("TWO-"):
             assert (base, table) == (P2_BASE, P2_TABLE)
             assert "Name" in fields and "Title" not in fields
         else:
@@ -374,14 +374,14 @@ def test_index_rebuild_uses_projects_jira_key_column(two_projects):
     field_mappings._by_project[2] = [
         dict(d, lark_field="Key") if d["jira_field"] == "key" else dict(d)
         for d in field_mappings._by_project[2]]
-    recs = [{"record_id": "recK", "fields": {"Key": "TWO-7", "Jira Key": "WRONG-1"}},
+    recs = [{"record_id": "recK", "fields": {"Key": "TWO-7", "Jira Key": "PROJ-1"}},
             {"record_id": "recJ", "fields": {"Jira Key": "PROJ-7"}}]
     with projects.use(2):
         index.rebuild(recs)
         assert index._jira_to_lark == {"TWO-7": "recK"}
     with projects.use(1):
         index.rebuild(recs)
-        assert index._jira_to_lark == {"WRONG-1": "recK", "PROJ-7": "recJ"}
+        assert index._jira_to_lark == {"PROJ-1": "recK", "PROJ-7": "recJ"}
 
 
 def test_bootstrap_adopts_null_project_history_rows(fake_supabase):

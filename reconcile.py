@@ -52,6 +52,27 @@ def _set_setting(key: str, value: str) -> None:
         log.warning(f"Reconcile: could not persist setting {key}: {e}")
 
 
+def _group_own(lark_records: list, where: str) -> dict:
+    """Lark records grouped by Jira Key, OWN keys only. A row whose Jira Key
+    belongs to another Jira project (e.g. a Base duplicated with its data) is
+    left alone: never linked, never treated as a duplicate, never "Jira gone"
+    (it is not in this project's Jira issue list), never deleted."""
+    grouped: dict = {}
+    foreign: list = []
+    for rec in lark_records:
+        jk = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
+        if not jk:
+            continue
+        if not projects.owns_key(jk):
+            foreign.append(jk)
+            continue
+        grouped.setdefault(jk, []).append(rec)
+    if foreign:
+        log.warning(f"{where}: project {projects.current_id()} ignored {len(foreign)} Lark row(s) "
+                    f"with another Jira project's key (e.g. {sorted(set(foreign))[:5]})")
+    return grouped
+
+
 def _ms_to_jira_jql(ts_ms: int) -> str:
     # Jira JQL accepts "yyyy-MM-dd HH:mm" in the instance timezone. LOCAL_TZ
     # (default UTC+7) matches the rest of this project's date handling.
@@ -77,6 +98,7 @@ def _run(cfg: dict) -> None:
     if missing:
         log.warning(f"Reconcile: skipped — project {projects.current_id()} has no "
                     f"mapping for required {missing}")
+        field_mappings.report_skipped(missing, "Reconcile")
         return
     try:
         token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
@@ -139,11 +161,8 @@ def _run_incremental(cfg: dict, token: str, mod_field: str, since_ms: int) -> No
     # Lark records that already carry a Jira Key, indexed by key. Records whose
     # Jira issue changed but whose own row didn't won't be here — fetched
     # per-issue below so the field diff stays accurate (no blind overwrites).
-    lark_by_jira_key: dict = {}
-    for rec in lark_records:
-        jk = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
-        if jk:
-            lark_by_jira_key[jk] = rec
+    lark_by_jira_key: dict = {jk: recs[-1] for jk, recs in
+                              _group_own(lark_records, "Reconcile incremental").items()}
 
     for issue in jira_issues:
         key = issue["key"]
@@ -174,11 +193,7 @@ def _run_full(cfg: dict, token: str) -> None:
     jira_by_key = {i["key"]: i for i in jira_issues}
 
     # Group linked Lark records by Jira Key, resolve duplicates by title match
-    lark_grouped: dict = {}
-    for rec in lark_records:
-        jk = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
-        if jk:
-            lark_grouped.setdefault(jk, []).append(rec)
+    lark_grouped = _group_own(lark_records, "Reconcile")
 
     lark_by_jira_key: dict = {}
     for jk, recs in lark_grouped.items():
@@ -386,11 +401,7 @@ def _backfill(cfg: dict) -> dict:
 
     # ── Step 1: Remove duplicate Lark records — keep the one whose title ──
     #           matches the Jira issue summary; fallback to first seen      ─
-    lark_grouped: dict = {}
-    for rec in lark_records:
-        jk = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
-        if jk:
-            lark_grouped.setdefault(jk, []).append(rec)
+    lark_grouped = _group_own(lark_records, "backfill")
 
     lark_by_jira_key: dict = {}
     removed_duplicates = 0

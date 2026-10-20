@@ -1,9 +1,13 @@
 """Shared in-memory index: jira_key <-> lark record_id, one pair of maps per
 project. `index._jira_to_lark` / `index._lark_to_jira` resolve to the
 current project's maps (see projects.use)."""
+import logging
+
 import field_mappings
 import projects
 from utils import _lark_text
+
+log = logging.getLogger(__name__)
 
 # project id -> (jira_key → record_id, record_id → jira_key)
 _maps: "dict[int, tuple[dict, dict]]" = {}
@@ -32,14 +36,28 @@ def rebuild(records: list) -> None:
     j2l.clear()
     l2j.clear()
     key_col = field_mappings.F_JIRA_KEY
+    foreign = []
     for rec in records:
         jk = _lark_text(rec["fields"].get(key_col))
-        if jk:
-            j2l[jk] = rec["record_id"]
-            l2j[rec["record_id"]] = jk
+        if not jk:
+            continue
+        if not projects.owns_key(jk):
+            foreign.append(jk)
+            continue
+        j2l[jk] = rec["record_id"]
+        l2j[rec["record_id"]] = jk
+    if foreign:
+        log.warning(f"index: project {projects.current_id()} skipped {len(foreign)} Lark row(s) "
+                    f"whose Jira Key belongs to another Jira project (e.g. {foreign[:5]})")
 
 
 def add(jira_key: str, record_id: str) -> None:
+    """Link jira_key <-> record_id. A key of another Jira project is never
+    linked (logged and skipped)."""
+    if not projects.owns_key(jira_key):
+        log.warning(f"index: project {projects.current_id()} refused to link Lark {record_id} "
+                    f"to foreign Jira key {jira_key}")
+        return
     j2l, l2j = _for()
     j2l[jira_key] = record_id
     l2j[record_id] = jira_key

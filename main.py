@@ -52,11 +52,17 @@ def _load_toggle_states() -> None:
 async def startup() -> None:
     log = logging.getLogger(__name__)
     # Project registry must be ready before any loader or get_cfg() call.
+    registry_ok = False
     try:
         projects.load_all()
         projects.bootstrap_default()
+        registry_ok = not projects.is_fallback()
     except Exception as e:
-        log.error(f"Project registry bootstrap failed (using env project): {e}")
+        log.error(f"Project registry bootstrap failed: {e}")
+    if not registry_ok:
+        log.error("Project registry not loaded - project #1 runs from stored settings "
+                  "with reconcile OFF; retrying in the background")
+        asyncio.create_task(_registry_retry_loop())
     # Build the in-memory index, but never let a Lark outage crash startup —
     # if the bind fails, Render's port scan kills the container and we never
     # come back. Empty index means new webhooks may arrive unlinked, but the
@@ -67,6 +73,40 @@ async def startup() -> None:
     asyncio.create_task(_keepalive_loop())
     asyncio.create_task(asyncio.to_thread(field_mappings.load))
     asyncio.create_task(asyncio.to_thread(_load_toggle_states))
+
+
+def _load_registry() -> bool:
+    """One registry load attempt (load + idempotent bootstrap). True on success."""
+    projects.load_all()
+    if projects.is_fallback() and projects._fallback_reason != "empty":
+        return False
+    projects.bootstrap_default()
+    return not projects.is_fallback()
+
+
+async def _registry_retry_loop(sleep=asyncio.sleep, first: float = 30, cap: float = 600) -> None:
+    """Retry loading the project registry (30 s doubling to 10 min) until it
+    succeeds, then reload mappings and rebuild every project's index. While
+    it fails, project #1 is the fail-closed stand-in (reconcile off, and
+    _reconcile_all skips everything)."""
+    log = logging.getLogger(__name__)
+    delay = first
+    while True:
+        await sleep(delay)
+        try:
+            ok = await asyncio.to_thread(_load_registry)
+        except Exception as e:
+            ok = False
+            log.error(f"Project registry retry failed: {e}")
+        if ok:
+            log.info("Project registry loaded after retry - rebuilding indexes")
+            await asyncio.to_thread(field_mappings.load)
+            await _initial_index_rebuild()
+            history.record(direction="system", event="config",
+                           description="Project registry loaded after a startup failure; "
+                                       "indexes rebuilt")
+            return
+        delay = min(delay * 2, cap)
 
 
 async def _initial_index_rebuild() -> None:
@@ -115,6 +155,10 @@ def _reconcile_all() -> None:
     """One reconcile pass over every active, reconcile-enabled project.
     A failure in one project never stops the others."""
     log = logging.getLogger(__name__)
+    if projects.is_fallback():
+        log.warning("Reconcile skipped for all projects — project registry not loaded "
+                    "(fail-closed stand-in in use)")
+        return
     for p in projects.all_projects():
         if not (p.reconcile_enabled and p.setup_state == "active"):
             log.info(f"Reconcile skipped for project {p.id} — disabled or not active")
@@ -445,13 +489,23 @@ async def debug_payloads():
     return list(_raw_payloads)
 
 
+def _debug_project(project: int) -> "projects.Project":
+    p = projects.get(project)
+    if p is None:
+        raise HTTPException(404, f"project {project} not found")
+    return p
+
+
 @app.get("/debug/index")
-async def debug_index():
-    """Current in-memory index of linked Jira ↔ Lark records."""
-    return {
-        "linked_count": len(index._jira_to_lark),
-        "jira_to_lark": index._jira_to_lark,
-    }
+async def debug_index(project: int = 1):
+    """One project's in-memory index of linked Jira ↔ Lark records (?project=N)."""
+    p = _debug_project(project)
+    with projects.use(p.id):
+        return {
+            "project": p.id,
+            "linked_count": len(index._jira_to_lark),
+            "jira_to_lark": dict(index._jira_to_lark),
+        }
 
 
 @app.get("/debug/lark-calls")
@@ -462,13 +516,19 @@ async def debug_lark_calls():
 
 
 @app.post("/debug/rebuild")
-async def debug_rebuild():
-    """Force-rebuild the index from all current Lark records."""
-    cfg = get_cfg()
-    token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
-    records = lark_api.fetch_all_records(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
-    index.rebuild(records)
-    return {"rebuilt": True, "linked_count": len(index._jira_to_lark)}
+async def debug_rebuild(project: int = 1):
+    """Force-rebuild one project's index from its current Lark records (?project=N)."""
+    p = _debug_project(project)
+    cfg = projects.cfg_for(p)
+
+    def rebuild():
+        token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+        records = lark_api.fetch_all_records(token, p.lark_base_token, p.lark_table_id)
+        with projects.use(p.id):
+            index.rebuild(records)
+            return len(index._jira_to_lark)
+    n = await asyncio.to_thread(rebuild)
+    return {"rebuilt": True, "project": p.id, "linked_count": n}
 
 
 def _capture(source: str, body, p) -> None:

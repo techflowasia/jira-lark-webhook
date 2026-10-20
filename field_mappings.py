@@ -6,6 +6,8 @@ project's list.
 """
 import logging
 import sys
+import threading
+import time
 import types
 import config
 import history
@@ -15,16 +17,45 @@ log = logging.getLogger(__name__)
 
 # project id -> that project's mapping rows
 _by_project: "dict[int, list]" = {}
+# project id -> earliest time to retry a load whose rows in _by_project are
+# only a FALLBACK (Supabase read failed). Never treated as authoritative: the
+# real load is retried on access, at most once per _RETRY_SECONDS.
+_retry_at: "dict[int, float]" = {}
+_RETRY_SECONDS = 60
+# project id -> time of the last "skipped: required mapping missing" history row
+_skip_reported: "dict[int, float]" = {}
+_SKIP_REPORT_SECONDS = 3600
+_skip_lock = threading.Lock()
 
 
 def _rows() -> list:
     """The current project's rows, loaded on first use. An unloaded project
     must never read as "nothing mapped" (every field would then be skipped,
-    and a create would make a blank record) — so load it now."""
+    and a create would make a blank record) — so load it now. Fallback rows
+    from a failed load are retried after the backoff."""
     pid = projects.current_id()
-    if pid not in _by_project:
+    if pid not in _by_project or (pid in _retry_at and time.time() >= _retry_at[pid]):
         load(pid)
     return _by_project.setdefault(pid, [])
+
+
+def report_skipped(missing: list, where: str) -> None:
+    """Record why a live project is not syncing (required mapping missing) as
+    an error history row so the dashboard health turns red. At most one row
+    per project per hour."""
+    pid = projects.current_id()
+    p = projects.get(pid)
+    if p is None or p.setup_state != "active":
+        return
+    now = time.time()
+    with _skip_lock:
+        if now - _skip_reported.get(pid, float("-inf")) < _SKIP_REPORT_SECONDS:
+            return
+        _skip_reported[pid] = now
+    msg = (f"Sync skipped ({where}): required mapping missing for "
+           f"{', '.join(missing)} — fix the field mappings of this project")
+    history.record(direction="system", event="skipped", description=msg,
+                   status="error", error=msg)
 
 
 # A project cannot sync without these: the Jira<->Lark link (key), the record
@@ -160,13 +191,16 @@ def load(project_id: "int | None" = None) -> None:
     if not client:
         for pid in pids:
             _by_project[pid] = _fallback(pid, owner)
+            _retry_at.pop(pid, None)
         return
     try:
         rows = client.table("field_mappings").select("*").order("id").execute().data or []
     except Exception as e:
-        log.warning(f"field_mappings.load failed: {e}")
+        log.warning(f"field_mappings.load failed (fallback rows in use, retry in "
+                    f"{_RETRY_SECONDS}s): {e}")
         for pid in pids:
             _by_project[pid] = _fallback(pid, owner)
+            _retry_at[pid] = time.time() + _RETRY_SECONDS
         return
     grouped: dict = {}
     for r in rows:
@@ -174,6 +208,7 @@ def load(project_id: "int | None" = None) -> None:
         grouped.setdefault(owner if pid is None else int(pid), []).append(r)
     for pid in pids:
         _by_project[pid] = grouped.get(pid) or (list(_DEFAULTS) if pid == owner else [])
+        _retry_at.pop(pid, None)
 
 
 def get_all() -> list:

@@ -100,6 +100,21 @@ def _resolve_id(cache: dict, getter, cfg: dict, name: str):
     return getter(cfg, force=True).get(name)
 
 
+def _owned(jira_key: str, rid: str, event: str, op: str, itype: str = "") -> bool:
+    """Ownership check right before a Jira write. A key of another Jira
+    project (e.g. a Lark Base duplicated with its data) gets no Jira call and
+    an error history row instead."""
+    if projects.owns_key(jira_key):
+        return True
+    p = projects.current()
+    msg = (f"Refused to {op} Jira {jira_key}: it is not an issue of project "
+           f"#{p.id}'s Jira project {p.jira_project_key}")
+    log.error(f"lark_handler: {msg} (Lark {rid})")
+    history.record(direction="lark→jira", event=event, lark_id=rid, jira_key=jira_key,
+                   description=msg, status="error", error=msg, type=itype)
+    return False
+
+
 def _resolve_parent(rec: dict) -> "str | None":
     if not field_mappings.reads_for_jira(field_mappings.F_PARENT):
         return None  # parent not mapped in this project
@@ -297,6 +312,7 @@ def _process(action: dict, table_id: str, cfg: dict) -> None:
     if missing:
         log.warning(f"lark_handler: skipping {act} {rid} — project "
                     f"{projects.current_id()} has no mapping for required {missing}")
+        field_mappings.report_skipped(missing, "lark_handler")
         return
     try:
         if act == "record_added":
@@ -348,6 +364,10 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
 
         existing_key = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
         if existing_key:
+            if not projects.owns_key(existing_key):
+                log.warning(f"lark_handler: skipping create {rid} — Jira Key {existing_key} "
+                            f"belongs to another Jira project; not linking")
+                return
             log.info(f"lark_handler: skipping create {rid} — Jira Key already set ({existing_key})")
             index.add(existing_key, rid)  # backfill the index so future edits sync
             return
@@ -462,6 +482,8 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     tz_hours = lark_api.get_base_tz_hours(token, cfg["LARK_BASE_TOKEN"])
 
     jira_key = index._lark_to_jira.get(rid)
+    if jira_key and not _owned(jira_key, rid, "updated", "update"):
+        return
     rec = None
 
     # Fast path: we already know the Jira link AND the webhook handed us the
@@ -491,6 +513,10 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     if not jira_key:
         # Not in index — check if the record itself has a Jira Key (auto-discover)
         jira_key = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
+        if jira_key and not projects.owns_key(jira_key):
+            log.warning(f"lark_handler: {rid} has Jira Key {jira_key} of another Jira "
+                        f"project — not linking, no Jira call")
+            return
         if jira_key:
             index.add(jira_key, rid)
             log.info(f"lark_handler: auto-discovered link {rid} → {jira_key}")
@@ -657,6 +683,8 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
         log.info(f"lark_handler: no relevant updates for {jira_key}")
         return
 
+    if not _owned(jira_key, rid, "updated", "update"):
+        return
     if updates:
         log.info(f"lark_handler: sending to Jira {jira_key} fields={list(updates.keys())}")
         jira_api.update_issue(cfg, jira_key, updates)
@@ -668,14 +696,14 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
         if "duedate" in updates:
             dedup.mark(dedup.date_echo_key(jira_key, "end", updates["duedate"]))
 
-    if sid:
+    if sid and _owned(jira_key, rid, "updated", "move to a sprint"):
         try:
             jira_api.move_to_sprint(cfg, sid, jira_key)
             changed.append(f"Sprint: {release_raw}")
         except Exception as e:
             log.warning(f"Sprint move {jira_key}: {e}")
 
-    if status_change_target:
+    if status_change_target and _owned(jira_key, rid, "updated", "transition"):
         # Fire after update_issue/move_to_sprint so a "Jira status push" bug
         # doesn't blow up a successful normal-field write. `False` return =
         # workflow has no transition to the target (e.g. Done → To Do) — log
@@ -711,6 +739,8 @@ def _handle_delete(rid: str, cfg: dict) -> None:
     jira_key = index._lark_to_jira.get(rid)
     if not jira_key:
         return
+    if not _owned(jira_key, rid, "deleted", "delete"):
+        return
 
     # Verify the record is actually gone — Lark sometimes fires record_deleted spuriously.
     try:
@@ -732,6 +762,8 @@ def _handle_delete(rid: str, cfg: dict) -> None:
 
     # Cascade delete to Jira. Mark dedup first so the jira:issue_deleted webhook
     # firing back for this delete is recognized as our own.
+    if not _owned(jira_key, rid, "deleted", "delete", itype):
+        return
     dedup.mark(f"jira:{jira_key}")
     try:
         jira_api.delete_issue(cfg, jira_key)

@@ -13,6 +13,19 @@ def _url(cfg: dict, path: str) -> str:
     return f"https://{cfg['JIRA_DOMAIN']}{path}"
 
 
+def _assert_owned(cfg: dict, key: str) -> None:
+    """Last line of defence for multi-project sync: never write to an issue
+    outside cfg's Jira project (a Lark row in project B may carry project
+    A's key). Callers check projects.owns_key first and record history."""
+    mine = (cfg.get("JIRA_PROJECT") or "").strip().upper()
+    if not mine or "-" not in (key or "") or key.rsplit("-", 1)[0].strip().upper() != mine:
+        raise ValueError(f"refusing to write Jira {key}: not an issue of project {mine or '?'}")
+
+
+def _jql_project(cfg: dict) -> str:
+    return 'project = "' + str(cfg["JIRA_PROJECT"]).replace("\\", "").replace('"', "") + '"'
+
+
 def fetch_all_issues(cfg: dict, types: "list | None" = None,
                      updated_since: "str | None" = None) -> list:
     """All project issues of the given types.
@@ -26,7 +39,7 @@ def fetch_all_issues(cfg: dict, types: "list | None" = None,
     fields = ["summary", "issuetype", "assignee", JF_START,
               "duedate", JF_STORY_POINTS, "parent", "status",
               JF_ACTUAL_START, JF_ACTUAL_END, JF_SPRINT]
-    jql = f"project={cfg['JIRA_PROJECT']} AND issuetype in ({type_list})"
+    jql = f"{_jql_project(cfg)} AND issuetype in ({type_list})"
     if updated_since:
         jql += f' AND updated >= "{updated_since}"'
     jql += " ORDER BY key ASC"
@@ -57,7 +70,7 @@ def get_issue(cfg: dict, key: str) -> dict:
 
 def get_account_ids(cfg: dict) -> dict:
     resp = requests.post(_url(cfg, "/rest/api/3/search/jql"),
-                         json={"jql": f"project={cfg['JIRA_PROJECT']} AND assignee is not EMPTY",
+                         json={"jql": f"{_jql_project(cfg)} AND assignee is not EMPTY",
                                "maxResults": 200, "fields": ["assignee"]},
                          auth=_auth(cfg))
     resp.raise_for_status()
@@ -85,6 +98,7 @@ def create_issue(cfg: dict, issuetype: str, summary: str,
 
 
 def update_issue(cfg: dict, key: str, fields: dict) -> None:
+    _assert_owned(cfg, key)
     if not fields:
         return
     resp = requests.put(_url(cfg, f"/rest/api/3/issue/{key}"),
@@ -98,6 +112,7 @@ def update_issue(cfg: dict, key: str, fields: dict) -> None:
 
 
 def delete_issue(cfg: dict, key: str) -> None:
+    _assert_owned(cfg, key)
     resp = requests.delete(_url(cfg, f"/rest/api/3/issue/{key}"), auth=_auth(cfg))
     resp.raise_for_status()
 
@@ -143,6 +158,7 @@ def get_board_sprints(cfg: dict, board_id: str) -> list:
 
 
 def move_to_sprint(cfg: dict, sprint_id: int, issue_key: str) -> None:
+    _assert_owned(cfg, issue_key)
     resp = requests.post(_url(cfg, f"/rest/agile/1.0/sprint/{sprint_id}/issue"),
                          json={"issues": [issue_key]}, auth=_auth(cfg))
     resp.raise_for_status()
@@ -182,6 +198,7 @@ def transition_issue(cfg: dict, key: str, target_status_name: str) -> bool:
     is rejected by Jira — status changes MUST go through the workflow, which
     is enforced server-side as the transition ID.
     """
+    _assert_owned(cfg, key)
     transitions = get_transitions(cfg, key)
     target = None
     for t in transitions:
