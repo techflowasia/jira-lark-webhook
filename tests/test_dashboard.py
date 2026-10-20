@@ -92,3 +92,22 @@ def test_draft_project_shows_setup_banner():
     html = client.get("/p/2").text
     assert "/p/2/setup" in html
     assert "/p/2/setup" not in client.get("/p/1").text
+
+
+def test_no_unscoped_api_urls_in_project_page():
+    import re
+    html = client.get("/p/2").text
+    assert not re.findall(r"'/api/(?!p/)", html)
+    assert "API + 'jira-fields'" in html
+
+
+def test_new_and_setup_routes_not_shadowed():
+    assert client.get("/p/new").status_code == 200
+    assert client.get("/p/2/setup").status_code == 200
+
+
+def test_activity_hides_lark_column_by_class_and_project_filter_keeps_custom_dates():
+    html = client.get("/activity?range=custom&from_date=2026-01-01&to_date=2026-02-01").text
+    assert 'th class="col-lark"' in html and "nth-child(6)" not in html
+    form = html.split('class="proj-filter"')[1].split("</form>")[0]
+    assert 'name="from_date"' in form and 'name="to_date"' in form

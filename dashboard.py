@@ -213,7 +213,7 @@ _CSS = """
     .section { overflow-x: auto; border-radius: 8px; }
     table { font-size: 12px; min-width: 480px; }
     th, td { padding: 8px 10px; }
-    #history-table th:nth-child(6), #history-table td:nth-child(6) { display: none; }
+    #history-table .col-lark { display: none; }
     #field-table th:nth-child(3), #field-table td:nth-child(3),
     #field-table th:nth-child(5), #field-table td:nth-child(5) { display: none; }
     .filter-bar { gap: 6px; padding: 10px 12px; }
@@ -337,7 +337,7 @@ def _history_section(request, result: dict, base_path: str, with_project: bool,
           <td>{_event_badge(en.get("event"))}</td>
           <td>{e(en.get("type") or "—")}</td>
           <td><code>{e(en.get("jira_key") or "—")}</code></td>
-          <td><code class="small">{e(en.get("lark_id") or "—")}</code></td>
+          <td class="col-lark"><code class="small">{e(en.get("lark_id") or "—")}</code></td>
           <td>{e(en.get("description"))}{err}</td>
         </tr>"""
     ncols = 8 if with_project else 7
@@ -371,6 +371,8 @@ def _history_section(request, result: dict, base_path: str, with_project: bool,
     custom_to = f["to_date"] or now.strftime("%Y-%m-%d")
     hidden_proj = (f'<input type="hidden" name="project" value="{e(project_filter)}">'
                    if extra else "")
+    from_hidden = f'<input type="hidden" name="from_date" value="{e(f["from_date"])}">' if f["from_date"] else ""
+    to_hidden = f'<input type="hidden" name="to_date" value="{e(f["to_date"])}">' if f["to_date"] else ""
     proj_select = ""
     if with_project:
         opts = '<option value="">All projects</option>' + "".join(
@@ -379,10 +381,9 @@ def _history_section(request, result: dict, base_path: str, with_project: bool,
         proj_select = (f'<form class="proj-filter" method="get" action="{base_path}">'
                        f'<input type="hidden" name="range" value="{e(f["range"])}">'
                        f'<input type="hidden" name="q" value="{e(f["q"])}">'
+                       f'{from_hidden}{to_hidden}'
                        f'<select name="project" onchange="this.form.submit()">{opts}</select></form>')
     proj_th = "<th>Project</th>" if with_project else ""
-    from_hidden = f'<input type="hidden" name="from_date" value="{e(f["from_date"])}">' if f["from_date"] else ""
-    to_hidden = f'<input type="hidden" name="to_date" value="{e(f["to_date"])}">' if f["to_date"] else ""
     return f"""<div class="section">
     <div class="filter-bar">
       {proj_select}
@@ -405,7 +406,7 @@ def _history_section(request, result: dict, base_path: str, with_project: bool,
     </div>
     <table id="history-table">
       <thead><tr><th>Time</th>{proj_th}<th>Direction</th><th>Event</th><th>Type</th>
-        <th>Jira Key</th><th>Lark Record</th><th>Description</th></tr></thead>
+        <th>Jira Key</th><th class="col-lark">Lark Record</th><th>Description</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
     <div class="pagination">{prev_btn}
@@ -509,7 +510,7 @@ async function loadAvailableFields() {
     _larkFields = ld.fields || [];
   } catch(e) { _larkFields = []; }
   try {
-    var jr = await fetch('/api/jira-fields');
+    var jr = await fetch(API + 'jira-fields');
     var jd = await jr.json();
     _jiraFields = jd.fields || [];
   } catch(e) { _jiraFields = []; }
@@ -612,8 +613,7 @@ async function saveRow(id) {
     lark_field: lf, jira_field: jf, jira_label: lbl,
     direction: dir, field_type: typ, active: chk ? chk.checked : true
   });
-  await postField(payload);
-  loadFields();
+  if (await postField(payload)) loadFields();
 }
 
 async function deleteField(id) {
@@ -665,11 +665,11 @@ async function saveNewRow() {
   var typ = allSel[3] ? allSel[3].value : 'text';
   var chk = row.querySelector('input[type=checkbox]');
   if (!lf || !jf) { alert('Lark field and Jira field are required.'); return; }
-  await postField({
+  var ok = await postField({
     lark_field: lf, jira_field: jf, jira_label: lbl,
     direction: dir, field_type: typ, active: chk ? chk.checked : true, is_system: false
   });
-  loadFields();
+  if (ok) loadFields();
 }
 
 function dirSelect(cur) {

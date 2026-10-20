@@ -381,6 +381,23 @@ async def dashboard_root(request: Request):
     return RedirectResponse(f"/p/{target}", status_code=303)
 
 
+def _coming_soon(title: str) -> HTMLResponse:
+    return HTMLResponse(f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>{title}</title></head>"
+                        f"<body style='font-family:sans-serif;padding:32px'><h1>{title}</h1>"
+                        "<p>Setup coming soon.</p><p><a href='/'>Back to dashboard</a></p></body></html>")
+
+
+# Placeholders registered BEFORE /p/{pid} so they are never shadowed; Task 8 replaces them.
+@app.get("/p/new", response_class=HTMLResponse)
+async def new_project_page():
+    return _coming_soon("New project")
+
+
+@app.get("/p/{pid}/setup", response_class=HTMLResponse)
+async def project_setup_page(pid: int):
+    return _coming_soon("Project setup")
+
+
 @app.get("/p/{pid}", response_class=HTMLResponse)
 async def project_dashboard(pid: int, request: Request):
     p = projects.get(pid)
