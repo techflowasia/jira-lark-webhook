@@ -114,8 +114,34 @@ SUPABASE_URL        # Supabase project URL
 SUPABASE_KEY        # Supabase service role key
 ```
 
-Hardcoded in `main.py` (not secrets — Lark app credentials for the OAuth flow):
-- `LARK_APP_ID`, `LARK_APP_SECRET`, `LARK_BASE_TOKEN`, `BOT_OPEN_ID`, `REDIRECT_URI`
+### Workspace profile (optional, `config.py`)
+
+Nothing workspace-specific is hardcoded in the sync code. Each value below is an
+env var whose default is the original workspace's value, so an unset var changes
+nothing. `tests/test_config.py` pins both the defaults and the overrides.
+
+| Env var | Default | Used for |
+|---------|---------|----------|
+| `JIRA_FIELD_START_DATE` | `customfield_10015` | Jira Start date |
+| `JIRA_FIELD_STORY_POINTS` | `customfield_10016` | Story Points → `R. MD` |
+| `JIRA_FIELD_ACTUAL_START` | `customfield_10175` | Actual start |
+| `JIRA_FIELD_ACTUAL_END` | `customfield_10176` | Actual end |
+| `JIRA_FIELD_SPRINT` | `customfield_10020` | Sprint → `Release` |
+| `ASSIGNEE_MAP` | the five names below | JSON, Jira display name → Lark name |
+| `DEFAULT_SYNC_TYPES` | `["Epic", "Story", "Task"]` | Allowed types before the dashboard sets any |
+| `LARK_API_BASE` | `https://open.larksuite.com/open-apis` | Lark vs Feishu host |
+| `LARK_BOT_OPEN_ID` | the original bot | Bot added as editor by `/auth/callback` |
+| `PUBLIC_URL` | `https://jira-lark-webhook.onrender.com` | OAuth redirect and the webhook URLs shown on the dashboard |
+| `TZ_OFFSET_HOURS` | `7` | History timestamps, daily call counter, reconcile JQL |
+
+The OAuth flow in `main.py` reads `LARK_APP_ID`, `LARK_APP_SECRET` and
+`LARK_BASE_TOKEN` from the same env vars as the sync paths.
+
+The system rows in Supabase `field_mappings` are matched by `jira_field`. When
+a `JIRA_FIELD_*` var is overridden, update that row's `jira_field` to the same
+ID, or a dashboard rename of its Lark field stops being honored.
+
+One deployment still syncs one Jira project with one Lark table.
 
 ---
 
@@ -151,7 +177,7 @@ Hardcoded in `main.py` (not secrets — Lark app credentials for the OAuth flow)
 
 ---
 
-## Assignee Mapping (hardcoded in `config.py`)
+## Assignee Mapping (default of `ASSIGNEE_MAP`)
 
 | Jira display name | Lark name |
 |-------------------|-----------|

@@ -9,6 +9,14 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
+## 2026-10-05 — Workspace-specific values moved from code to env vars
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| _pending_ | refactor | **Nothing workspace-specific is hardcoded any more.** The five Jira custom field IDs (Start date, Story Points, Actual start/end, Sprint), the assignee map, the default sync types, the Lark API host, the bot `open_id`, the public URL and the UTC+7 offset are now a workspace profile in `config.py`, each read from an env var whose default is the old literal. With no new env vars set the service sends the same requests as before: the existing 141 tests pass unmodified, and `tests/test_config.py` (4 new) pins every default and proves every override reaches the code that uses it. `main.py` no longer carries its own copy of the Lark app ID, app secret and Base token; the OAuth flow reads the env vars the sync paths already require. `/api/lark-type-options` reads the current Type field name where it had the literal `"Type"`. `keep-alive.yml` takes its URL from the `HEALTH_URL` repository variable, falling back to the current one. Still one Jira project and one Lark table per deployment. Suite: 145 passed. |
+
+---
+
 ## 2026-09-30 — Moving a Jira card from a sprint to the backlog never cleared Lark Release
 
 | Commit | Type | Summary |

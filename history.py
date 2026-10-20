@@ -2,10 +2,12 @@
 import os
 import logging
 from collections import deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
+from config import LOCAL_TZ, TZ_LABEL
 
 log = logging.getLogger(__name__)
-_TZ7 = timezone(timedelta(hours=7))
+_TZ7 = LOCAL_TZ
+_TS_FMT = f"%Y-%m-%d %H:%M:%S {TZ_LABEL}"
 
 _fallback: deque = deque(maxlen=500)
 _client = None
@@ -31,7 +33,7 @@ def _get_client():
 def record(*, direction: str, event: str, lark_id: str = "",
            jira_key: str = "", description: str, status: str = "ok",
            error: str = "", type: str = "") -> None:
-    ts_str = datetime.now(_TZ7).strftime("%Y-%m-%d %H:%M:%S +07")
+    ts_str = datetime.now(_TZ7).strftime(_TS_FMT)
     mem = {"ts": ts_str, "direction": direction, "event": event,
            "lark_id": lark_id, "jira_key": jira_key, "type": type,
            "description": description, "status": status, "error": error}
@@ -88,7 +90,7 @@ def query(from_dt: "datetime | None" = None, to_dt: "datetime | None" = None,
                 if r.get("ts"):
                     try:
                         dt = datetime.fromisoformat(r["ts"].replace("Z", "+00:00"))
-                        r["ts"] = dt.astimezone(_TZ7).strftime("%Y-%m-%d %H:%M:%S +07")
+                        r["ts"] = dt.astimezone(_TZ7).strftime(_TS_FMT)
                     except Exception:
                         pass
             pages = max(1, (total + page_size - 1) // page_size)
@@ -107,7 +109,7 @@ def _fallback_query(from_dt, to_dt, jira_key, page, page_size):
         filtered = []
         for r in rows:
             try:
-                ts = datetime.strptime(r["ts"], "%Y-%m-%d %H:%M:%S +07").replace(tzinfo=_TZ7)
+                ts = datetime.strptime(r["ts"], _TS_FMT).replace(tzinfo=_TZ7)
                 if from_dt and ts < from_dt:
                     continue
                 if to_dt and ts > to_dt:

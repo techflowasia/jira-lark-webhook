@@ -1,7 +1,8 @@
 """Jira webhook events → Lark actions."""
 import logging
 import lark_api, index, dedup, history, field_mappings, config
-from config import (JIRA_TO_LARK_ASSIGNEE)
+from config import (JIRA_TO_LARK_ASSIGNEE,
+                    JF_START, JF_STORY_POINTS, JF_ACTUAL_START, JF_ACTUAL_END, JF_SPRINT)
 from utils import (_jira_datetime_to_lark_ts, _jira_date_to_lark_ts,
                    _lark_ts_to_jira_date, _lark_text, _lark_select,
                    _lark_link_rid, _lark_multi)
@@ -14,10 +15,10 @@ def _sprint_names(sprint_data) -> list:
     return [s.get("name") for s in (sprint_data or []) if s.get("name")]
 
 RELEVANT_CHANGELOG_FIELDS = {
-    "summary", "assignee", "customfield_10016",
-    "customfield_10175", "customfield_10176", "status", "parent",
-    "customfield_10020",       # Sprint → Release
-    "customfield_10015",       # Start date → Timeline - Start
+    "summary", "assignee", JF_STORY_POINTS,
+    JF_ACTUAL_START, JF_ACTUAL_END, "status", "parent",
+    JF_SPRINT,       # Sprint → Release
+    JF_START,       # Start date → Timeline - Start
     "duedate",                 # Due date  → Timeline - End
     "IssueParentAssociation",  # Jira's actual changelog field name for a
                                # parent change (fieldId is None) — without
@@ -57,15 +58,15 @@ def _handle_create(issue: dict, cfg: dict) -> None:
 
     assignee_name = (jf.get("assignee") or {}).get("displayName")
     lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
-    sp_num = _sp_to_num(jf.get("customfield_10016"))
+    sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
     jira_status = (jf.get("status") or {}).get("name")
-    actual_start = _jira_datetime_to_lark_ts(jf.get("customfield_10175"))
-    actual_end = _jira_datetime_to_lark_ts(jf.get("customfield_10176"))
-    start_ts = _jira_date_to_lark_ts(jf.get("customfield_10015"))
+    actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
+    actual_end = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_END))
+    start_ts = _jira_date_to_lark_ts(jf.get(JF_START))
     end_ts = _jira_date_to_lark_ts(jf.get("duedate"))
     parent_jira_key = (jf.get("parent") or {}).get("key")
     parent_record_id = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
-    sprint_data = jf.get("customfield_10020") or []
+    sprint_data = jf.get(JF_SPRINT) or []
     sprint_names = _sprint_names(sprint_data)
 
     fields = {
@@ -138,7 +139,7 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
             if lark_a != _lark_select(lark_fields.get(field_mappings.F_ASSIGNEE)):
                 updates[field_mappings.F_ASSIGNEE] = [lark_a] if lark_a else None
 
-        elif field == "customfield_10016":
+        elif field == JF_STORY_POINTS:
             sp_num = _sp_to_num(to_str)
             cur = lark_fields.get(field_mappings.F_MD)
             # Lark returns Number fields as strings ("3"); parse via _sp_to_num
@@ -148,12 +149,12 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
             if sp_num != cur_num:
                 updates[field_mappings.F_MD] = sp_num  # may be None to clear
 
-        elif field == "customfield_10175":
+        elif field == JF_ACTUAL_START:
             ts = _jira_datetime_to_lark_ts(to_raw or to_str)
             if ts is not None and ts != lark_fields.get(field_mappings.F_ACTUAL_START):
                 updates[field_mappings.F_ACTUAL_START] = ts
 
-        elif field == "customfield_10176":
+        elif field == JF_ACTUAL_END:
             ts = _jira_datetime_to_lark_ts(to_raw or to_str)
             if ts is not None and ts != lark_fields.get(field_mappings.F_ACTUAL_END):
                 updates[field_mappings.F_ACTUAL_END] = ts
@@ -162,7 +163,7 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
             if to_str and to_str != _lark_select(lark_fields.get(field_mappings.F_JIRA_STATUS)):
                 updates[field_mappings.F_JIRA_STATUS] = to_str
 
-        elif field == "customfield_10015":  # Jira Start date → Timeline - Start
+        elif field == JF_START:  # Jira Start date → Timeline - Start
             # `ts` may legitimately be None here (Jira Start date cleared) — a
             # changelog item for this field only exists because it actually
             # changed, so None is as authoritative a "new value" as a real
@@ -215,9 +216,9 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     # Sprint changelog item — i.e. the card was actually moved to the backlog.
     # Gating on `if jira_sprints` alone silently dropped every sprint→backlog
     # move (VR-741 et al., Beta 1.6, 2026-09-30).
-    jira_sprints = _sprint_names(issue["fields"].get("customfield_10020"))
+    jira_sprints = _sprint_names(issue["fields"].get(JF_SPRINT))
     lark_release = _lark_multi(lark_fields.get(field_mappings.F_RELEASE))
-    sprint_changed = any((it.get("fieldId") or it.get("field")) == "customfield_10020"
+    sprint_changed = any((it.get("fieldId") or it.get("field")) == JF_SPRINT
                          for it in items)
     if jira_sprints and set(jira_sprints) != set(lark_release):
         updates[field_mappings.F_RELEASE] = jira_sprints

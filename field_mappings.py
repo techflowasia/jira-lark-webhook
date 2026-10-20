@@ -13,17 +13,17 @@ _cache: list = []
 # module.__getattr__ below can resolve the CURRENT lark_field for it.
 _SYSTEM_JIRA_KEYS = {
     "F_TITLE":        "summary",
-    "F_START":        "customfield_10015",
+    "F_START":        config.JF_START,
     "F_END":          "duedate",
     "F_ASSIGNEE":     "assignee",
     "F_JIRA_KEY":     "key",
     "F_JIRA_URL":     "url",
     "F_TYPE":         "issuetype",
     "F_PARENT":       "parent",
-    "F_MD":           "customfield_10016",
+    "F_MD":           config.JF_STORY_POINTS,
     "F_RELEASE":      "fixVersions",
-    "F_ACTUAL_START": "customfield_10175",
-    "F_ACTUAL_END":   "customfield_10176",
+    "F_ACTUAL_START": config.JF_ACTUAL_START,
+    "F_ACTUAL_END":   config.JF_ACTUAL_END,
     "F_JIRA_STATUS":  "status",
 }
 
@@ -54,17 +54,17 @@ def __getattr__(name: str):
 # Hardcoded fallback (matches Supabase seed data)
 _DEFAULTS = [
     {"id": 0, "lark_field": "Title",             "jira_field": "summary",           "jira_label": "Title",        "direction": "both",         "field_type": "text",   "is_system": True,  "active": True},
-    {"id": 0, "lark_field": "Timeline - Start",  "jira_field": "customfield_10015", "jira_label": "Start Date",   "direction": "both",         "field_type": "date",   "is_system": True,  "active": True},
+    {"id": 0, "lark_field": "Timeline - Start",  "jira_field": config.JF_START, "jira_label": "Start Date",   "direction": "both",         "field_type": "date",   "is_system": True,  "active": True},
     {"id": 0, "lark_field": "Timeline - End",    "jira_field": "duedate",           "jira_label": "Due Date",     "direction": "both",         "field_type": "date",   "is_system": True,  "active": True},
     {"id": 0, "lark_field": "Assignee",          "jira_field": "assignee",          "jira_label": "Assignee",     "direction": "both",         "field_type": "user",   "is_system": True,  "active": True},
     {"id": 0, "lark_field": "Type",              "jira_field": "issuetype",         "jira_label": "Issue Type",   "direction": "both",         "field_type": "select", "is_system": True,  "active": True},
     {"id": 0, "lark_field": "Parent items",      "jira_field": "parent",            "jira_label": "Parent",       "direction": "both",         "field_type": "text",   "is_system": True,  "active": True},
     {"id": 0, "lark_field": "Jira Key",          "jira_field": "key",               "jira_label": "Jira Key",     "direction": "jira_to_lark", "field_type": "text",   "is_system": True,  "active": True},
     {"id": 0, "lark_field": "Jira URL",          "jira_field": "url",               "jira_label": "Jira URL",     "direction": "jira_to_lark", "field_type": "text",   "is_system": True,  "active": True},
-    {"id": 0, "lark_field": "R. MD",             "jira_field": "customfield_10016", "jira_label": "Story Points", "direction": "jira_to_lark", "field_type": "number", "is_system": True,  "active": True},
+    {"id": 0, "lark_field": "R. MD",             "jira_field": config.JF_STORY_POINTS, "jira_label": "Story Points", "direction": "jira_to_lark", "field_type": "number", "is_system": True,  "active": True},
     {"id": 0, "lark_field": "Release",           "jira_field": "fixVersions",       "jira_label": "Fix Version",  "direction": "lark_to_jira", "field_type": "select", "is_system": True,  "active": True},
-    {"id": 0, "lark_field": "Actual start date", "jira_field": "customfield_10175", "jira_label": "Actual Start", "direction": "jira_to_lark", "field_type": "date",   "is_system": True,  "active": True},
-    {"id": 0, "lark_field": "Actual end date",   "jira_field": "customfield_10176", "jira_label": "Actual End",   "direction": "jira_to_lark", "field_type": "date",   "is_system": True,  "active": True},
+    {"id": 0, "lark_field": "Actual start date", "jira_field": config.JF_ACTUAL_START, "jira_label": "Actual Start", "direction": "jira_to_lark", "field_type": "date",   "is_system": True,  "active": True},
+    {"id": 0, "lark_field": "Actual end date",   "jira_field": config.JF_ACTUAL_END, "jira_label": "Actual End",   "direction": "jira_to_lark", "field_type": "date",   "is_system": True,  "active": True},
     {"id": 0, "lark_field": "Jira status",       "jira_field": "status",            "jira_label": "Jira Status",  "direction": "jira_to_lark", "field_type": "select", "is_system": True,  "active": True},
 ]
 

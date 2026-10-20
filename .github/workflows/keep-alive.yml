@@ -9,4 +9,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping health endpoint
-        run: curl -sf https://jira-lark-webhook.onrender.com/health
+        run: curl -sf ${{ vars.HEALTH_URL || 'https://jira-lark-webhook.onrender.com/health' }}

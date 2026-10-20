@@ -4,13 +4,14 @@ import random
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 import requests
 import field_mappings
+from config import LARK_API_BASE, LOCAL_TZ, TZ_LABEL
 
 log = logging.getLogger(__name__)
 
-LARK_BASE_URL = "https://open.larksuite.com/open-apis"
+LARK_BASE_URL = LARK_API_BASE
 _token_cache = {"token": None, "expires_at": 0}
 
 # Cached Base timezone offset (hours from UTC). Populated by get_base_tz_hours().
@@ -81,7 +82,7 @@ def get_base_tz_hours(token: str, base_token: str) -> float:
 # the project's date handling). In-memory only — resets on process restart;
 # the Lark Developer Console is authoritative for the monthly quota. Exposed
 # at GET /debug/lark-calls to watch the quota-reduction work land.
-_BKK = timezone(timedelta(hours=7))
+_BKK = LOCAL_TZ
 _call_counts: dict = defaultdict(int)
 # Per-call-type attempt counts (cumulative since restart). Counts every actual
 # HTTP attempt INCLUDING retries, so the totals reconcile with the Lark admin
@@ -133,7 +134,7 @@ def call_stats() -> dict:
         "retries_total": sum(retries_by_type.values()),
         "retries_by_type": dict(sorted(retries_by_type.items(), key=lambda kv: -kv[1])),
         "process_started": datetime.fromtimestamp(_process_start, tz=_BKK)
-                            .strftime("%Y-%m-%d %H:%M:%S +07"),
+                            .strftime(f"%Y-%m-%d %H:%M:%S {TZ_LABEL}"),
     }
 
 # Short-lived cache for table field schemas. The dashboard hits /api/lark-fields
