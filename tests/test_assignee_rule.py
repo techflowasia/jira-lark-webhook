@@ -458,3 +458,33 @@ def test_lark_second_event_on_same_record_does_not_rewarn(four, lark_mocks):
     ml.get_record.return_value = rec
     lark_handler.process({"action": "record_edited", "record_id": "rec5"}, P2_TABLE, CFG2)
     assert len(_warnings()) == 1
+
+
+def test_concurrent_option_adds_keep_every_option(lark_http):
+    """Two threads (e.g. a webhook and the reconcile loop) adding different
+    names at once: the second PUT must not drop the first one's new option."""
+    barrier = threading.Barrier(2)
+    real = lark_api._request.side_effect
+
+    def slow(method, url, **kw):
+        resp = real(method, url, **kw)
+        if method == "GET" and url.endswith("/fields"):
+            threading.Event().wait(0.05)  # widen the GET -> PUT window
+        return resp
+
+    def worker(name):
+        barrier.wait()
+        lark_api.add_select_options("tok", "bX", "tX", "Assignee", [name])
+
+    with patch("lark_api._request", side_effect=slow):
+        ts = [threading.Thread(target=worker, args=(n,)) for n in ("A", "B")]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+    puts = _field_puts(lark_http)
+    assert len(puts) == 2
+    final = puts[-1][1]["property"]["options"]
+    assert final[:len(_OLD_OPTIONS)] == _OLD_OPTIONS
+    assert {o["name"] for o in final[len(_OLD_OPTIONS):]} == {"A", "B"}
+    assert {o["name"] for o in lark_http["options"]} == {"Tawan", "Lin", "Nurse", "A", "B"}

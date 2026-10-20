@@ -461,8 +461,27 @@ def _write_adding_missing_options(send, token: str, base_token: str, table_id: s
         return send()
 
 
+_option_locks: dict = {}
+_option_locks_guard = threading.Lock()
+
+
+def _option_lock(base_token: str, table_id: str) -> threading.Lock:
+    with _option_locks_guard:
+        return _option_locks.setdefault((base_token, table_id), threading.Lock())
+
+
 def add_select_options(token: str, base_token: str, table_id: str, field_name: str,
                        names: list) -> list:
+    """Serialized per (base, table): two concurrent GET->PUT sequences (a
+    webhook thread and the reconcile thread) would otherwise each send
+    "old options + their own new one", and the second PUT would drop the
+    first one's option. The fresh GET happens inside the lock."""
+    with _option_lock(base_token, table_id):
+        return _add_select_options_locked(token, base_token, table_id, field_name, names)
+
+
+def _add_select_options_locked(token: str, base_token: str, table_id: str,
+                               field_name: str, names: list) -> list:
     """Add each of `names` that is not yet an option of select column
     `field_name`; returns the names added ([] when none were missing, the
     column doesn't exist or isn't a select).
