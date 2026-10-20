@@ -160,12 +160,13 @@ def recent(n: int = 200) -> list:
     return list(_fallback)[:n]
 
 
-def warn_unmapped_assignee(*, jira_key: str, name: str, lark_id: str = "",
-                           outcome: str = "Lark Assignee cleared",
-                           direction: str = "jira→lark", type: str = "") -> None:
-    """One skipped history row for an assignee who is not in the project's
-    people list. Callers invoke it only when a write actually happened (or a
-    record was created), so repeated sweeps never repeat the warning."""
+def warn_unmapped_assignee(*, jira_key: str, name: str, outcome: str,
+                           lark_id: str = "", direction: str = "lark→jira",
+                           type: str = "") -> None:
+    """One skipped history row for a Lark assignee who is not in the
+    project's people list (Lark->Jira; Jira is left unchanged). Jira->Lark
+    never warns: an unmapped Jira assignee is auto-added instead (see
+    config.lark_assignee_for). Callers rate-limit / call it once per event."""
     record(direction=direction, event="updated", jira_key=jira_key, lark_id=lark_id,
            description=f"Assignee '{name}' not in people list — {outcome}",
            status="skipped", type=type)

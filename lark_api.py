@@ -114,7 +114,7 @@ def _classify(method: str, url: str) -> str:
         if method == "DELETE":
             return "delete_record"
     if "/fields" in url:
-        return "list_fields"
+        return "update_field" if method == "PUT" else "list_fields"
     if url.rstrip("/").endswith("/tables"):
         return "list_tables"
     return f"{method.lower()}_other"
@@ -430,6 +430,74 @@ def _known_columns(token: str, base_token: str, table_id: str, fields: dict,
     return kept
 
 
+_SELECT_TYPES = (3, 4)  # SingleSelect, MultiSelect
+
+
+def _write_adding_missing_options(send, token: str, base_token: str, table_id: str,
+                                  fields: dict):
+    """Run `send()` (one record write). If Lark rejects it while the Assignee
+    value names a person who is not yet an option of the Assignee select
+    column (a person just auto-added to the people list), add the missing
+    option(s) and retry the write ONCE. Any other failure — or a failure to
+    read/extend the column — re-raises the original error unchanged. It is
+    unknown whether Lark auto-creates options on write, so the write is always
+    tried first and a successful write never touches the column."""
+    try:
+        return send()
+    except Exception as err:
+        col = field_mappings.F_ASSIGNEE
+        names = fields.get(col) if col else None
+        if not isinstance(names, list) or not names:
+            raise
+        try:
+            added = add_select_options(token, base_token, table_id, col, names)
+        except Exception as e:
+            log.error(f"lark_api: could not add {names} to '{col}' options: {e}")
+            raise err
+        if not added:
+            raise
+        log.warning(f"lark_api: write rejected ({err}); added option(s) {added} "
+                    f"to '{col}' and retrying once")
+        return send()
+
+
+def add_select_options(token: str, base_token: str, table_id: str, field_name: str,
+                       names: list) -> list:
+    """Add each of `names` that is not yet an option of select column
+    `field_name`; returns the names added ([] when none were missing, the
+    column doesn't exist or isn't a select).
+
+    The schema is read FRESH (never from the 60 s cache) and the PUT sends
+    EVERY existing option with its id, name and colour unchanged, followed by
+    the new ones: Lark replaces the whole option list, so a dropped or renamed
+    option would blank that value on every record."""
+    invalidate_fields_cache(base_token, table_id)
+    items = _fetch_field_items(token, base_token, table_id)
+    fld = next((f for f in items if f.get("field_name") == field_name), None)
+    if fld is None or fld.get("type") not in _SELECT_TYPES or not fld.get("field_id"):
+        return []
+    prop = fld.get("property") or {}
+    existing = prop.get("options") or []
+    have = {o.get("name") for o in existing}
+    new = [n for n in dict.fromkeys(names) if isinstance(n, str) and n and n not in have]
+    if not new:
+        return []
+    options = ([{k: o[k] for k in ("id", "name", "color") if k in o} for o in existing]
+               + [{"name": n} for n in new])
+    body = {"field_name": fld["field_name"], "type": fld["type"],
+            "property": {**prop, "options": options}}
+    resp = _request("PUT",
+        f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields/{fld['field_id']}",
+        headers=_headers(token), json=body)
+    resp.raise_for_status()
+    data = resp.json()
+    invalidate_fields_cache(base_token, table_id)
+    if data.get("code") != 0:
+        raise RuntimeError(f"Lark update_field error: {data.get('msg')}")
+    log.info(f"lark_api: added option(s) {new} to '{field_name}' in {table_id}")
+    return new
+
+
 def create_record(token: str, base_token: str, table_id: str, fields: dict) -> str:
     sent = _known_columns(token, base_token, table_id, fields, "created")
     # Never create a record without its link / title / type: a record missing
@@ -440,14 +508,18 @@ def create_record(token: str, base_token: str, table_id: str, fields: dict) -> s
     if lost:
         raise RuntimeError(f"Lark column(s) {lost} not found — required, record not created")
     fields = sent
-    resp = _request("POST",
-        f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records",
-        headers=_headers(token), json={"fields": fields})
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code") != 0:
-        raise RuntimeError(f"Lark create error: {data.get('msg')}")
-    return data["data"]["record"]["record_id"]
+
+    def send():
+        resp = _request("POST",
+            f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records",
+            headers=_headers(token), json={"fields": fields})
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Lark create error: {data.get('msg')}")
+        return data["data"]["record"]["record_id"]
+
+    return _write_adding_missing_options(send, token, base_token, table_id, fields)
 
 
 def update_record(token: str, base_token: str, table_id: str,
@@ -455,13 +527,17 @@ def update_record(token: str, base_token: str, table_id: str,
     fields = _known_columns(token, base_token, table_id, fields, "updated", record_id)
     if not fields:
         return
-    resp = _request("PUT",
-        f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records/{record_id}",
-        headers=_headers(token), json={"fields": fields})
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code") != 0:
-        raise RuntimeError(f"Lark update error: {data.get('msg')}")
+
+    def send():
+        resp = _request("PUT",
+            f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records/{record_id}",
+            headers=_headers(token), json={"fields": fields})
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Lark update error: {data.get('msg')}")
+
+    _write_adding_missing_options(send, token, base_token, table_id, fields)
     # Merge written fields into existing cache entry so the next read sees
     # them without a get_record fetch. We do NOT seed a new entry from a
     # write alone — partial data would mislead value-compares for fields

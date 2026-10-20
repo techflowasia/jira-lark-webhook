@@ -335,6 +335,29 @@ def update(pid: int, fields: dict) -> Project:
         return new
 
 
+def add_assignee(pid: int, jira_name: str, lark_name: str) -> str:
+    """Add one {jira_name: lark_name} entry to project `pid`'s people list.
+
+    Read-merge-write under the registry lock, re-reading the CURRENT map (not
+    a caller's snapshot), so concurrent adds never lose an entry. Never
+    overwrites an existing entry and never reuses a Lark name another person
+    already has (Lark->Jira would then be ambiguous). Returns "added",
+    "exists" or "collision"."""
+    _ensure_loaded()
+    with _lock:
+        cur = _projects.get(pid)
+        if cur is None:
+            raise KeyError(f"project {pid} not found")
+        m = dict(cur.assignee_map)
+        if jira_name in m:
+            return "exists"
+        if lark_name in m.values():
+            return "collision"
+        m[jira_name] = lark_name
+        update(pid, {"assignee_map": m})
+        return "added"
+
+
 def delete(pid: int) -> None:
     """Delete a DRAFT project: its registry row and its field_mappings rows,
     nothing else. Never touches Jira or Lark records. Project #1 is never

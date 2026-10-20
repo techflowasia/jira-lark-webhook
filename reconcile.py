@@ -254,7 +254,7 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
     itype = jf["issuetype"]["name"]
 
     assignee_name = (jf.get("assignee") or {}).get("displayName")
-    lark_assignee, assignee_unmapped = config.lark_assignee_for(assignee_name)
+    lark_assignee, _ = config.lark_assignee_for(assignee_name, jira_key=key, type=itype)
     sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
     jira_status = (jf.get("status") or {}).get("name")
     actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
@@ -271,7 +271,7 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
         rid = rec["record_id"]
         updates = {}
 
-        warn_assignee = _assignee_update(updates, rec["fields"], lark_assignee, assignee_unmapped)
+        _assignee_update(updates, rec["fields"], lark_assignee)
         cur_md = rec["fields"].get(field_mappings.F_MD)
         # Lark's bitable API returns Number fields as STRINGS (e.g. "3"), so the
         # old `isinstance(int,float)` guard coerced the current value to None and
@@ -306,9 +306,6 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
                 lark_api.update_record(token, cfg["LARK_BASE_TOKEN"],
                                        cfg["LARK_TABLE_ID"], rid, updates)
                 log.info(f"Reconcile: updated Lark {rid} ({key})")
-                if warn_assignee:
-                    history.warn_unmapped_assignee(jira_key=key, name=assignee_name,
-                                                   lark_id=rid, type=itype)
             except Exception as e:
                 log.error(f"Reconcile: update {rid}: {e}")
     else:
@@ -332,26 +329,21 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
             dedup.mark(f"lark:{rid}")
             index.add(key, rid)
             log.info(f"Reconcile: created Lark {rid} ({key})")
-            if assignee_unmapped and field_mappings.F_ASSIGNEE:
-                history.warn_unmapped_assignee(jira_key=key, name=assignee_name, lark_id=rid,
-                                               outcome="Lark Assignee left empty", type=itype)
         except Exception as e:
             log.error(f"Reconcile: create for {key}: {e}")
 
 
-def _assignee_update(updates: dict, lark_fields: dict, lark_assignee: "str | None",
-                     unmapped: bool) -> bool:
-    """Queue a Lark Assignee set/clear for a sweep. A mapped Jira assignee sets
-    it; an unmapped one clears it; a Jira-UNASSIGNED issue leaves Lark untouched
-    (R8: a Lark-only assignee must survive sweeps) (put is a no-op when the Assignee field
-    is unmapped). Returns True when an unmapped person's clear was queued, i.e.
-    exactly when a warning row is due (never when Lark is already empty)."""
-    if not lark_assignee and not unmapped:
-        return False  # Jira-unassigned: sweeps never clear (R8); only webhooks do
+def _assignee_update(updates: dict, lark_fields: dict, lark_assignee: "str | None") -> None:
+    """Queue a Lark Assignee set for a sweep when it differs. Sweeps never
+    clear: a Jira-UNASSIGNED issue leaves Lark untouched (R8: a Lark-only
+    assignee must survive sweeps), and so does a person who could not be
+    added to the people list (lark_assignee None). An unmapped person was
+    already auto-added by config.lark_assignee_for, so lark_assignee is
+    their name. put is a no-op when the Assignee field is unmapped."""
+    if not lark_assignee:
+        return
     if lark_assignee != _lark_select(lark_fields.get(field_mappings.F_ASSIGNEE)):
-        put(updates, field_mappings.F_ASSIGNEE, [lark_assignee] if lark_assignee else None)
-        return bool(unmapped and field_mappings.F_ASSIGNEE in updates)
-    return False
+        put(updates, field_mappings.F_ASSIGNEE, [lark_assignee])
 
 
 def _link_fields(cfg: dict, jira_key: str) -> dict:
@@ -481,7 +473,7 @@ def _backfill(cfg: dict) -> dict:
         if itype not in allowed_jira:
             continue
         assignee_name = (jf.get("assignee") or {}).get("displayName")
-        lark_assignee, assignee_unmapped = config.lark_assignee_for(assignee_name)
+        lark_assignee, _ = config.lark_assignee_for(assignee_name, jira_key=key, type=itype)
         sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
         jira_status = (jf.get("status") or {}).get("name")
         actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
@@ -513,9 +505,6 @@ def _backfill(cfg: dict) -> dict:
             lark_by_jira_key[key] = {"record_id": rid, "fields": fields}
             created_lark += 1
             log.info(f"backfill: created Lark {rid} for Jira {key}")
-            if assignee_unmapped and field_mappings.F_ASSIGNEE:
-                history.warn_unmapped_assignee(jira_key=key, name=assignee_name, lark_id=rid,
-                                               outcome="Lark Assignee left empty", type=itype)
         except Exception as e:
             log.error(f"backfill: create Lark for {key}: {e}")
 
@@ -578,7 +567,8 @@ def _backfill(cfg: dict) -> dict:
         rid = lark_rec["record_id"]
         cur = lark_rec["fields"]
         assignee_name = (jf.get("assignee") or {}).get("displayName")
-        lark_assignee, assignee_unmapped = config.lark_assignee_for(assignee_name)
+        lark_assignee, _ = config.lark_assignee_for(
+            assignee_name, jira_key=jira_key, type=jf["issuetype"]["name"])
         sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
         jira_status  = (jf.get("status") or {}).get("name")
         actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
@@ -590,7 +580,7 @@ def _backfill(cfg: dict) -> dict:
         parent_jira_key = (jf.get("parent") or {}).get("key")
         parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
         updates: dict = {}
-        warn_assignee = _assignee_update(updates, cur, lark_assignee, assignee_unmapped)
+        _assignee_update(updates, cur, lark_assignee)
         cur_md = cur.get(field_mappings.F_MD)
         # See _sync_issue_to_lark: Lark returns Number fields as strings, so
         # parse through _sp_to_num for a stable numeric compare (no phantom write).
@@ -619,10 +609,6 @@ def _backfill(cfg: dict) -> dict:
                                        cfg["LARK_TABLE_ID"], rid, updates)
                 synced += 1
                 log.info(f"backfill: synced {jira_key} → Lark {rid}")
-                if warn_assignee:
-                    history.warn_unmapped_assignee(jira_key=jira_key, name=assignee_name,
-                                                   lark_id=rid,
-                                                   type=jf["issuetype"]["name"])
             except Exception as e:
                 log.error(f"backfill: sync {rid}: {e}")
 

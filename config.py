@@ -1,11 +1,14 @@
 """Env var loading, field constants, assignee maps."""
 import os
 import json
+import logging
 from datetime import timezone, timedelta
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 load_dotenv()
+
+log = logging.getLogger(__name__)
 
 F_TITLE          = "Title"
 F_START          = "Timeline - Start"
@@ -105,14 +108,53 @@ def lark_to_jira_assignee() -> dict:
     return {v: k for k, v in jira_to_lark_assignee().items()}
 
 
-def lark_assignee_for(display_name: "str | None") -> "tuple[str | None, bool]":
-    """(lark_name_or_None, is_unmapped) for a Jira assignee display name in
-    the CURRENT project. Unassigned -> (None, False); a person absent from the
-    project's people list -> (None, True)."""
+_collision_warned: set = set()
+
+
+def lark_assignee_for(display_name: "str | None", *, jira_key: str = "",
+                      type: str = "") -> "tuple[str | None, bool]":
+    """(lark_name_or_None, leave_unchanged) for a Jira assignee display name
+    in the CURRENT project (Jira->Lark).
+
+    - Unassigned -> (None, False): a webhook update clears Lark, sweeps don't.
+    - In the people list -> (mapped name, False).
+    - Not in the people list -> auto-added as {name: name} to the project's
+      people list (one "Added" history row the first time) -> (name, False).
+    - Not addable -> (None, True): the caller leaves Lark Assignee unchanged.
+      That is the case when the Lark Assignee field is unmapped (nothing is
+      synced) or when `display_name` is already ANOTHER person's Lark name
+      (adding it would make Lark->Jira ambiguous; warned once per process)."""
     if not display_name:
         return None, False
     lark_name = jira_to_lark_assignee().get(display_name)
-    return lark_name, lark_name is None
+    if lark_name is not None:
+        return lark_name, False
+    import field_mappings, history, projects
+    if not field_mappings.F_ASSIGNEE:
+        return None, True
+    pid = projects.current_id()
+    try:
+        outcome = projects.add_assignee(pid, display_name, display_name)
+    except Exception as e:
+        # Persisting failed: still write the true name to Lark; the next
+        # event retries the add.
+        log.error(f"config: could not add '{display_name}' to project {pid} people list: {e}")
+        return display_name, False
+    if outcome == "collision":
+        if (pid, display_name) not in _collision_warned:
+            _collision_warned.add((pid, display_name))
+            history.record(direction="jira→lark", event="config", jira_key=jira_key,
+                           description=f"Assignee '{display_name}' not added: "
+                                       f"'{display_name}' is already the Lark name of "
+                                       f"another person — Lark Assignee unchanged",
+                           status="skipped", type=type)
+        return None, True
+    if outcome == "added":
+        log.info(f"config: added '{display_name}' to project {pid} people list")
+        history.record(direction="jira→lark", event="config", jira_key=jira_key,
+                       description=f"Added '{display_name}' to People list and Lark Assignee",
+                       status="ok", type=type)
+    return jira_to_lark_assignee().get(display_name, display_name), False
 
 
 def get_cfg() -> dict:

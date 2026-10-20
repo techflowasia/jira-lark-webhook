@@ -215,7 +215,13 @@ Draft (sync off) from the end of step 2; nothing syncs until Go live. 1 Name + J
 
 ## Assignee Mapping (per project; default of `ASSIGNEE_MAP` seeds project #1)
 
-Rule: a Jira assignee who is unassigned **or** not in the project's people list clears the Lark Assignee on a **webhook** (an unmapped person also writes a warning row in history). **Sweeps** (reconcile/backfill) clear Lark only for an unmapped person, never merely because the issue is unassigned (ruling R8). A Lark assignee with no Jira mapping leaves Jira unchanged + warning.
+Rule (Jira → Lark, every path: webhook create/update, reconcile, backfill; `config.lark_assignee_for`):
+- **Unassigned** → a **webhook update** clears the Lark Assignee; **sweeps** (reconcile/backfill) leave Lark unchanged (ruling R8).
+- **In the people list** → the mapped Lark name is written.
+- **Not in the people list** → **auto-added**: `{displayName: displayName}` joins the project's `assignee_map` (`projects.add_assignee`: under the registry lock, re-reads the current map, never overwrites an entry), `[displayName]` is written to Lark (via `utils.put`, so an unmapped Assignee field is skipped and nothing is added), and one `config` history row `Added '<name>' to People list and Lark Assignee` is written the first time. Nothing is ever cleared for that person. Exception: if `displayName` is already **another** person's Lark name, nothing is added or written (Lark → Jira would become ambiguous) and one skipped row is logged per process.
+- If Lark rejects the record write because the name is not yet an option of the Assignee select column, `lark_api` adds the option (fresh schema read; the field PUT resends **every** existing option with its id, name and colour, plus the new one) and retries the write once. A write that succeeds never touches the column.
+
+Lark → Jira: a Lark assignee with no Jira mapping leaves Jira unchanged + a rate-limited warning row.
 
 
 | Jira display name | Lark name |
