@@ -173,3 +173,49 @@ def test_bootstrap_copies_reconcile_watermarks(fake_supabase):
 
 def test_bootstrap_without_supabase_returns_env_project(no_supabase):
     assert projects.bootstrap_default().id == 1
+
+
+def test_bootstrap_rerun_repairs_partial_run(fake_supabase):
+    p = projects.bootstrap_default()
+    n_projects = fake_supabase.count("sync_projects")
+    # Simulate a crash after the project insert: stray NULL project_id row,
+    # a missing system row, one watermark missing and one already set.
+    fm = fake_supabase.tables["field_mappings"]
+    fm[:] = [r for r in fm if r["jira_field"] != "status"]
+    fake_supabase.insert_row("field_mappings", {
+        "lark_field": "Custom", "jira_field": "customfield_999", "is_system": False, "project_id": None})
+    fake_supabase.tables["settings"][:] = []
+    fake_supabase.set_setting("last_reconcile_ts", "123")
+    fake_supabase.set_setting("last_full_reconcile_ts", "99")
+    fake_supabase.set_setting("last_full_reconcile_ts:1", "777")
+    fake_supabase.tables["sync_history"] = []
+    again = projects.bootstrap_default()
+    assert again.id == p.id and fake_supabase.count("sync_projects") == n_projects
+    rows = fake_supabase.rows("field_mappings")
+    assert all(r["project_id"] == 1 for r in rows)
+    assert "status" in {r["jira_field"] for r in rows if r["is_system"]}
+    kv = {r["key"]: r["value"] for r in fake_supabase.rows("settings")}
+    assert kv["last_reconcile_ts:1"] == "123"
+    assert kv["last_full_reconcile_ts:1"] == "777"
+    assert fake_supabase.count("sync_history") == 0  # "created" record only once
+
+
+def test_memory_only_mutations_warn_when_supabase_reachable(fake_supabase, caplog):
+    projects.load_all()  # empty table, bootstrap not done -> not persisted
+    with caplog.at_level("WARNING", logger="projects"):
+        projects.update(1, {"lark_table_name": "x"})
+        projects.create({"jira_project_key": "TWO", "lark_base_token": "B2", "lark_table_id": "t2"})
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum("memory-only" in m for m in msgs) == 2
+
+
+def test_no_warning_without_supabase(no_supabase, caplog):
+    projects.load_all()
+    with caplog.at_level("WARNING", logger="projects"):
+        projects.update(1, {"lark_table_name": "x"})
+    assert not caplog.records
+
+
+def test_main_has_no_startup_table_override():
+    import main
+    assert not hasattr(main, "_load_active_table_async")

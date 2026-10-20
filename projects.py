@@ -159,6 +159,13 @@ def _check_unique(fields: dict, exclude_id: "int | None" = None) -> None:
             raise ValueError(f"Lark table {p.lark_table_id} is already synced by project #{p.id}")
 
 
+def _warn_memory_only(op: str, pid: "int | None" = None) -> None:
+    if history._get_client():  # Supabase reachable but registry not persisted
+        log.warning(f"projects.{op}{'' if pid is None else f' (project {pid})'}: registry is not "
+                    "persisted (migration 003 applied but bootstrap not complete?) - "
+                    "change is memory-only and will be lost on restart")
+
+
 def create(fields: dict) -> Project:
     """Create a project. Always starts draft with sync and reconcile off."""
     global _persisted
@@ -177,6 +184,8 @@ def create(fields: dict) -> Project:
     data.setdefault("assignee_map", {})
     with _lock:
         client = history._get_client() if _persisted else None
+        if not client:
+            _warn_memory_only("create")
         if client:
             res = client.table(_TABLE).insert(data).execute()
             p = _from_row(res.data[0])
@@ -198,6 +207,8 @@ def update(pid: int, fields: dict) -> Project:
         merged = {**{k: getattr(cur, k) for k in _COLUMNS}, **changes}
         new = _from_row(merged)
         client = history._get_client() if _persisted else None
+        if not client:
+            _warn_memory_only("update", pid)
         if client and changes:
             client.table(_TABLE).update(changes).eq("id", pid).execute()
         _projects[pid] = new
@@ -265,33 +276,37 @@ def bootstrap_default() -> Project:
         _ensure_loaded()
         return current()
     existing = client.table(_TABLE).select("*").order("id").execute().data or []
-    if existing:
-        load_all()
-        return min(_projects.values(), key=lambda p: p.id)
 
     keys = ["active_table_id", "active_table_name", "sync_enabled", "reconcile_enabled",
             "allowed_jira_types", "allowed_lark_types",
             "last_reconcile_ts", "last_full_reconcile_ts"]
     rows = client.table("settings").select("key,value").in_("key", keys).execute().data or []
     kv = {r["key"]: r["value"] for r in rows}
-    base = _env_project()
-    row = {
-        "name": base.name,
-        "jira_project_key": base.jira_project_key,
-        "jira_board_id": None,
-        "lark_base_token": base.lark_base_token,
-        "lark_table_id": kv.get("active_table_id") or base.lark_table_id,
-        "lark_table_name": kv.get("active_table_name") or "",
-        "sync_enabled": _bool_setting(kv.get("sync_enabled"), True),
-        "reconcile_enabled": _bool_setting(kv.get("reconcile_enabled"), True),
-        "allowed_jira_types": _list_setting(kv.get("allowed_jira_types"), config.DEFAULT_SYNC_TYPES),
-        "allowed_lark_types": _list_setting(kv.get("allowed_lark_types"), config.DEFAULT_SYNC_TYPES),
-        "assignee_map": base.assignee_map,
-        "setup_state": "active",
-    }
-    res = client.table(_TABLE).insert(row).execute()
-    pid = int(res.data[0]["id"])
 
+    created = False
+    if existing:
+        pid = min(int(r["id"]) for r in existing)
+    else:
+        base = _env_project()
+        row = {
+            "name": base.name,
+            "jira_project_key": base.jira_project_key,
+            "jira_board_id": None,
+            "lark_base_token": base.lark_base_token,
+            "lark_table_id": kv.get("active_table_id") or base.lark_table_id,
+            "lark_table_name": kv.get("active_table_name") or "",
+            "sync_enabled": _bool_setting(kv.get("sync_enabled"), True),
+            "reconcile_enabled": _bool_setting(kv.get("reconcile_enabled"), True),
+            "allowed_jira_types": _list_setting(kv.get("allowed_jira_types"), config.DEFAULT_SYNC_TYPES),
+            "allowed_lark_types": _list_setting(kv.get("allowed_lark_types"), config.DEFAULT_SYNC_TYPES),
+            "assignee_map": base.assignee_map,
+            "setup_state": "active",
+        }
+        res = client.table(_TABLE).insert(row).execute()
+        pid = int(res.data[0]["id"])
+        created = True
+
+    # Idempotent repair steps: safe to rerun after a partial earlier run.
     # Adopt existing field mappings and add any system mapping the table lacks.
     client.table("field_mappings").update({"project_id": pid}).is_("project_id", "null").execute()
     have = {r["jira_field"] for r in (client.table("field_mappings").select("jira_field,is_system")
@@ -302,13 +317,19 @@ def bootstrap_default() -> Project:
             client.table("field_mappings").insert(
                 {**{k: v for k, v in d.items() if k != "id"}, "project_id": pid}).execute()
 
-    # Per-project reconcile watermarks, carried over from the global ones.
+    # Per-project reconcile watermarks, carried over from the global ones
+    # only when the per-project key is absent.
+    scoped = [f"{k}:{pid}" for k in ("last_reconcile_ts", "last_full_reconcile_ts")]
+    present = {r["key"] for r in (client.table("settings").select("key,value")
+               .in_("key", scoped).execute().data or [])}
     for k in ("last_reconcile_ts", "last_full_reconcile_ts"):
-        if kv.get(k) is not None:
+        if kv.get(k) is not None and f"{k}:{pid}" not in present:
             client.table("settings").upsert({"key": f"{k}:{pid}", "value": kv[k]}).execute()
 
     load_all()
-    history.record(direction="system", event="config",
-                   description=f"Multi-project bootstrap: created project #{pid} "
-                               f"({row['jira_project_key']} <-> {row['lark_table_id']}) from existing config")
+    if created:
+        p = _projects[pid]
+        history.record(direction="system", event="config",
+                       description=f"Multi-project bootstrap: created project #{pid} "
+                                   f"({p.jira_project_key} <-> {p.lark_table_id}) from existing config")
     return _projects[pid]

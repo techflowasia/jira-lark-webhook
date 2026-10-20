@@ -72,7 +72,6 @@ async def startup() -> None:
     asyncio.create_task(_initial_index_rebuild(cfg))
     asyncio.create_task(_reconcile_loop())
     asyncio.create_task(_keepalive_loop())
-    asyncio.create_task(_load_active_table_async())
     asyncio.create_task(asyncio.to_thread(field_mappings.load))
     asyncio.create_task(asyncio.to_thread(_cfg_mod.load_sync_types))
     asyncio.create_task(asyncio.to_thread(_load_toggle_states))
@@ -88,37 +87,6 @@ async def _initial_index_rebuild(cfg: dict) -> None:
         log.info(f"Index built: {len(index._jira_to_lark)} linked records")
     except Exception as e:
         log.error(f"Initial index rebuild failed (continuing with empty index): {e}")
-
-
-async def _load_active_table_async() -> None:
-    """Load active table from Supabase settings in a background thread, re-index if changed."""
-    import os as _os
-    try:
-        def _fetch():
-            client = history._get_client()
-            if not client:
-                return None, None
-            rows = client.table("settings").select("key,value") \
-                .in_("key", ["active_table_id", "active_table_name"]).execute()
-            kv = {r["key"]: r["value"] for r in (rows.data or [])}
-            return (kv.get("active_table_id") or _os.environ.get("LARK_TABLE_ID", ""),
-                    kv.get("active_table_name") or "")
-
-        tid, name = await asyncio.to_thread(_fetch)
-        if tid and tid != get_cfg()["LARK_TABLE_ID"]:
-            # Table differs from env var — switch and rebuild index
-            set_active_table(tid, name)
-            cfg = get_cfg()
-            token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
-            records = await asyncio.to_thread(
-                lark_api.fetch_all_records, token, cfg["LARK_BASE_TOKEN"], tid)
-            index.rebuild(records)
-            logging.getLogger(__name__).info(
-                f"Active table loaded from DB: '{name}' ({tid}), {len(index._jira_to_lark)} records")
-        elif tid:
-            set_active_table(tid, name)
-    except Exception as e:
-        logging.getLogger(__name__).warning(f"Could not load active table from DB: {e}")
 
 
 async def _keepalive_loop() -> None:
