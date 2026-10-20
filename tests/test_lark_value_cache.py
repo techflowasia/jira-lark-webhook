@@ -276,3 +276,25 @@ def test_delete_record_invalidates_entry():
         lark_api.delete_record("tok", "base", "tbl", "recGONE")
 
     assert "recGONE" not in lark_api._record_cache
+
+
+def _empty_page_response(data: dict):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"code": 0, "data": data}
+    return resp
+
+
+def test_fetch_all_records_empty_table_returns_empty_list():
+    """Lark omits `items` (or sends null) when a table has no records — a new
+    project's empty Base must read as [] instead of crashing setup/backfill."""
+    for data in ({"has_more": False, "total": 0}, {"has_more": False, "items": None, "total": 0}):
+        with patch("lark_api._request", return_value=_empty_page_response(data)):
+            assert lark_api.fetch_all_records("tok", "base", "tbl") == []
+
+
+def test_search_records_modified_since_empty_page_returns_empty_list():
+    with patch("lark_api._request",
+               return_value=_empty_page_response({"has_more": False, "items": None})):
+        assert lark_api.search_records_modified_since("tok", "base", "tbl", "Modified", 0) == []
