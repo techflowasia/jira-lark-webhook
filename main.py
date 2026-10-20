@@ -9,7 +9,7 @@ from datetime import datetime
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
 import lark_api, jira_api, index, reconcile, history, field_mappings
-import lark_handler, jira_handler, projects
+import lark_handler, jira_handler, projects, routing
 import config as _cfg_mod
 from config import get_cfg, set_active_table
 
@@ -19,10 +19,6 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 app = FastAPI()
-
-# Global enable/disable flags
-_sync_enabled: bool = True
-_reconcile_enabled: bool = True
 
 # F_PARENT writes don't round-trip with get_record's read-shape — update_record
 # invalidates the cache entry instead of merging a wrong-shape parent value
@@ -35,20 +31,16 @@ _raw_payloads: deque = deque(maxlen=20)
 
 
 def _load_toggle_states() -> None:
-    global _sync_enabled, _reconcile_enabled
+    """Only the global Lark value-cache flag is global; sync/reconcile toggles
+    live on each Project."""
     try:
         client = history._get_client()
         if not client:
             return
         rows = client.table("settings").select("key,value") \
-            .in_("key", ["sync_enabled", "reconcile_enabled",
-                          "lark_value_cache_enabled"]).execute()
+            .in_("key", ["lark_value_cache_enabled"]).execute()
         for r in (rows.data or []):
-            if r["key"] == "sync_enabled":
-                _sync_enabled = r["value"].lower() != "false"
-            elif r["key"] == "reconcile_enabled":
-                _reconcile_enabled = r["value"].lower() != "false"
-            elif r["key"] == "lark_value_cache_enabled":
+            if r["key"] == "lark_value_cache_enabled":
                 lark_api.set_value_cache_enabled(r["value"].lower() != "false")
     except Exception as e:
         logging.getLogger(__name__).warning(f"Could not load toggle states: {e}")
@@ -63,29 +55,36 @@ async def startup() -> None:
         projects.bootstrap_default()
     except Exception as e:
         log.error(f"Project registry bootstrap failed (using env project): {e}")
-    cfg = get_cfg()
     # Build the in-memory index, but never let a Lark outage crash startup —
     # if the bind fails, Render's port scan kills the container and we never
     # come back. Empty index means new webhooks may arrive unlinked, but the
     # 30-min reconcile loop and the auto-discover path in _handle_update will
     # repair the link as soon as Lark recovers.
-    asyncio.create_task(_initial_index_rebuild(cfg))
+    asyncio.create_task(_initial_index_rebuild())
     asyncio.create_task(_reconcile_loop())
     asyncio.create_task(_keepalive_loop())
     asyncio.create_task(asyncio.to_thread(field_mappings.load))
     asyncio.create_task(asyncio.to_thread(_load_toggle_states))
 
 
-async def _initial_index_rebuild(cfg: dict) -> None:
+async def _initial_index_rebuild() -> None:
+    """Build every project's index sequentially; one project's failure never
+    blocks the others."""
     log = logging.getLogger(__name__)
-    try:
-        token = await asyncio.to_thread(lark_api.get_token, cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
-        records = await asyncio.to_thread(
-            lark_api.fetch_all_records, token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"])
-        index.rebuild(records)
-        log.info(f"Index built: {len(index._jira_to_lark)} linked records")
-    except Exception as e:
-        log.error(f"Initial index rebuild failed (continuing with empty index): {e}")
+    for p in projects.all_projects():
+        try:
+            cfg = projects.cfg_for(p)
+            token = await asyncio.to_thread(
+                lark_api.get_token, cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
+            records = await asyncio.to_thread(
+                lark_api.fetch_all_records, token, p.lark_base_token, p.lark_table_id)
+            with projects.use(p.id):
+                index.rebuild(records)
+                log.info(f"Index built for project {p.id} ({p.jira_project_key}): "
+                         f"{len(index._jira_to_lark)} linked records")
+        except Exception as e:
+            log.error(f"Initial index rebuild failed for project {p.id} "
+                      f"(continuing with empty index): {e}")
 
 
 async def _keepalive_loop() -> None:
@@ -110,18 +109,28 @@ async def _keepalive_loop() -> None:
             log.warning(f"Keepalive ping failed: {e}")
 
 
-async def _reconcile_loop() -> None:
+def _reconcile_all() -> None:
+    """One reconcile pass over every active, reconcile-enabled project.
+    A failure in one project never stops the others."""
     log = logging.getLogger(__name__)
+    for p in projects.all_projects():
+        if not (p.reconcile_enabled and p.setup_state == "active"):
+            log.info(f"Reconcile skipped for project {p.id} — disabled or not active")
+            continue
+        try:
+            reconcile.run(projects.cfg_for(p))
+        except Exception as e:
+            log.error(f"Reconcile failed for project {p.id} ({p.jira_project_key}): {e}")
+
+
+async def _reconcile_loop() -> None:
     while True:
         # 6 h, not 30 min: reconcile is a safety net for missed webhooks, not the
         # primary sync path. At 30 min it alone burned ~21k Lark calls/month and
         # blew the tenant API quota. The dashboard "Run Backfill" button still
         # forces an immediate full reconcile when needed.
         await asyncio.sleep(21600)
-        if _reconcile_enabled:
-            await asyncio.to_thread(reconcile.run, get_cfg())
-        else:
-            log.info("Reconcile skipped — disabled")
+        await asyncio.to_thread(_reconcile_all)
 
 
 @app.get("/auth/start")
@@ -223,7 +232,9 @@ def _b64(s: str) -> str:
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "sync_enabled": _sync_enabled}
+    return {"ok": True,
+            "projects": [{"id": p.id, "sync_enabled": p.sync_enabled}
+                         for p in projects.all_projects()]}
 
 
 @app.get("/api/tables")
@@ -377,39 +388,42 @@ async def api_backfill():
                 "created_lark": 0, "created_jira": 0, "synced": 0, "pairs": [], "error": str(e)}
 
 
+def _flip(pid: int, field: str, label: str) -> None:
+    p = projects.get(pid)
+    if p is None:
+        return
+    new = not getattr(p, field)
+    projects.update(pid, {field: new})
+    state = "enabled" if new else "disabled"
+    logging.getLogger(__name__).info(f"{label} {state} for project {pid} via dashboard toggle")
+    with projects.use(pid):
+        history.record(direction="system", event="config",
+                       description=f"{label} {state} via dashboard")
+
+
+@app.post("/p/{pid}/toggle")
+async def toggle_sync_project(pid: int):
+    _flip(pid, "sync_enabled", "Sync")
+    return RedirectResponse(f"/p/{pid}", status_code=303)
+
+
+@app.post("/p/{pid}/toggle/reconcile")
+async def toggle_reconcile_project(pid: int):
+    _flip(pid, "reconcile_enabled", "Reconcile")
+    return RedirectResponse(f"/p/{pid}", status_code=303)
+
+
 @app.post("/toggle")
 async def toggle_sync():
-    global _sync_enabled
-    _sync_enabled = not _sync_enabled
-    state = "enabled" if _sync_enabled else "disabled"
-    logging.getLogger(__name__).info(f"Sync {state} via dashboard toggle")
-    history.record(direction="system", event="config",
-                   description=f"Sync {state} via dashboard")
-    client = history._get_client()
-    if client:
-        try:
-            client.table("settings").upsert(
-                {"key": "sync_enabled", "value": str(_sync_enabled).lower()}).execute()
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"Could not persist sync_enabled: {e}")
+    """Legacy route: acts on project #1."""
+    _flip(1, "sync_enabled", "Sync")
     return RedirectResponse("/", status_code=303)
 
 
 @app.post("/toggle/reconcile")
 async def toggle_reconcile():
-    global _reconcile_enabled
-    _reconcile_enabled = not _reconcile_enabled
-    state = "enabled" if _reconcile_enabled else "disabled"
-    logging.getLogger(__name__).info(f"Reconcile {state} via dashboard toggle")
-    history.record(direction="system", event="config",
-                   description=f"Reconcile {state} via dashboard")
-    client = history._get_client()
-    if client:
-        try:
-            client.table("settings").upsert(
-                {"key": "reconcile_enabled", "value": str(_reconcile_enabled).lower()}).execute()
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"Could not persist reconcile_enabled: {e}")
+    """Legacy route: acts on project #1."""
+    _flip(1, "reconcile_enabled", "Reconcile")
     return RedirectResponse("/", status_code=303)
 
 
@@ -437,6 +451,10 @@ async def dashboard(request: Request):
     from datetime import timezone, timedelta
     cfg = get_cfg()
     linked = len(index._jira_to_lark)
+    # Until the per-project dashboard lands, show project #1's toggles.
+    _p1 = projects.get(1) or projects.current()
+    _sync_enabled = _p1.sync_enabled
+    _reconcile_enabled = _p1.reconcile_enabled
 
     # --- Parse filter params ---
     range_param  = request.query_params.get("range", "1d")
@@ -1279,68 +1297,86 @@ async def debug_rebuild():
     return {"rebuilt": True, "linked_count": len(index._jira_to_lark)}
 
 
+def _capture(source: str, body, p) -> None:
+    _raw_payloads.appendleft({"source": source, "body": body,
+                              "routed": p.id if p is not None else None})
+
+
+def _not_live(source: str, body, p) -> dict:
+    logging.getLogger(__name__).info(f"{source} webhook ignored — no live project")
+    _raw_payloads.appendleft({"source": source, "body": body, "routed": None})
+    return {"ok": True, "note": "no live project"}
+
+
 @app.post("/webhook/lark")
 async def recv_lark(request: Request, bg: BackgroundTasks):
     body = await request.json()
-    _raw_payloads.appendleft({"source": "lark", "body": body})
     logging.getLogger(__name__).info(f"Lark webhook received: {json.dumps(body)[:500]}")
 
     if body.get("type") == "url_verification":
+        _raw_payloads.appendleft({"source": "lark", "body": body, "routed": None})
         return {"challenge": body["challenge"]}
 
-    if not _sync_enabled:
-        logging.getLogger(__name__).info("Lark webhook ignored — sync disabled")
-        return {"ok": True, "note": "sync disabled"}
-
     event = body.get("event", {})
-    cfg = get_cfg()
+    p = routing.route_lark_event(event)
+    if not routing.is_live(p):
+        return _not_live("lark", body, p)
+    _capture("lark", body, p)
+
+    cfg = projects.cfg_for(p)
     action_list = event.get("action_list", [])
     logging.getLogger(__name__).info(
-        f"Lark event: table_id={event.get('table_id')} actions={len(action_list)}"
+        f"Lark event: project={p.id} table_id={event.get('table_id')} actions={len(action_list)}"
     )
     for action in action_list:
         bg.add_task(lark_handler.process, action, event.get("table_id"), cfg)
     return {"ok": True}
 
 
-@app.post("/webhook/lark-auto")
-async def recv_lark_auto(request: Request, bg: BackgroundTasks):
-    """Receives webhooks from Lark Base Automation (no bot file-access needed).
-    Body: {"action": "record_added|record_edited|record_deleted", "record_id": "...", "table_id": "..."}
-    """
+async def _recv_lark_auto(request: Request, bg: BackgroundTasks, project_id):
     body = await request.json()
-    _raw_payloads.appendleft({"source": "lark-auto", "body": body})
-    logging.getLogger(__name__).info(f"Lark-auto webhook: {body}")
-
-    if not _sync_enabled:
-        return {"ok": True, "note": "sync disabled"}
+    logging.getLogger(__name__).info(f"Lark-auto webhook (project {project_id}): {body}")
+    p = routing.route_lark_auto(body, project_id)
+    if not routing.is_live(p):
+        return _not_live("lark-auto", body, p)
+    _capture("lark-auto", body, p)
 
     action = {
         "action":    body.get("action", "record_edited"),
         "record_id": body.get("record_id", ""),
     }
-    table_id = body.get("table_id", get_cfg().get("LARK_TABLE_ID", ""))
-    cfg = get_cfg()
-    bg.add_task(lark_handler.process, action, table_id, cfg)
+    bg.add_task(lark_handler.process, action, p.lark_table_id, projects.cfg_for(p))
     return {"ok": True}
+
+
+@app.post("/webhook/lark-auto")
+async def recv_lark_auto(request: Request, bg: BackgroundTasks):
+    """Receives webhooks from Lark Base Automation (no bot file-access needed).
+    Legacy URL: routes to project #1 (or by table_id within project #1's Base).
+    Body: {"action": "record_added|record_edited|record_deleted", "record_id": "...", "table_id": "..."}
+    """
+    return await _recv_lark_auto(request, bg, None)
+
+
+@app.post("/webhook/lark-auto/{project_id}")
+async def recv_lark_auto_project(project_id: int, request: Request, bg: BackgroundTasks):
+    return await _recv_lark_auto(request, bg, project_id)
 
 
 @app.post("/webhook/jira")
 async def recv_jira(request: Request, bg: BackgroundTasks):
     body = await request.json()
-    _raw_payloads.appendleft({"source": "jira", "body": body})
     logging.getLogger(__name__).info(
         f"Jira webhook received: event={body.get('webhookEvent')} key={body.get('issue',{}).get('key')}"
     )
+    p = routing.route_jira(body)
+    if not routing.is_live(p):
+        return _not_live("jira", body, p)
+    _capture("jira", body, p)
 
-    if not _sync_enabled:
-        logging.getLogger(__name__).info("Jira webhook ignored — sync disabled")
-        return {"ok": True, "note": "sync disabled"}
-
-    cfg = get_cfg()
     bg.add_task(jira_handler.process,
                 body.get("webhookEvent"),
                 body.get("issue", {}),
                 body.get("changelog", {}),
-                cfg)
+                projects.cfg_for(p))
     return {"ok": True}
