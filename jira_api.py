@@ -114,6 +114,9 @@ def get_project_versions(cfg: dict) -> list:
 
 
 def get_board_id(cfg: dict) -> "str | None":
+    """The project's configured board, else the first board Jira lists."""
+    if cfg.get("JIRA_BOARD_ID"):
+        return str(cfg["JIRA_BOARD_ID"])
     resp = requests.get(_url(cfg, "/rest/agile/1.0/board"),
                         params={"projectKeyOrId": cfg["JIRA_PROJECT"]},
                         auth=_auth(cfg))

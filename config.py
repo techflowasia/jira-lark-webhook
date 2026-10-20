@@ -65,11 +65,9 @@ JIRA_TO_LARK_ASSIGNEE = _env_json("ASSIGNEE_MAP", {
     "Moe Pyae Pyae Kyaw":      "Iris",
     "Waritsara Matnok":        "Min",
 })
+# Seed for project #1 only (projects._env_project / bootstrap). At runtime use
+# jira_to_lark_assignee() / lark_to_jira_assignee(), which read the current project.
 LARK_TO_JIRA_ASSIGNEE = {v: k for k, v in JIRA_TO_LARK_ASSIGNEE.items()}
-
-
-_allowed_jira_types: set = set(DEFAULT_SYNC_TYPES)
-_allowed_lark_types: set = set(DEFAULT_SYNC_TYPES)
 
 
 def set_active_table(table_id: str, table_name: str = "") -> None:
@@ -81,43 +79,30 @@ def set_active_table(table_id: str, table_name: str = "") -> None:
 
 
 def get_allowed_jira_types() -> set:
-    return set(_allowed_jira_types)
+    import projects
+    return set(projects.current().allowed_jira_types)
 
 
 def get_allowed_lark_types() -> set:
-    return set(_allowed_lark_types)
-
-
-def load_sync_types() -> None:
-    global _allowed_jira_types, _allowed_lark_types
-    try:
-        import history
-        client = history._get_client()
-        if not client:
-            return
-        rows = client.table("settings").select("*").in_(
-            "key", ["allowed_jira_types", "allowed_lark_types"]).execute()
-        for row in (rows.data or []):
-            if row["key"] == "allowed_jira_types":
-                _allowed_jira_types = set(json.loads(row["value"]))
-            elif row["key"] == "allowed_lark_types":
-                _allowed_lark_types = set(json.loads(row["value"]))
-    except Exception:
-        pass  # keep defaults on any error
+    import projects
+    return set(projects.current().allowed_lark_types)
 
 
 def save_sync_types(jira_types: list, lark_types: list) -> None:
-    global _allowed_jira_types, _allowed_lark_types
-    import history
-    client = history._get_client()
-    if not client:
-        raise RuntimeError("Supabase not configured")
-    client.table("settings").upsert(
-        {"key": "allowed_jira_types", "value": json.dumps(jira_types)}).execute()
-    client.table("settings").upsert(
-        {"key": "allowed_lark_types", "value": json.dumps(lark_types)}).execute()
-    _allowed_jira_types = set(jira_types)
-    _allowed_lark_types = set(lark_types)
+    """Save the CURRENT project's allowed sync types."""
+    import projects
+    projects.update(projects.current_id(), {"allowed_jira_types": list(jira_types),
+                                            "allowed_lark_types": list(lark_types)})
+
+
+def jira_to_lark_assignee() -> dict:
+    """The CURRENT project's Jira display name -> Lark name map."""
+    import projects
+    return dict(projects.current().assignee_map)
+
+
+def lark_to_jira_assignee() -> dict:
+    return {v: k for k, v in jira_to_lark_assignee().items()}
 
 
 def get_cfg() -> dict:

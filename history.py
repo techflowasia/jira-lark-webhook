@@ -30,13 +30,24 @@ def _get_client():
         return None
 
 
+def _current_project_id() -> "int | None":
+    try:
+        import projects  # lazy: projects imports history
+        return projects.current_id()
+    except Exception as e:
+        log.warning(f"history: could not resolve current project: {e}")
+        return None
+
+
 def record(*, direction: str, event: str, lark_id: str = "",
            jira_key: str = "", description: str, status: str = "ok",
            error: str = "", type: str = "") -> None:
     ts_str = datetime.now(_TZ7).strftime(_TS_FMT)
+    project_id = _current_project_id()
     mem = {"ts": ts_str, "direction": direction, "event": event,
            "lark_id": lark_id, "jira_key": jira_key, "type": type,
-           "description": description, "status": status, "error": error}
+           "description": description, "status": status, "error": error,
+           "project_id": project_id}
     _fallback.appendleft(mem)
 
     client = _get_client()
@@ -45,35 +56,39 @@ def record(*, direction: str, event: str, lark_id: str = "",
             "direction": direction, "event": event,
             "lark_id": lark_id, "jira_key": jira_key, "type": type,
             "description": description, "status": status, "error": error,
+            "project_id": project_id,
         }
-        try:
-            client.table("sync_history").insert(payload).execute()
-        except Exception as e:
-            msg = str(e)
-            if "type" in msg and ("column" in msg.lower() or "schema" in msg.lower()):
-                log.warning(
-                    "history.record: 'type' column missing from sync_history — "
-                    "dropping field and retrying. Run: "
-                    "ALTER TABLE sync_history ADD COLUMN type text; "
-                    "(see migrations/001_add_type_column.sql)"
-                )
-                payload.pop("type", None)
-                try:
-                    client.table("sync_history").insert(payload).execute()
+        # A column missing from sync_history (migration 001 / 003 not applied)
+        # must not lose the event: drop that column and retry.
+        for _ in range(3):
+            try:
+                client.table("sync_history").insert(payload).execute()
+                return
+            except Exception as e:
+                msg = str(e)
+                missing = next((c for c in ("project_id", "type") if c in payload and c in msg
+                                and ("column" in msg.lower() or "schema" in msg.lower())), None)
+                if missing is None:
+                    log.warning(f"history.record Supabase insert failed: {e}")
                     return
-                except Exception as e2:
-                    log.warning(f"history.record Supabase insert (retry) failed: {e2}")
-                    return
-            log.warning(f"history.record Supabase insert failed: {e}")
+                hint = {"type": "migrations/001_add_type_column.sql",
+                        "project_id": "migrations/003_multi_project.sql"}[missing]
+                log.warning(f"history.record: '{missing}' column missing from sync_history — "
+                            f"dropping field and retrying. Run {hint}")
+                payload.pop(missing)
 
 
 def query(from_dt: "datetime | None" = None, to_dt: "datetime | None" = None,
-          jira_key: str = "", page: int = 1, page_size: int = 50) -> dict:
-    """Return {rows, total, page, pages} from Supabase (falls back to in-memory)."""
+          jira_key: str = "", page: int = 1, page_size: int = 50,
+          project_id: "int | None" = None) -> dict:
+    """Return {rows, total, page, pages} from Supabase (falls back to in-memory).
+    project_id filters to one project's rows when given."""
     client = _get_client()
     if client:
         try:
             q = client.table("sync_history").select("*", count="exact")
+            if project_id is not None:
+                q = q.eq("project_id", project_id)
             if from_dt:
                 q = q.gte("ts", from_dt.isoformat())
             if to_dt:
@@ -98,11 +113,13 @@ def query(from_dt: "datetime | None" = None, to_dt: "datetime | None" = None,
         except Exception as e:
             log.warning(f"history.query Supabase failed: {e}")
 
-    return _fallback_query(from_dt, to_dt, jira_key, page, page_size)
+    return _fallback_query(from_dt, to_dt, jira_key, page, page_size, project_id)
 
 
-def _fallback_query(from_dt, to_dt, jira_key, page, page_size):
+def _fallback_query(from_dt, to_dt, jira_key, page, page_size, project_id=None):
     rows = list(_fallback)
+    if project_id is not None:
+        rows = [r for r in rows if r.get("project_id") == project_id]
     if jira_key:
         rows = [r for r in rows if jira_key.lower() in r.get("jira_key", "").lower()]
     if from_dt or to_dt:
@@ -122,6 +139,21 @@ def _fallback_query(from_dt, to_dt, jira_key, page, page_size):
     offset = (page - 1) * page_size
     pages = max(1, (total + page_size - 1) // page_size)
     return {"rows": rows[offset:offset + page_size], "total": total, "page": page, "pages": pages}
+
+
+def error_count(project_id: int, since: datetime) -> int:
+    """Number of status='error' history rows of one project since `since`."""
+    client = _get_client()
+    if client:
+        try:
+            res = (client.table("sync_history").select("id", count="exact")
+                   .eq("project_id", project_id).eq("status", "error")
+                   .gte("ts", since.isoformat()).execute())
+            return res.count or 0
+        except Exception as e:
+            log.warning(f"history.error_count Supabase failed: {e}")
+    rows = _fallback_query(since, None, "", 1, max(1, len(_fallback)), project_id)["rows"]
+    return sum(1 for r in rows if r.get("status") == "error")
 
 
 def recent(n: int = 200) -> list:

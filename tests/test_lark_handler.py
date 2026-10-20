@@ -722,7 +722,7 @@ def test_new_sprint_synced_when_stale_cache_misses(mock_lark, mock_jira):
     index._jira_to_lark["PROJ-90"] = "recSP"
 
     # Cache is fresh (expires in the future) but does NOT contain the new sprint.
-    lark_handler._sprint_cache.update(
+    lark_handler._slot(lark_handler._sprint_cache).update(
         {"data": {"old sprint": 11}, "expires_at": _t.time() + 3600,
          "last_forced": 0})
 
@@ -753,7 +753,7 @@ def test_forced_refresh_throttled_for_version_only_release(mock_lark, mock_jira)
     index._lark_to_jira["recVO"] = "PROJ-91"
     index._jira_to_lark["PROJ-91"] = "recVO"
 
-    lark_handler._sprint_cache.update(
+    lark_handler._slot(lark_handler._sprint_cache).update(
         {"data": {"some sprint": 5}, "expires_at": _t.time() + 3600,
          "last_forced": _t.time()})  # just force-refreshed → throttled
 

@@ -4,8 +4,8 @@ import logging
 import time
 from datetime import datetime
 from collections import Counter
-import lark_api, jira_api, index, dedup, config, history, field_mappings
-from config import (JIRA_TO_LARK_ASSIGNEE, LARK_TO_JIRA_ASSIGNEE, LOCAL_TZ,
+import lark_api, jira_api, index, dedup, config, history, field_mappings, projects
+from config import (LOCAL_TZ,
                     JF_START, JF_STORY_POINTS, JF_ACTUAL_START, JF_ACTUAL_END, JF_SPRINT)
 from utils import (_lark_text, _lark_select, _jira_datetime_to_lark_ts,
                    _jira_date_to_lark_ts, _lark_ts_to_jira_date,
@@ -21,7 +21,14 @@ _FULL_SWEEP_INTERVAL_MS = 24 * 3600 * 1000
 _INCREMENTAL_BUFFER_MS = 10 * 60 * 1000
 
 
+def _wm(key: str) -> str:
+    """Reconcile watermarks are per project: settings key `last_reconcile_ts:1`."""
+    return f"{key}:{projects.current_id()}"
+
+
 def _get_setting(key: str) -> "str | None":
+    """Read the CURRENT project's watermark `key`."""
+    key = _wm(key)
     client = history._get_client()
     if not client:
         return None
@@ -34,6 +41,8 @@ def _get_setting(key: str) -> "str | None":
 
 
 def _set_setting(key: str, value: str) -> None:
+    """Write the CURRENT project's watermark `key`."""
+    key = _wm(key)
     client = history._get_client()
     if not client:
         return
@@ -51,6 +60,11 @@ def _ms_to_jira_jql(ts_ms: int) -> str:
 
 
 def run(cfg: dict) -> None:
+    with projects.use(cfg["PROJECT_ID"] if "PROJECT_ID" in cfg else projects.current_id()):
+        _run(cfg)
+
+
+def _run(cfg: dict) -> None:
     """Dispatcher: full sweep daily, lightweight incremental in between.
 
     Falls back to a full sweep whenever the incremental path can't be trusted
@@ -220,7 +234,7 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
     itype = jf["issuetype"]["name"]
 
     assignee_name = (jf.get("assignee") or {}).get("displayName")
-    lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
+    lark_assignee = config.jira_to_lark_assignee().get(assignee_name) if assignee_name else None
     sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
     jira_status = (jf.get("status") or {}).get("name")
     actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
@@ -302,6 +316,11 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
 
 
 def backfill(cfg: dict) -> dict:
+    with projects.use(cfg["PROJECT_ID"] if "PROJECT_ID" in cfg else projects.current_id()):
+        return _backfill(cfg)
+
+
+def _backfill(cfg: dict) -> dict:
     """Bidirectional backfill for pre-existing unlinked records.
 
     Steps:
@@ -417,7 +436,7 @@ def backfill(cfg: dict) -> dict:
         if itype not in allowed_jira:
             continue
         assignee_name = (jf.get("assignee") or {}).get("displayName")
-        lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
+        lark_assignee = config.jira_to_lark_assignee().get(assignee_name) if assignee_name else None
         sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
         jira_status = (jf.get("status") or {}).get("name")
         actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
@@ -470,7 +489,7 @@ def backfill(cfg: dict) -> dict:
             except Exception:
                 account_ids = {}
         assignee_lark = _lark_select(rec["fields"].get(field_mappings.F_ASSIGNEE))
-        jira_name = LARK_TO_JIRA_ASSIGNEE.get(assignee_lark, "") if assignee_lark else ""
+        jira_name = config.lark_to_jira_assignee().get(assignee_lark, "") if assignee_lark else ""
         assignee_id = account_ids.get(jira_name)
         start = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_START), tz_hours)
         end   = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_END), tz_hours)
@@ -503,7 +522,7 @@ def backfill(cfg: dict) -> dict:
         rid = lark_rec["record_id"]
         cur = lark_rec["fields"]
         assignee_name = (jf.get("assignee") or {}).get("displayName")
-        lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
+        lark_assignee = config.jira_to_lark_assignee().get(assignee_name) if assignee_name else None
         sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
         jira_status  = (jf.get("status") or {}).get("name")
         actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))

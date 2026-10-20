@@ -14,9 +14,10 @@ log = logging.getLogger(__name__)
 LARK_BASE_URL = LARK_API_BASE
 _token_cache = {"token": None, "expires_at": 0}
 
-# Cached Base timezone offset (hours from UTC). Populated by get_base_tz_hours().
+# Cached Base timezone offset (hours from UTC) per base token:
+# {base_token: {"offset", "expires_at"}}. Populated by get_base_tz_hours().
 # If unavailable, defaults to 0 (UTC) preserving legacy behavior.
-_base_tz_cache: dict = {"offset": 0, "expires_at": 0}
+_base_tz_cache: dict = {}
 
 
 def _iana_to_offset(tz_name: str) -> float:
@@ -45,8 +46,8 @@ def _iana_to_offset(tz_name: str) -> float:
 
 
 def invalidate_base_tz_cache() -> None:
-    """Force re-fetch of the Base timezone on next call."""
-    _base_tz_cache["expires_at"] = 0
+    """Force re-fetch of every Base timezone on next call."""
+    _base_tz_cache.clear()
 
 
 def get_base_tz_hours(token: str, base_token: str) -> float:
@@ -56,8 +57,9 @@ def get_base_tz_hours(token: str, base_token: str) -> float:
     Returns the offset (e.g. 7.0 for UTC+7 Bangkok), or 0.0 on error/unknown.
     """
     now = time.time()
-    if now < _base_tz_cache["expires_at"]:
-        return _base_tz_cache["offset"]
+    cached = _base_tz_cache.get(base_token)
+    if cached and now < cached["expires_at"]:
+        return cached["offset"]
     try:
         url = f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}"
         resp = _request("GET", url, headers=_headers(token))
@@ -71,7 +73,7 @@ def get_base_tz_hours(token: str, base_token: str) -> float:
             offset = _iana_to_offset(tz_name)
         else:
             offset = 0.0
-        _base_tz_cache.update({"offset": offset, "expires_at": now + 3600})
+        _base_tz_cache[base_token] = {"offset": offset, "expires_at": now + 3600}
         log.info(f"lark_api: Base timezone = '{tz_name}' (offset UTC{offset:+g}h)")
         return offset
     except Exception as e:

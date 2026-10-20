@@ -3,16 +3,22 @@ import json
 import time
 import threading
 import logging
-import lark_api, jira_api, index, dedup, history, field_mappings, config
-from config import (LARK_TO_JIRA_ASSIGNEE, LARK_API_HOST,
+import lark_api, jira_api, index, dedup, history, field_mappings, config, projects
+from config import (LARK_API_HOST,
                     JF_START, JF_SPRINT)
 from utils import _lark_text, _lark_select, _lark_ts_to_jira_date, _norm, _lark_link_rid
 
 log = logging.getLogger(__name__)
 
-_account_ids_cache: dict = {"data": None, "expires_at": 0}
-_version_cache: dict = {"data": {}, "expires_at": 0}
-_sprint_cache: dict = {"data": {}, "expires_at": 0}
+# Jira lookup caches, one slot per project id (see _slot).
+_account_ids_cache: dict = {}
+_version_cache: dict = {}
+_sprint_cache: dict = {}
+
+
+def _slot(cache: dict) -> dict:
+    """The current project's entry in one of the caches above."""
+    return cache.setdefault(projects.current_id(), {"data": None, "expires_at": 0})
 
 # Serializes concurrent record_added handlers for the same rid. Lark sometimes
 # delivers the same event multiple times in parallel; without this guard each
@@ -26,17 +32,19 @@ _create_lock = threading.Lock()
 # the parallel calls trip Lark's per-Base QPS cap (429s in history). When a
 # handler is already in flight, additional events just flag a re-run so the
 # in-flight handler does one more pass with fresh state at the end.
-_update_in_flight: set[str] = set()
-_update_pending: set[str] = set()
+# Keyed by (project id, rid).
+_update_in_flight: set = set()
+_update_pending: set = set()
 _update_lock = threading.Lock()
 
 
 def _get_account_ids(cfg: dict) -> dict:
     now = time.time()
-    if _account_ids_cache["data"] and now < _account_ids_cache["expires_at"]:
-        return _account_ids_cache["data"]
+    cache = _slot(_account_ids_cache)
+    if cache["data"] and now < cache["expires_at"]:
+        return cache["data"]
     data = jira_api.get_account_ids(cfg)
-    _account_ids_cache.update({"data": data, "expires_at": now + 3600})
+    cache.update({"data": data, "expires_at": now + 3600})
     return data
 
 
@@ -48,27 +56,29 @@ _FORCED_REFRESH_INTERVAL = 60
 
 def _get_version_map(cfg: dict, force: bool = False) -> dict:
     now = time.time()
-    if not force and _version_cache["data"] and now < _version_cache["expires_at"]:
-        return _version_cache["data"]
+    cache = _slot(_version_cache)
+    if not force and cache["data"] and now < cache["expires_at"]:
+        return cache["data"]
     try:
         data = {_norm(v["name"]): v["id"] for v in jira_api.get_project_versions(cfg)}
     except Exception:
         data = {}
-    _version_cache.update({"data": data, "expires_at": now + 3600})
+    cache.update({"data": data, "expires_at": now + 3600})
     return data
 
 
 def _get_sprint_map(cfg: dict, force: bool = False) -> dict:
     now = time.time()
-    if not force and _sprint_cache["data"] and now < _sprint_cache["expires_at"]:
-        return _sprint_cache["data"]
+    cache = _slot(_sprint_cache)
+    if not force and cache["data"] and now < cache["expires_at"]:
+        return cache["data"]
     try:
         bid = jira_api.get_board_id(cfg)
         data = ({_norm(s["name"]): s["id"] for s in jira_api.get_board_sprints(cfg, bid)}
                 if bid else {})
     except Exception:
         data = {}
-    _sprint_cache.update({"data": data, "expires_at": now + 3600})
+    cache.update({"data": data, "expires_at": now + 3600})
     return data
 
 
@@ -265,6 +275,11 @@ def _decode_after_value(after_value, token, cfg, before_value=None, record_id=No
 
 
 def process(action: dict, table_id: str, cfg: dict) -> None:
+    with projects.use(cfg["PROJECT_ID"] if "PROJECT_ID" in cfg else projects.current_id()):
+        _process(action, table_id, cfg)
+
+
+def _process(action: dict, table_id: str, cfg: dict) -> None:
     act = action.get("action")
     rid = action.get("record_id", "")
     if table_id and table_id != cfg.get("LARK_TABLE_ID"):
@@ -344,7 +359,7 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
         parent_jira_key = _resolve_parent(rec) if itype in ("Story", "Task") else None
 
         assignee_lark = _lark_select(rec["fields"].get(field_mappings.F_ASSIGNEE))
-        jira_name = LARK_TO_JIRA_ASSIGNEE.get(assignee_lark, "")
+        jira_name = config.lark_to_jira_assignee().get(assignee_lark, "")
         assignee_id = _get_account_ids(cfg).get(jira_name)
 
         new_key = jira_api.create_issue(cfg, itype, title,
@@ -382,26 +397,27 @@ def _handle_update(rid: str, table_id: str, cfg: dict,
     # get_record). The coalesced re-run intentionally passes after_value=None so
     # it re-reads fresh full state via get_record — the coalesced events that
     # triggered the re-run carried their own (now-discarded) payloads.
+    key = (projects.current_id(), rid)
     with _update_lock:
-        if rid in _update_in_flight:
-            _update_pending.add(rid)
+        if key in _update_in_flight:
+            _update_pending.add(key)
             log.info(f"lark_handler: coalescing update {rid} — handler already in flight")
             return
-        _update_in_flight.add(rid)
+        _update_in_flight.add(key)
     try:
         _handle_update_impl(rid, table_id, cfg,
                             after_value=after_value, before_value=before_value)
         while True:
             with _update_lock:
-                if rid not in _update_pending:
+                if key not in _update_pending:
                     break
-                _update_pending.discard(rid)
+                _update_pending.discard(key)
             _handle_update_impl(rid, table_id, cfg,
                                 after_value=None, before_value=None)
     finally:
         with _update_lock:
-            _update_in_flight.discard(rid)
-            _update_pending.discard(rid)
+            _update_in_flight.discard(key)
+            _update_pending.discard(key)
 
 
 def _handle_update_impl(rid: str, table_id: str, cfg: dict,
@@ -489,7 +505,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
 
     assignee_lark = _lark_select(rec["fields"].get(field_mappings.F_ASSIGNEE))
     if assignee_lark:
-        jira_name = LARK_TO_JIRA_ASSIGNEE.get(assignee_lark, "")
+        jira_name = config.lark_to_jira_assignee().get(assignee_lark, "")
         account_id = _get_account_ids(cfg).get(jira_name)
         if account_id:
             current_account_id = (jira_fields.get("assignee") or {}).get("accountId")
@@ -500,7 +516,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     release_raw = (_lark_text(rec["fields"].get(field_mappings.F_RELEASE))
                    or _lark_select(rec["fields"].get(field_mappings.F_RELEASE)))
     if release_raw:
-        vid = _resolve_id(_version_cache, _get_version_map, cfg, _norm(release_raw))
+        vid = _resolve_id(_slot(_version_cache), _get_version_map, cfg, _norm(release_raw))
         if vid:
             current_version_ids = [v["id"] for v in (jira_fields.get("fixVersions") or [])]
             if vid not in current_version_ids:
@@ -581,7 +597,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     # "new sprint doesn't sync" bug.
     sid = None
     if release_raw:
-        sid = _resolve_id(_sprint_cache, _get_sprint_map, cfg, _norm(release_raw))
+        sid = _resolve_id(_slot(_sprint_cache), _get_sprint_map, cfg, _norm(release_raw))
         if sid:
             current_sprint_ids = [s.get("id") for s in
                                   (jira_fields.get(JF_SPRINT) or [])]

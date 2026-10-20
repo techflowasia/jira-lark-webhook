@@ -151,3 +151,36 @@ def fake_supabase(monkeypatch):
     fake = FakeSupabase()
     monkeypatch.setattr(history, "_get_client", lambda: fake)
     return fake
+
+
+P2_BASE, P2_TABLE = "base2", "tbl2"
+P2_ASSIGNEES = {"Ada Lovelace": "Ada"}
+P2_TYPES = ["Epic", "Bug"]
+
+
+@pytest.fixture
+def two_projects():
+    """Registry with the env project #1 plus a project #2 (`base2`/`tbl2`,
+    Lark Title column named "Name", its own people and sync types).
+    Works alone (in-memory registry) or after `fake_supabase`. Restores the
+    registry and every per-project cache it touched afterwards."""
+    import field_mappings, index, lark_handler, projects
+    saved = (projects._projects, projects._persisted, dict(field_mappings._by_project))
+    projects._projects, projects._persisted = {}, False
+    projects.load_all()
+    p2 = projects.create({"name": "Two", "jira_project_key": "TWO",
+                          "lark_base_token": P2_BASE, "lark_table_id": P2_TABLE})
+    p2 = projects.update(p2.id, {"assignee_map": dict(P2_ASSIGNEES),
+                                 "allowed_jira_types": list(P2_TYPES),
+                                 "allowed_lark_types": list(P2_TYPES),
+                                 "sync_enabled": True, "setup_state": "active"})
+    field_mappings._by_project[p2.id] = [
+        dict(d, lark_field="Name") if d["jira_field"] == "summary" else dict(d)
+        for d in field_mappings._DEFAULTS]
+    yield projects.get(min(projects._projects)), p2
+    for cache in (index._maps, lark_handler._account_ids_cache,
+                  lark_handler._version_cache, lark_handler._sprint_cache):
+        cache.pop(p2.id, None)
+    projects._projects, projects._persisted, fm = saved
+    field_mappings._by_project.clear()
+    field_mappings._by_project.update(fm)

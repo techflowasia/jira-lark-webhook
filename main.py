@@ -73,7 +73,6 @@ async def startup() -> None:
     asyncio.create_task(_reconcile_loop())
     asyncio.create_task(_keepalive_loop())
     asyncio.create_task(asyncio.to_thread(field_mappings.load))
-    asyncio.create_task(asyncio.to_thread(_cfg_mod.load_sync_types))
     asyncio.create_task(asyncio.to_thread(_load_toggle_states))
 
 

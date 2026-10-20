@@ -1,8 +1,7 @@
 """Jira webhook events → Lark actions."""
 import logging
-import lark_api, index, dedup, history, field_mappings, config
-from config import (JIRA_TO_LARK_ASSIGNEE,
-                    JF_START, JF_STORY_POINTS, JF_ACTUAL_START, JF_ACTUAL_END, JF_SPRINT)
+import lark_api, index, dedup, history, field_mappings, config, projects
+from config import (JF_START, JF_STORY_POINTS, JF_ACTUAL_START, JF_ACTUAL_END, JF_SPRINT)
 from utils import (_jira_datetime_to_lark_ts, _jira_date_to_lark_ts,
                    _lark_ts_to_jira_date, _lark_text, _lark_select,
                    _lark_link_rid, _lark_multi)
@@ -28,6 +27,11 @@ RELEVANT_CHANGELOG_FIELDS = {
 
 
 def process(event: str, issue: dict, changelog: dict, cfg: dict) -> None:
+    with projects.use(cfg["PROJECT_ID"] if "PROJECT_ID" in cfg else projects.current_id()):
+        _process(event, issue, changelog, cfg)
+
+
+def _process(event: str, issue: dict, changelog: dict, cfg: dict) -> None:
     key = issue.get("key", "")
     itype = ((issue.get("fields") or {}).get("issuetype") or {}).get("name", "")
     log.info(f"jira_handler: event={event} key={key}")
@@ -57,7 +61,7 @@ def _handle_create(issue: dict, cfg: dict) -> None:
         return
 
     assignee_name = (jf.get("assignee") or {}).get("displayName")
-    lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
+    lark_assignee = config.jira_to_lark_assignee().get(assignee_name) if assignee_name else None
     sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
     jira_status = (jf.get("status") or {}).get("name")
     actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
@@ -135,7 +139,7 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
                 updates[field_mappings.F_TITLE] = to_str
 
         elif field == "assignee":
-            lark_a = JIRA_TO_LARK_ASSIGNEE.get(to_str) if to_str else None
+            lark_a = config.jira_to_lark_assignee().get(to_str) if to_str else None
             if lark_a != _lark_select(lark_fields.get(field_mappings.F_ASSIGNEE)):
                 updates[field_mappings.F_ASSIGNEE] = [lark_a] if lark_a else None
 

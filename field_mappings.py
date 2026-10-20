@@ -1,11 +1,24 @@
-"""Field mapping cache — loads from Supabase, falls back to hardcoded defaults."""
+"""Field mapping cache — loads from Supabase, falls back to hardcoded defaults.
+
+Mappings are per project (`field_mappings.project_id`). Every reader uses the
+CURRENT project's rows (see projects.use); `field_mappings._cache` is that
+project's list.
+"""
 import logging
+import sys
+import types
 import config
 import history
+import projects
 
 log = logging.getLogger(__name__)
 
-_cache: list = []
+# project id -> that project's mapping rows
+_by_project: "dict[int, list]" = {}
+
+
+def _rows() -> list:
+    return _by_project.setdefault(projects.current_id(), [])
 
 # jira_field is the STABLE identity of a system mapping — it never changes
 # when a user renames the Lark-side field via the dashboard (only lark_field
@@ -46,7 +59,7 @@ def __getattr__(name: str):
     jira_field = _SYSTEM_JIRA_KEYS.get(name)
     if jira_field is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    for m in _cache:
+    for m in _rows():
         if m.get("jira_field") == jira_field and m.get("is_system"):
             return m.get("lark_field")
     return getattr(config, name)
@@ -69,22 +82,36 @@ _DEFAULTS = [
 ]
 
 
-def load() -> None:
-    global _cache
+def load(project_id: "int | None" = None) -> None:
+    """Reload mappings for one project, or for every project when None.
+    Rows without a project_id (pre-migration) belong to the lowest-id project,
+    the same project bootstrap adopts them into. A project with no rows gets
+    the hardcoded defaults."""
+    pids = ([project_id] if project_id is not None
+            else [p.id for p in projects.all_projects()])
     client = history._get_client()
     if not client:
-        _cache = list(_DEFAULTS)
+        for pid in pids:
+            _by_project[pid] = list(_DEFAULTS)
         return
     try:
-        rows = client.table("field_mappings").select("*").order("id").execute()
-        _cache = rows.data or list(_DEFAULTS)
+        rows = client.table("field_mappings").select("*").order("id").execute().data or []
     except Exception as e:
         log.warning(f"field_mappings.load failed: {e}")
-        _cache = list(_DEFAULTS)
+        for pid in pids:
+            _by_project[pid] = list(_DEFAULTS)
+        return
+    owner = min(p.id for p in projects.all_projects())
+    grouped: dict = {}
+    for r in rows:
+        pid = r.get("project_id")
+        grouped.setdefault(owner if pid is None else int(pid), []).append(r)
+    for pid in pids:
+        _by_project[pid] = grouped.get(pid) or list(_DEFAULTS)
 
 
 def get_all() -> list:
-    return list(_cache)
+    return list(_rows())
 
 
 def get_direction(lark_field: str) -> "str | None":
@@ -102,7 +129,7 @@ def get_direction(lark_field: str) -> "str | None":
       - lark_handler._handle_update_impl() — gates whether to write a system
         field to Jira on update.
     """
-    for m in _cache:
+    for m in _rows():
         if m.get("lark_field") == lark_field:
             return m.get("direction")
     return None
@@ -110,47 +137,87 @@ def get_direction(lark_field: str) -> "str | None":
 
 def get_custom_lark_to_jira() -> list:
     """Non-system active mappings that sync Lark → Jira."""
-    return [m for m in _cache
+    return [m for m in _rows()
             if not m.get("is_system") and m.get("active")
             and m.get("direction") in ("both", "lark_to_jira")]
 
 
 def get_custom_jira_to_lark() -> list:
     """Non-system active mappings that sync Jira → Lark."""
-    return [m for m in _cache
+    return [m for m in _rows()
             if not m.get("is_system") and m.get("active")
             and m.get("direction") in ("both", "jira_to_lark")]
 
 
 def upsert(row: dict) -> dict:
-    """Insert or update a field mapping. Returns the saved row."""
+    """Insert or update a field mapping of the CURRENT project. Returns the
+    saved row (empty when the id belongs to another project)."""
     client = history._get_client()
     if not client:
         raise RuntimeError("Supabase not configured")
+    pid = projects.current_id()
     data = {k: row[k] for k in ("lark_field", "jira_field", "jira_label",
                                   "direction", "field_type", "is_system", "active")
             if k in row}
     if row.get("id"):
-        res = client.table("field_mappings").update(data).eq("id", row["id"]).execute()
+        res = (client.table("field_mappings").update(data)
+               .eq("id", row["id"]).eq("project_id", pid).execute())
     else:
-        res = client.table("field_mappings").insert(data).execute()
-    load()
+        res = client.table("field_mappings").insert({**data, "project_id": pid}).execute()
+    load(pid)
     return (res.data or [{}])[0]
 
 
 def delete(mapping_id: int) -> None:
-    """Delete any mapping by id."""
+    """Delete a mapping of the CURRENT project by id."""
     client = history._get_client()
     if not client:
         raise RuntimeError("Supabase not configured")
-    client.table("field_mappings").delete().eq("id", mapping_id).execute()
-    load()
+    pid = projects.current_id()
+    client.table("field_mappings").delete().eq("id", mapping_id).eq("project_id", pid).execute()
+    load(pid)
 
 
 def update_lark_field(mapping_id: int, new_lark_field: str) -> None:
-    """Update only the lark_field name of a system mapping."""
+    """Update only the lark_field name of a system mapping (CURRENT project)."""
     client = history._get_client()
     if not client:
         raise RuntimeError("Supabase not configured")
-    client.table("field_mappings").update({"lark_field": new_lark_field}).eq("id", mapping_id).execute()
-    load()
+    pid = projects.current_id()
+    client.table("field_mappings").update({"lark_field": new_lark_field}) \
+        .eq("id", mapping_id).eq("project_id", pid).execute()
+    load(pid)
+
+
+_COPY_COLS = ("lark_field", "jira_field", "jira_label", "direction",
+              "field_type", "is_system", "active")
+
+
+def copy_from(src_pid: int, dst_pid: int) -> int:
+    """Copy every mapping row of project src_pid into project dst_pid.
+    Returns the number of rows copied. Project src_pid is left untouched."""
+    client = history._get_client()
+    if not client:
+        raise RuntimeError("Supabase not configured")
+    src = (client.table("field_mappings").select("*")
+           .eq("project_id", src_pid).order("id").execute().data or [])
+    if src:
+        client.table("field_mappings").insert(
+            [{**{k: r.get(k) for k in _COPY_COLS}, "project_id": dst_pid} for r in src]).execute()
+    load(dst_pid)
+    return len(src)
+
+
+class _Module(types.ModuleType):
+    """`field_mappings._cache` reads and replaces the current project's rows."""
+
+    @property
+    def _cache(self) -> list:
+        return _rows()
+
+    @_cache.setter
+    def _cache(self, rows: list) -> None:
+        _by_project[projects.current_id()] = rows
+
+
+sys.modules[__name__].__class__ = _Module
