@@ -310,15 +310,19 @@ def bootstrap_default() -> Project:
     # Adopt pre-multi-project history rows so per-project history views and
     # error counts include them.
     client.table("sync_history").update({"project_id": pid}).is_("project_id", "null").execute()
-    # Adopt existing field mappings and add any system mapping the table lacks.
+    # Adopt existing field mappings (every run).
     client.table("field_mappings").update({"project_id": pid}).is_("project_id", "null").execute()
-    have = {r["jira_field"] for r in (client.table("field_mappings").select("jira_field,is_system")
-            .eq("project_id", pid).execute().data or []) if r.get("is_system")}
-    import field_mappings
-    for d in field_mappings._DEFAULTS:
-        if d["jira_field"] not in have:
-            client.table("field_mappings").insert(
-                {**{k: v for k, v in d.items() if k != "id"}, "project_id": pid}).execute()
+    # Add any system mapping the table lacks — only in the run that creates
+    # project #1 (R4). Afterwards the mapping table decides what syncs: a
+    # built-in mapping the user deleted must stay deleted across restarts.
+    if created:
+        have = {r["jira_field"] for r in (client.table("field_mappings").select("jira_field,is_system")
+                .eq("project_id", pid).execute().data or []) if r.get("is_system")}
+        import field_mappings
+        for d in field_mappings._DEFAULTS:
+            if d["jira_field"] not in have:
+                client.table("field_mappings").insert(
+                    {**{k: v for k, v in d.items() if k != "id"}, "project_id": pid}).execute()
 
     # Per-project reconcile watermarks, carried over from the global ones
     # only when the per-project key is absent.

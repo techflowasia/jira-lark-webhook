@@ -179,7 +179,7 @@ def test_bootstrap_rerun_repairs_partial_run(fake_supabase):
     p = projects.bootstrap_default()
     n_projects = fake_supabase.count("sync_projects")
     # Simulate a crash after the project insert: stray NULL project_id row,
-    # a missing system row, one watermark missing and one already set.
+    # a deleted system row, one watermark missing and one already set.
     fm = fake_supabase.tables["field_mappings"]
     fm[:] = [r for r in fm if r["jira_field"] != "status"]
     fake_supabase.insert_row("field_mappings", {
@@ -193,7 +193,9 @@ def test_bootstrap_rerun_repairs_partial_run(fake_supabase):
     assert again.id == p.id and fake_supabase.count("sync_projects") == n_projects
     rows = fake_supabase.rows("field_mappings")
     assert all(r["project_id"] == 1 for r in rows)
-    assert "status" in {r["jira_field"] for r in rows if r["is_system"]}
+    # R4: a system row deleted after project #1 exists stays deleted — only
+    # the run that creates project #1 inserts missing system rows.
+    assert "status" not in {r["jira_field"] for r in rows if r["is_system"]}
     kv = {r["key"]: r["value"] for r in fake_supabase.rows("settings")}
     assert kv["last_reconcile_ts:1"] == "123"
     assert kv["last_full_reconcile_ts:1"] == "777"

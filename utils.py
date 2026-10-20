@@ -11,6 +11,12 @@ from datetime import datetime, timezone
 # below handles real datetimes (with their own offset) and is unaffected.
 
 
+def put(fields: dict, name: "str | None", value) -> None:
+    """fields[name] = value, unless the field is unmapped (name is None)."""
+    if name is not None:
+        fields[name] = value
+
+
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
 

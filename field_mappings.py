@@ -18,7 +18,18 @@ _by_project: "dict[int, list]" = {}
 
 
 def _rows() -> list:
-    return _by_project.setdefault(projects.current_id(), [])
+    """The current project's rows, loaded on first use. An unloaded project
+    must never read as "nothing mapped" (every field would then be skipped,
+    and a create would make a blank record) — so load it now."""
+    pid = projects.current_id()
+    if pid not in _by_project:
+        load(pid)
+    return _by_project.setdefault(pid, [])
+
+
+# A project cannot sync without these: the Jira<->Lark link (key), the record
+# title (summary) and the type filter (issuetype).
+REQUIRED_JIRA_FIELDS = {"summary", "key", "issuetype"}
 
 # jira_field is the STABLE identity of a system mapping — it never changes
 # when a user renames the Lark-side field via the dashboard (only lark_field
@@ -43,26 +54,60 @@ _SYSTEM_JIRA_KEYS = {
 
 def __getattr__(name: str):
     """PEP 562 dynamic module attribute: `field_mappings.F_PARENT` (etc.)
-    resolves to the CURRENT Lark field name for that system mapping, read
-    fresh from the dashboard-editable cache on every access (module
-    attribute lookups aren't cached the way `from x import y` bindings are,
-    so this re-resolves every single call — no stale, import-time-frozen
-    value). Falls back to the config.py default when the cache has no
-    matching row (Supabase unreachable, row deleted, or cache not yet
-    loaded) — same resilience contract as get_all()/load().
+    resolves to the CURRENT project's Lark field name for that system
+    mapping, read fresh on every access, so a dashboard rename (e.g.
+    "Parent items" -> "Epic") takes effect immediately.
 
-    This is what makes a dashboard field-name rename (e.g. "Parent items" ->
-    "Epic") take effect immediately, with no code change or redeploy: every
-    call site now does `field_mappings.F_PARENT` instead of importing a
-    frozen string from config.py.
+    Returns None when the project has no ACTIVE system row for the field:
+    the field is unmapped and every read/write of it must be skipped (use
+    utils.put for Lark writes; check before reading for Jira writes). There
+    is deliberately no config.py fallback — the mapping table decides what
+    syncs. (_DEFAULTS still stand in for project #1 when Supabase is
+    unreachable; see load().)
     """
     jira_field = _SYSTEM_JIRA_KEYS.get(name)
     if jira_field is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     for m in _rows():
-        if m.get("jira_field") == jira_field and m.get("is_system"):
+        if m.get("jira_field") == jira_field and m.get("is_system") and _active(m):
             return m.get("lark_field")
-    return getattr(config, name)
+    return None
+
+
+def _active(m: dict) -> bool:
+    """Only an explicit active=False switches a row off; a NULL/absent flag
+    keeps today's behaviour (the row syncs)."""
+    return m.get("active") is not False
+
+
+def syncs(lark_field: "str | None", direction: str) -> bool:
+    """True when an active row for `lark_field` syncs in `direction`
+    ("jira_to_lark" or "lark_to_jira"), i.e. its direction is that or "both"."""
+    if lark_field is None:
+        return False
+    return any(m.get("lark_field") == lark_field and _active(m)
+               and m.get("direction") in (direction, "both") for m in _rows())
+
+
+def reads_for_jira(lark_field: "str | None") -> bool:
+    """Whether a SYSTEM field's Lark value may be read to write Jira.
+
+    Mapped (an active row) is required; direction is NOT consulted, because
+    the spec says direction is "honoured as today" and today only Jira status
+    honours it for system fields (production project #1 has Assignee set to
+    jira_to_lark yet pushes Lark assignee edits to Jira). This is the single
+    switch point if system-field direction should be honoured later:
+    return syncs(lark_field, "lark_to_jira").
+    """
+    return lark_field is not None
+
+
+def missing_required() -> list:
+    """Jira fields of REQUIRED_JIRA_FIELDS the current project has no active
+    system row for. Sync for the project is skipped while this is non-empty."""
+    have = {m.get("jira_field") for m in _rows() if m.get("is_system") and _active(m)}
+    return sorted(REQUIRED_JIRA_FIELDS - have)
+
 
 # Hardcoded fallback (matches Supabase seed data)
 _DEFAULTS = [
@@ -82,32 +127,48 @@ _DEFAULTS = [
 ]
 
 
+def _fallback(pid: int, owner: "int | None") -> list:
+    """Rows to use when Supabase can't supply them: keep what is cached; an
+    uncached project #1 gets the hardcoded defaults (today's resilience);
+    any other project gets nothing (sync is then skipped, see
+    missing_required) — never project #1's defaults."""
+    if pid in _by_project:
+        return _by_project[pid]
+    return list(_DEFAULTS) if pid == owner else []
+
+
+def _owner() -> "int | None":
+    ids = [p.id for p in projects.all_projects()]
+    return min(ids) if ids else None
+
+
 def load(project_id: "int | None" = None) -> None:
     """Reload mappings for one project, or for every project when None.
-    Rows without a project_id (pre-migration) belong to the lowest-id project,
-    the same project bootstrap adopts them into. A project with no rows gets
-    the hardcoded defaults."""
+    Rows without a project_id (pre-migration) belong to the lowest-id project
+    (project #1), the same project bootstrap adopts them into. Project #1
+    with no rows at all gets the hardcoded defaults (pre-bootstrap); any
+    other project with no rows has nothing mapped."""
+    owner = _owner()
     pids = ([project_id] if project_id is not None
             else [p.id for p in projects.all_projects()])
     client = history._get_client()
     if not client:
         for pid in pids:
-            _by_project[pid] = list(_DEFAULTS)
+            _by_project[pid] = _fallback(pid, owner)
         return
     try:
         rows = client.table("field_mappings").select("*").order("id").execute().data or []
     except Exception as e:
         log.warning(f"field_mappings.load failed: {e}")
         for pid in pids:
-            _by_project[pid] = list(_DEFAULTS)
+            _by_project[pid] = _fallback(pid, owner)
         return
-    owner = min(p.id for p in projects.all_projects())
     grouped: dict = {}
     for r in rows:
         pid = r.get("project_id")
         grouped.setdefault(owner if pid is None else int(pid), []).append(r)
     for pid in pids:
-        _by_project[pid] = grouped.get(pid) or list(_DEFAULTS)
+        _by_project[pid] = grouped.get(pid) or (list(_DEFAULTS) if pid == owner else [])
 
 
 def get_all() -> list:
@@ -149,9 +210,16 @@ def get_custom_jira_to_lark() -> list:
             and m.get("direction") in ("both", "jira_to_lark")]
 
 
+def _stored_row(client, mapping_id, pid: int) -> "dict | None":
+    rows = (client.table("field_mappings").select("*").eq("id", mapping_id)
+            .eq("project_id", pid).execute().data or [])
+    return rows[0] if rows else None
+
+
 def upsert(row: dict) -> dict:
     """Insert or update a field mapping of the CURRENT project. Returns the
-    saved row (empty when the id belongs to another project)."""
+    saved row (empty when the id belongs to another project). Deactivating a
+    required mapping, or moving it to another Jira field, raises ValueError."""
     client = history._get_client()
     if not client:
         raise RuntimeError("Supabase not configured")
@@ -160,6 +228,11 @@ def upsert(row: dict) -> dict:
                                   "direction", "field_type", "is_system", "active")
             if k in row}
     if row.get("id"):
+        cur = _stored_row(client, row["id"], pid)
+        if cur and cur.get("jira_field") in REQUIRED_JIRA_FIELDS and (
+                data.get("active", True) is False
+                or data.get("jira_field", cur["jira_field"]) != cur["jira_field"]):
+            raise ValueError(f"{cur.get('lark_field') or cur['jira_field']} mapping is required")
         res = (client.table("field_mappings").update(data)
                .eq("id", row["id"]).eq("project_id", pid).execute())
     else:
@@ -169,11 +242,15 @@ def upsert(row: dict) -> dict:
 
 
 def delete(mapping_id: int) -> None:
-    """Delete a mapping of the CURRENT project by id."""
+    """Delete a mapping of the CURRENT project by id. Required mappings
+    (REQUIRED_JIRA_FIELDS) raise ValueError."""
     client = history._get_client()
     if not client:
         raise RuntimeError("Supabase not configured")
     pid = projects.current_id()
+    cur = _stored_row(client, mapping_id, pid)
+    if cur and cur.get("jira_field") in REQUIRED_JIRA_FIELDS:
+        raise ValueError(f"{cur.get('lark_field') or cur['jira_field']} mapping is required")
     client.table("field_mappings").delete().eq("id", mapping_id).eq("project_id", pid).execute()
     load(pid)
 

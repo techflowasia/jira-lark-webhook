@@ -7,6 +7,7 @@ from collections import defaultdict
 from datetime import datetime
 import requests
 import field_mappings
+import history
 from config import LARK_API_BASE, LOCAL_TZ, TZ_LABEL
 
 log = logging.getLogger(__name__)
@@ -385,7 +386,43 @@ def get_cached_or_fetch_record(token: str, base_token: str, table_id: str,
     return get_record(token, base_token, table_id, record_id)
 
 
+def _known_columns(token: str, base_token: str, table_id: str, fields: dict,
+                   event: str, record_id: str = "") -> dict:
+    """`fields` minus keys that are not columns of the table (a mapping that
+    names a Lark column which doesn't exist, e.g. renamed in Lark). Each
+    dropped key is logged and recorded in history as skipped. When the schema
+    can't be read (error or empty), `fields` is returned unchanged — Lark
+    then rejects an unknown column itself, as before. Uses the 60 s schema
+    cache, so this adds no Lark call on the hot path."""
+    try:
+        names = {f["field_name"] for f in list_fields(token, base_token, table_id)}
+    except Exception as e:
+        log.warning(f"lark_api: schema check skipped for {table_id}: {e}")
+        return fields
+    if not names:
+        return fields
+    kept = {}
+    for k, v in fields.items():
+        if k in names:
+            kept[k] = v
+            continue
+        msg = f"Lark column '{k}' not found — field not synced"
+        log.warning(f"lark_api: {msg} (table {table_id}, record {record_id or 'new'})")
+        history.record(direction="jira→lark", event=event, lark_id=record_id,
+                       description=msg, status="skipped")
+    return kept
+
+
 def create_record(token: str, base_token: str, table_id: str, fields: dict) -> str:
+    sent = _known_columns(token, base_token, table_id, fields, "created")
+    # Never create a record without its link / title / type: a record missing
+    # its Jira Key column can't be matched again, so every reconcile would
+    # create another duplicate.
+    required = {field_mappings.F_TITLE, field_mappings.F_JIRA_KEY, field_mappings.F_TYPE}
+    lost = sorted(k for k in fields if k not in sent and k in required)
+    if lost:
+        raise RuntimeError(f"Lark column(s) {lost} not found — required, record not created")
+    fields = sent
     resp = _request("POST",
         f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records",
         headers=_headers(token), json={"fields": fields})
@@ -398,6 +435,9 @@ def create_record(token: str, base_token: str, table_id: str, fields: dict) -> s
 
 def update_record(token: str, base_token: str, table_id: str,
                   record_id: str, fields: dict) -> None:
+    fields = _known_columns(token, base_token, table_id, fields, "updated", record_id)
+    if not fields:
+        return
     resp = _request("PUT",
         f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records/{record_id}",
         headers=_headers(token), json={"fields": fields})

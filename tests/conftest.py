@@ -184,3 +184,16 @@ def two_projects():
     projects._projects, projects._persisted, fm = saved
     field_mappings._by_project.clear()
     field_mappings._by_project.update(fm)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_field_mappings():
+    """Each test starts with no cached mapping rows, so a project's rows are
+    loaded on first use (project #1 without Supabase -> the defaults), and a
+    test's `field_mappings._cache = [...]` can't leak into the next test."""
+    import field_mappings
+    saved = dict(field_mappings._by_project)
+    field_mappings._by_project.clear()
+    yield
+    field_mappings._by_project.clear()
+    field_mappings._by_project.update(saved)

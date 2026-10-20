@@ -61,6 +61,7 @@ def test_index_is_per_project():
 
 
 def test_index_rebuild_and_remove_touch_only_current_project():
+    field_mappings._by_project[2] = [dict(d) for d in field_mappings._DEFAULTS]
     with projects.use(1):
         index.add("VR-1", "recA")
     with projects.use(2):
@@ -355,9 +356,9 @@ def test_field_mappings_upsert_and_delete_are_scoped(fake_supabase, two_projects
 
 
 def test_field_mappings_copy_from(fake_supabase, two_projects):
-    for name in ("Title", "Assignee"):
+    for name, jf in (("Title", "summary"), ("Assignee", "assignee")):
         fake_supabase.insert_row("field_mappings", {
-            "lark_field": name, "jira_field": name.lower(), "is_system": True, "project_id": 1})
+            "lark_field": name, "jira_field": jf, "is_system": True, "project_id": 1})
     p3 = projects.create({"jira_project_key": "THREE", "lark_base_token": "b3",
                           "lark_table_id": "t3"})
     assert field_mappings.copy_from(1, p3.id) == 2
