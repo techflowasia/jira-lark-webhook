@@ -9,7 +9,7 @@ from datetime import datetime
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
 import lark_api, jira_api, index, reconcile, history, field_mappings
-import lark_handler, jira_handler
+import lark_handler, jira_handler, projects
 import config as _cfg_mod
 from config import get_cfg, set_active_table
 
@@ -57,6 +57,12 @@ def _load_toggle_states() -> None:
 @app.on_event("startup")
 async def startup() -> None:
     log = logging.getLogger(__name__)
+    # Project registry must be ready before any loader or get_cfg() call.
+    try:
+        projects.load_all()
+        projects.bootstrap_default()
+    except Exception as e:
+        log.error(f"Project registry bootstrap failed (using env project): {e}")
     cfg = get_cfg()
     # Build the in-memory index, but never let a Lark outage crash startup —
     # if the bind fails, Render's port scan kills the container and we never

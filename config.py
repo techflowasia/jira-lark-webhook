@@ -68,17 +68,16 @@ JIRA_TO_LARK_ASSIGNEE = _env_json("ASSIGNEE_MAP", {
 LARK_TO_JIRA_ASSIGNEE = {v: k for k, v in JIRA_TO_LARK_ASSIGNEE.items()}
 
 
-_active_table_id:   str = ""
-_active_table_name: str = ""
-
 _allowed_jira_types: set = set(DEFAULT_SYNC_TYPES)
 _allowed_lark_types: set = set(DEFAULT_SYNC_TYPES)
 
 
 def set_active_table(table_id: str, table_name: str = "") -> None:
-    global _active_table_id, _active_table_name
-    _active_table_id   = table_id
-    _active_table_name = table_name
+    """Point the CURRENT project at a different Lark table (persisted when
+    Supabase is available, in-memory otherwise)."""
+    import projects
+    projects.update(projects.current_id(),
+                    {"lark_table_id": table_id, "lark_table_name": table_name})
 
 
 def get_allowed_jira_types() -> set:
@@ -122,13 +121,5 @@ def save_sync_types(jira_types: list, lark_types: list) -> None:
 
 
 def get_cfg() -> dict:
-    return {
-        "JIRA_EMAIL":      os.environ["JIRA_EMAIL"],
-        "JIRA_TOKEN":      os.environ["JIRA_TOKEN"],
-        "JIRA_DOMAIN":     os.environ["JIRA_DOMAIN"],
-        "JIRA_PROJECT":    os.environ["JIRA_PROJECT"],
-        "LARK_APP_ID":     os.environ["LARK_APP_ID"],
-        "LARK_APP_SECRET": os.environ["LARK_APP_SECRET"],
-        "LARK_BASE_TOKEN": os.environ["LARK_BASE_TOKEN"],
-        "LARK_TABLE_ID":   _active_table_id or os.environ["LARK_TABLE_ID"],
-    }
+    import projects
+    return projects.cfg_for(projects.current())
