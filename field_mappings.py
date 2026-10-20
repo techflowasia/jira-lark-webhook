@@ -301,6 +301,21 @@ def copy_from(src_pid: int, dst_pid: int) -> int:
     return len(src)
 
 
+def seed_defaults(dst_pid: int) -> int:
+    """Insert the default system rows (`_DEFAULTS`) as project dst_pid's
+    mappings. Returns the number inserted. Refuses (ValueError) when the
+    project already has rows."""
+    client = history._get_client()
+    if not client:
+        raise RuntimeError("Supabase not configured")
+    if (client.table("field_mappings").select("id").eq("project_id", dst_pid).execute().data):
+        raise ValueError(f"project {dst_pid} already has field mappings")
+    client.table("field_mappings").insert(
+        [{**{k: d.get(k) for k in _COPY_COLS}, "project_id": dst_pid} for d in _DEFAULTS]).execute()
+    load(dst_pid)
+    return len(_DEFAULTS)
+
+
 class _Module(types.ModuleType):
     """`field_mappings._cache` reads and replaces the current project's rows."""
 

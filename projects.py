@@ -151,7 +151,8 @@ def _check_unique(fields: dict, exclude_id: "int | None" = None) -> None:
     for p in all_projects():
         if p.id == exclude_id:
             continue
-        if fields.get("jira_project_key") and fields["jira_project_key"] == p.jira_project_key:
+        if (fields.get("jira_project_key")
+                and fields["jira_project_key"].upper() == p.jira_project_key.upper()):
             raise ValueError(f"Jira project {p.jira_project_key} is already synced by project #{p.id}")
         if (fields.get("lark_base_token") and fields.get("lark_table_id")
                 and fields["lark_base_token"] == p.lark_base_token
@@ -172,6 +173,8 @@ def create(fields: dict) -> Project:
     _ensure_loaded()
     data = {k: v for k, v in fields.items() if k in _UPDATABLE}
     data.update(sync_enabled=False, reconcile_enabled=False, setup_state="draft")
+    if isinstance(data.get("jira_project_key"), str):
+        data["jira_project_key"] = data["jira_project_key"].strip().upper()  # R9a
     for req in ("jira_project_key", "lark_base_token", "lark_table_id"):
         if not data.get(req):
             raise ValueError(f"{req} is required")
@@ -213,6 +216,29 @@ def update(pid: int, fields: dict) -> Project:
             client.table(_TABLE).update(changes).eq("id", pid).execute()
         _projects[pid] = new
         return new
+
+
+def delete(pid: int) -> None:
+    """Delete a DRAFT project: its registry row and its field_mappings rows,
+    nothing else. Never touches Jira or Lark records. Project #1 is never
+    deletable. Raises KeyError (unknown) / ValueError (#1 or not a draft)."""
+    _ensure_loaded()
+    with _lock:
+        cur = _projects.get(pid)
+        if cur is None:
+            raise KeyError(f"project {pid} not found")
+        if pid == 1:
+            raise ValueError("project 1 cannot be deleted")
+        if cur.setup_state != "draft":
+            raise ValueError("only a draft project can be deleted")
+        client = history._get_client()
+        if client:
+            client.table("field_mappings").delete().eq("project_id", pid).execute()
+            if _persisted:
+                client.table(_TABLE).delete().eq("id", pid).execute()
+        del _projects[pid]
+    import field_mappings
+    field_mappings._by_project.pop(pid, None)
 
 
 @contextlib.contextmanager

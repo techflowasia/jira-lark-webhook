@@ -1,5 +1,6 @@
 """FastAPI entry point: / dashboard + /health + /webhook/lark + /webhook/jira + reconcile loop."""
 import asyncio
+import html as _html
 import json
 import logging
 import urllib.request
@@ -9,7 +10,7 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
 import lark_api, jira_api, index, reconcile, history, field_mappings
-import lark_handler, jira_handler, projects, projects_api, routing, dashboard
+import lark_handler, jira_handler, projects, projects_api, routing, dashboard, wizard
 import config as _cfg_mod
 from config import get_cfg, set_active_table
 
@@ -134,13 +135,24 @@ async def _reconcile_loop() -> None:
 
 
 @app.get("/auth/start")
-async def auth_start():
-    """Step 1 — redirect user to Lark OAuth to get a user access token."""
+async def auth_start(project: str = ""):
+    """Step 1 — redirect user to Lark OAuth to get a user access token.
+    `?project=N` carries the project through OAuth `state` so the callback
+    connects that project's Base (no param -> legacy state, project #1)."""
+    state = "add_bot"
+    if project != "":
+        try:
+            pid = int(project)
+        except ValueError:
+            raise HTTPException(400, "project must be a number")
+        if projects.get(pid) is None:
+            raise HTTPException(404, f"project {pid} not found")
+        state = f"project:{pid}"
     params = urllib.parse.urlencode({
         "app_id":       get_cfg()["LARK_APP_ID"],
         "redirect_uri": REDIRECT_URI,
         "scope":        "drive:drive",
-        "state":        "add_bot",
+        "state":        state,
     })
     return RedirectResponse(f"{lark_api.LARK_BASE_URL}/authen/v1/authorize?{params}")
 
@@ -152,7 +164,18 @@ async def auth_callback(request: Request):
     if not code:
         return HTMLResponse("<h2>Error: no code in callback</h2>", status_code=400)
 
-    cfg = get_cfg()
+    # state: "project:<id>" (wizard) or the legacy "add_bot" (project #1).
+    state = request.query_params.get("state", "")
+    pid = 1
+    if state.startswith("project:"):
+        try:
+            pid = int(state.split(":", 1)[1])
+        except ValueError:
+            return HTMLResponse("<h2>Error: bad project in state</h2>", status_code=400)
+    proj = projects.get(pid)
+    if proj is None:
+        return HTMLResponse(f"<h2>Error: project {_html.escape(str(pid))} not found</h2>", status_code=400)
+    cfg = projects.cfg_for(proj)
     # Step 1 — get app_access_token
     r0 = urllib.request.Request(
         f"{lark_api.LARK_BASE_URL}/auth/v3/app_access_token/internal",
@@ -172,11 +195,11 @@ async def auth_callback(request: Request):
     token_resp = json.loads(urllib.request.urlopen(req).read())
     user_token = token_resp.get("data", {}).get("access_token")
     if not user_token:
-        return HTMLResponse(f"<h2>Token exchange failed</h2><pre>{json.dumps(token_resp, indent=2)}</pre>", status_code=400)
+        return HTMLResponse(f"<h2>Token exchange failed</h2><pre>{_html.escape(json.dumps(token_resp, indent=2))}</pre>", status_code=400)
 
     # Add bot as editor on the Base using the user's token
     req2 = urllib.request.Request(
-        f"{lark_api.LARK_BASE_URL}/drive/v1/permissions/{cfg['LARK_BASE_TOKEN']}/members?type=bitable",
+        f"{lark_api.LARK_BASE_URL}/drive/v1/permissions/{urllib.parse.quote(cfg['LARK_BASE_TOKEN'], safe='')}/members?type=bitable",
         data=json.dumps({
             "member_type": "openid",
             "member_id":   _cfg_mod.LARK_BOT_OPEN_ID,
@@ -201,7 +224,7 @@ async def auth_callback(request: Request):
     sub_msg = ""
     try:
         req3 = urllib.request.Request(
-            f"{lark_api.LARK_BASE_URL}/drive/v1/files/{cfg['LARK_BASE_TOKEN']}/subscribe?file_type=bitable",
+            f"{lark_api.LARK_BASE_URL}/drive/v1/files/{urllib.parse.quote(cfg['LARK_BASE_TOKEN'], safe='')}/subscribe?file_type=bitable",
             data=json.dumps({"event_types": ["drive.file.bitable_record_changed_v1"]}).encode(),
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {user_token}"},
             method="POST",
@@ -216,11 +239,11 @@ async def auth_callback(request: Request):
     color = "#22c55e" if ok else ("#f59e0b" if (perm_ok or sub_ok) else "#ef4444")
     return HTMLResponse(f"""
     <html><body style="font-family:sans-serif;padding:40px;max-width:500px;margin:auto">
-    <h2 style="color:{color}">{"✅ Setup complete!" if ok else "⚠️ Partial setup"}</h2>
-    <p>{"✅" if perm_ok else "❌"} {perm_msg}</p>
-    <p>{"✅" if sub_ok else "❌"} {sub_msg}</p>
-    <p>{"Lark → Jira sync is now active. Edit any Lark record to test." if ok else "Check errors above and try again."}</p>
-    <p><a href="/">← Back to dashboard</a></p>
+    <h2 style="color:{color}">{"✅ Lark connected" if ok else "⚠️ Partial setup"}</h2>
+    <p>{"✅" if perm_ok else "❌"} {_html.escape(perm_msg)}</p>
+    <p>{"✅" if sub_ok else "❌"} {_html.escape(sub_msg)}</p>
+    <p>{"Lark → Jira events are now subscribed for this Base." if ok else "Check errors above and try again."}</p>
+    <p><a href="/p/{pid}/setup?step=4">Continue project setup →</a> &nbsp; <a href="/p/{pid}">Project page</a></p>
     </body></html>
     """)
 
@@ -381,21 +404,18 @@ async def dashboard_root(request: Request):
     return RedirectResponse(f"/p/{target}", status_code=303)
 
 
-def _coming_soon(title: str) -> HTMLResponse:
-    return HTMLResponse(f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>{title}</title></head>"
-                        f"<body style='font-family:sans-serif;padding:32px'><h1>{title}</h1>"
-                        "<p>Setup coming soon.</p><p><a href='/'>Back to dashboard</a></p></body></html>")
-
-
-# Placeholders registered BEFORE /p/{pid} so they are never shadowed; Task 8 replaces them.
+# Registered BEFORE /p/{pid} so they are never shadowed.
 @app.get("/p/new", response_class=HTMLResponse)
 async def new_project_page():
-    return _coming_soon("New project")
+    return HTMLResponse(await asyncio.to_thread(wizard.render_new))
 
 
 @app.get("/p/{pid}/setup", response_class=HTMLResponse)
-async def project_setup_page(pid: int):
-    return _coming_soon("Project setup")
+async def project_setup_page(pid: int, step: str = "3"):
+    p = projects.get(pid)
+    if p is None:
+        raise HTTPException(404, f"project {pid} not found")
+    return HTMLResponse(await asyncio.to_thread(wizard.render_setup, p, step))
 
 
 @app.get("/p/{pid}", response_class=HTMLResponse)

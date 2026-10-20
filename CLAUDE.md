@@ -61,10 +61,15 @@ A bidirectional webhook sync service that keeps Jira issues and Lark Base record
 | `index.py` | In-memory bidirectional map: `jira_key ↔ lark_record_id` |
 | `dedup.py` | TTL dedup cache (120 s) to break sync loops |
 | `history.py` | Sync event log — writes to Supabase `sync_history`, falls back to in-memory deque |
-| `field_mappings.py` | Configurable field mapping cache — loads from Supabase, falls back to hardcoded defaults |
+| `field_mappings.py` | Per-project field mapping cache — loads from Supabase, falls back to hardcoded defaults (project #1 only). `copy_from`, `seed_defaults` |
+| `projects.py` | Project registry (`sync_projects`), `use(pid)` current-project context, `create`/`update`/`delete` (draft only), `cfg_for` |
+| `routing.py` | Routes Jira webhooks by project key and Lark events by base/table (or `/webhook/lark-auto/{pid}`) to a project; unknown → ignored |
+| `projects_api.py` | Project-scoped REST API (`/api/projects`, `/api/p/{pid}/...`); the `do_*` functions are also used by the legacy unscoped aliases |
+| `dashboard.py` | Sidebar layout, per-project pages, All activity audit |
+| `wizard.py` | New-project setup wizard (9 steps) rendered in the sidebar layout |
 | `utils.py` | Field parse helpers: `_lark_text`, `_lark_select`, date/timestamp converters |
 | `migrations/` | One-off SQL migrations for the Supabase schema (run manually in the SQL editor) |
-| `tests/` | pytest suite: `test_dedup.py`, `test_jira_handler.py`, `test_lark_handler.py`, `test_reconcile.py`, `test_utils.py` |
+| `tests/` | pytest suite (`pytest tests/`): handlers, reconcile, routing, projects, projects API, dashboard, wizard, utils |
 
 ---
 
@@ -94,8 +99,32 @@ A bidirectional webhook sync service that keeps Jira issues and Lark Base record
 | `GET` | `/debug/payloads` | Last 20 raw webhook payloads |
 | `GET` | `/debug/index` | Current in-memory Jira↔Lark index |
 | `POST` | `/debug/rebuild` | Force rebuild the in-memory index |
-| `GET` | `/auth/start` | Lark OAuth flow start |
-| `GET` | `/auth/callback` | Lark OAuth callback (adds bot as editor + subscribes to events) |
+| `GET` | `/auth/start?project={pid}` | Lark OAuth flow start; `state=project:{pid}` (no param → legacy `add_bot`) |
+| `GET` | `/auth/callback` | Lark OAuth callback: adds the bot as editor and subscribes to events on **that project's** Base (legacy `add_bot` → project #1); links back to `/p/{pid}/setup?step=4` |
+
+### Multi-project endpoints
+
+The unscoped endpoints above remain as aliases for project #1.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/p/new`, `/p/{pid}/setup?step=N` | Setup wizard (steps 1-9); unknown pid → 404 |
+| `GET` | `/p/{pid}`, `/activity` | Project page; All activity (`?project=` filter) |
+| `POST` | `/p/{pid}/toggle`, `/p/{pid}/toggle/reconcile` | Per-project sync / reconcile toggles |
+| `POST` | `/webhook/lark-auto/{pid}` | Per-project Lark Automation webhook |
+| `GET`/`POST` | `/api/projects` | List projects / create a draft (key upper-cased; sync off; 409 on duplicate key or table) |
+| `GET` | `/api/jira/projects/{key}` | `{exists, name, boards, issue_types}` |
+| `POST` | `/api/lark/resolve-link` | Read-only: Base token, table and table list from a pasted link |
+| `PATCH` | `/api/p/{pid}` | name, board, table, assignee_map, sync types, `sync_enabled`, `reconcile_enabled`, `setup_state` (`active` → 400 while a required mapping is missing; going live rebuilds the index) |
+| `DELETE` | `/api/p/{pid}` | Delete a **draft** (registry row + its field mappings only; project 1 refused; never touches Jira/Lark) |
+| `GET` | `/api/p/{pid}/tables`, `/lark-fields`, `/jira-fields`, `/jira-issue-types`, `/lark-type-options` | Schema lookups |
+| `GET`/`POST`/`DELETE` | `/api/p/{pid}/fields[/{id}]` | Field mappings |
+| `POST` | `/api/p/{pid}/fields/seed-defaults` | Seed the 13 default rows (409 if the project already has rows) |
+| `POST` | `/api/p/{pid}/copy-from` | `{source}`: copy mappings, sync types, people (409 if destination has rows) |
+| `GET` | `/api/p/{pid}/check` | `{fields, people, ready}` setup check |
+| `GET`/`PUT` | `/api/p/{pid}/people`, `GET /api/p/{pid}/people/suggestions` | Assignee map; suggestions |
+| `GET`/`POST` | `/api/p/{pid}/sync-types` | Allowed types |
+| `POST` | `/api/p/{pid}/backfill` | Backfill (the only wizard step that writes Jira/Lark records) |
 
 ---
 
@@ -141,7 +170,11 @@ The system rows in Supabase `field_mappings` are matched by `jira_field`. When
 a `JIRA_FIELD_*` var is overridden, update that row's `jira_field` to the same
 ID, or a dashboard rename of its Lark field stops being honored.
 
-One deployment still syncs one Jira project with one Lark table.
+One deployment syncs many Jira project ↔ Lark table pairs. `JIRA_PROJECT`, `LARK_BASE_TOKEN`, `LARK_TABLE_ID`, `ASSIGNEE_MAP` and `DEFAULT_SYNC_TYPES` only seed project #1; every further project is created in the wizard and lives in `sync_projects`.
+
+### New-project wizard (`/p/new`)
+
+Draft (sync off) from the end of step 2; nothing syncs until Go live. 1 Name + Jira key/board → 2 Lark link + table (creates the draft) → 3 Connect Lark (`/auth/start?project={pid}`, plus the `/webhook/lark-auto/{pid}` URL) → 4 Copy from a project, or Start from defaults (Delete draft redoes a failed copy) → 5 Check fields (Next blocked until `/check` is `ready`) → 6 People → 7 Sync types → 8 Backfill → 9 Go live (`PATCH setup_state=active, sync_enabled=true`; index rebuilt). Remind the Jira admin to widen a JQL-filtered webhook to the new key.
 
 ---
 
@@ -150,8 +183,9 @@ One deployment still syncs one Jira project with one Lark table.
 | Table | Purpose |
 |-------|---------|
 | `sync_history` | Event log (direction, event, jira_key, lark_id, type, description, status, error, ts). The `type` column (Epic / Story / Task / …) is added by `migrations/001_add_type_column.sql`. |
-| `field_mappings` | Configurable Lark↔Jira field mappings |
-| `settings` | Key-value store: `sync_enabled`, `reconcile_enabled`, `active_table_id`, `active_table_name`, `allowed_jira_types`, `allowed_lark_types` |
+| `sync_projects` | Project registry: one row per Jira project ↔ Lark table (name, `jira_project_key`, board, `lark_base_token`, `lark_table_id`, sync/reconcile flags, allowed types, `assignee_map`, `setup_state` draft/active). Unique on key and on (base, table). Created by `migrations/003_multi_project.sql`; project #1 is bootstrapped from env + `settings` at startup. |
+| `field_mappings` | Configurable Lark↔Jira field mappings, per project (`project_id`, migration 003) |
+| `settings` | Key-value store. The per-project values now live in `sync_projects`; the old keys only seed project #1 once |
 
 ---
 
@@ -173,11 +207,16 @@ One deployment still syncs one Jira project with one Lark table.
 | Actual end date | customfield_10176 | jira → lark |
 | Jira status | status | jira → lark |
 
+**The mapping table decides what syncs.** A field with no active mapping row in a project never syncs in any path (webhooks, reconcile, backfill) — built-in fields included. **Title (`summary`), Jira Key (`key`) and Type (`issuetype`) are required**: they cannot be deleted/deactivated, and `setup_state="active"` and backfill are refused while one is missing.
+
 **Sprint field (customfield_10020) is read-only via Agile API** — skipped in issue update loop; moved via `jira_api.move_to_sprint()`.
 
 ---
 
-## Assignee Mapping (default of `ASSIGNEE_MAP`)
+## Assignee Mapping (per project; default of `ASSIGNEE_MAP` seeds project #1)
+
+Rule: a Jira assignee who is unassigned **or** not in the project's people list clears the Lark Assignee on a **webhook** (an unmapped person also writes a warning row in history). **Sweeps** (reconcile/backfill) clear Lark only for an unmapped person, never merely because the issue is unassigned (ruling R8). A Lark assignee with no Jira mapping leaves Jira unchanged + warning.
+
 
 | Jira display name | Lark name |
 |-------------------|-----------|

@@ -78,7 +78,7 @@ def _rebuild_sync(pid: int) -> None:
             log.info(f"Project {pid}: table '{p.lark_table_name}' ({p.lark_table_id}), "
                      f"{len(index._jira_to_lark)} records indexed")
             history.record(direction="system", event="config",
-                           description=f"Switched Lark table to '{p.lark_table_name}' ({p.lark_table_id})")
+                           description=f"Index rebuilt for Lark table '{p.lark_table_name}' ({p.lark_table_id})")
     except Exception as e:
         log.error(f"Index rebuild failed for project {pid}: {e}")
 
@@ -239,6 +239,16 @@ def do_patch(pid: int, body: dict) -> "projects.Project":
             if missing:
                 raise ValueError("required mapping missing: " + ", ".join(missing))
         changes["setup_state"] = body["setup_state"]
+    for k in ("sync_enabled", "reconcile_enabled"):
+        if k in body:
+            if not isinstance(body[k], bool):
+                raise ValueError(f"{k} must be true or false")
+            changes[k] = body[k]
+    before = projects.get(pid)
+    going_live = changes.get("setup_state") == "active" and before.setup_state != "active"
+    if (changes.get("sync_enabled") or changes.get("reconcile_enabled")) \
+            and changes.get("setup_state", before.setup_state) != "active":
+        raise ValueError("finish setup (setup_state=active) before turning sync or reconcile on")
     table_changed = False
     if body.get("lark_table_id"):
         cur = projects.get(pid)
@@ -249,7 +259,73 @@ def do_patch(pid: int, body: dict) -> "projects.Project":
     if table_changed:
         _on_table_changed()
         _start_rebuild(pid)
+    elif going_live:
+        # Cheap insurance: a project whose index was never built since boot.
+        _start_rebuild(pid)
     return p
+
+
+def do_delete(pid: int) -> dict:
+    """Delete a draft project (registry row + its field mappings only).
+    Raises ValueError (HTTP 400)."""
+    projects.delete(pid)
+    return {"ok": True}
+
+
+def do_seed_defaults(pid: int) -> dict:
+    return {"ok": True, "seeded": field_mappings.seed_defaults(pid)}
+
+
+def do_copy(pid: int, src_id: int) -> dict:
+    """Copy mappings, sync types and people from project src_id into the
+    (still empty) project pid. Raises HTTPException."""
+    src = projects.get(src_id)
+    if src is None:
+        raise HTTPException(404, f"copy source project {src_id} not found")
+    if src_id == pid:
+        raise HTTPException(400, "cannot copy a project from itself")
+    try:
+        n = field_mappings.copy_from(src_id, pid)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    p = projects.update(pid, {"allowed_jira_types": list(src.allowed_jira_types),
+                              "allowed_lark_types": list(src.allowed_lark_types),
+                              "assignee_map": dict(src.assignee_map)})
+    return {**project_dict(p), "copied_mappings": n}
+
+
+def do_resolve_link(link: str) -> dict:
+    """Read-only: Base token + table from a pasted link, and the Base's tables."""
+    cfg = projects.cfg_for(projects.get(min(p.id for p in projects.all_projects())))
+    token = _lark_token(cfg)
+    base, table = lark_api.parse_base_link(token, link)
+    out = {"base_token": base, "table_id": table, "tables": []}
+    try:
+        out["tables"] = lark_api.list_tables(token, base)
+    except Exception as e:  # the bot may not have access yet (Connect Lark comes later)
+        out["tables_error"] = str(e)
+    return out
+
+
+def do_people_suggestions(pid: int) -> dict:
+    """Read-only suggestions for the People step."""
+    with projects.use(pid):
+        cfg = config.get_cfg()
+        out = {"jira_users": [], "lark_options": []}
+        try:
+            out["jira_users"] = sorted(jira_api.get_account_ids(cfg))
+        except Exception as e:
+            out["jira_error"] = str(e)
+        f_assignee = field_mappings.F_ASSIGNEE
+        if f_assignee:
+            try:
+                out["lark_options"] = lark_api.get_select_options(
+                    _lark_token(cfg), cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], f_assignee)
+            except Exception as e:
+                out["lark_error"] = str(e)
+        return out
 
 
 def do_check(pid: int) -> dict:
@@ -328,7 +404,7 @@ def do_list_projects() -> list:
 
 def do_create(body: dict) -> dict:
     """Create a draft project (sync and reconcile off). Raises HTTPException."""
-    key = (body.get("jira_project_key") or "").strip()
+    key = (body.get("jira_project_key") or "").strip().upper()
     if not key:
         raise HTTPException(400, "jira_project_key is required")
     src = None
@@ -410,6 +486,54 @@ async def patch_project(pid: int, request: Request):
     except ValueError as e:
         return _conflict_or_bad(e)
     return project_dict(p)
+
+
+@router.delete("/api/p/{pid}")
+async def delete_project(pid: int):
+    _project(pid)
+    try:
+        return await asyncio.to_thread(do_delete, pid)
+    except ValueError as e:
+        return _err(400, str(e))
+
+
+@router.post("/api/p/{pid}/fields/seed-defaults")
+async def seed_defaults(pid: int):
+    _project(pid)
+    try:
+        return await asyncio.to_thread(do_seed_defaults, pid)
+    except ValueError as e:
+        return _err(409, str(e))
+    except RuntimeError as e:
+        return _err(400, str(e))
+
+
+@router.post("/api/p/{pid}/copy-from")
+async def copy_from(pid: int, request: Request):
+    _project(pid)
+    body = await request.json()
+    try:
+        src = int(body.get("source"))
+    except (TypeError, ValueError, AttributeError):
+        return _err(400, "source (a project id) is required")
+    return await asyncio.to_thread(do_copy, pid, src)
+
+
+@router.post("/api/lark/resolve-link")
+async def resolve_link(request: Request):
+    body = await request.json()
+    try:
+        return await asyncio.to_thread(do_resolve_link, (body or {}).get("lark_base_link", ""))
+    except ValueError as e:
+        return _err(400, str(e))
+    except Exception as e:
+        return _err(502, f"Lark lookup failed: {e}")
+
+
+@router.get("/api/p/{pid}/people/suggestions")
+async def people_suggestions(pid: int):
+    _project(pid)
+    return await asyncio.to_thread(do_people_suggestions, pid)
 
 
 @router.get("/api/p/{pid}/tables")

@@ -9,6 +9,14 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
+## 2026-10-20 — Multi-project: new-project wizard and per-project Lark connect
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| _pending_ | feat | **`/p/new` and `/p/{pid}/setup?step=N` are the 9-step setup wizard** (Name + Jira, Lark table, Connect Lark, Copy from, Check fields, People, Sync types, Backfill, Go live), rendered in the sidebar layout. The draft is created (sync off) at the end of step 2; Go live is blocked while Title / Jira Key / Type mappings are missing and rebuilds the project's index. `/auth/start?project={pid}` carries `state=project:{pid}`; `/auth/callback` adds the bot and subscribes events on **that project's** Base (legacy `add_bot` → project #1). Also: Jira keys are upper-cased on create (duplicates are case-insensitive), `DELETE /api/p/{pid}` deletes a draft only (registry row + its mappings; project 1 refused; Jira/Lark untouched), `POST /api/p/{pid}/fields/seed-defaults`, `POST /api/p/{pid}/copy-from`, `POST /api/lark/resolve-link`, `GET /api/p/{pid}/people/suggestions`; `PATCH /api/p/{pid}` accepts `sync_enabled` / `reconcile_enabled` (only once active). 28 new tests. |
+
+---
+
 ## 2026-10-05 — Workspace-specific values moved from code to env vars
 
 | Commit | Type | Summary |
