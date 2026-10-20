@@ -326,10 +326,13 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
 
 def _assignee_update(updates: dict, lark_fields: dict, lark_assignee: "str | None",
                      unmapped: bool) -> bool:
-    """Queue a Lark Assignee set/clear so it matches Jira's assignee. Unassigned
-    or unmapped Jira assignee clears it (put is a no-op when the Assignee field
+    """Queue a Lark Assignee set/clear for a sweep. A mapped Jira assignee sets
+    it; an unmapped one clears it; a Jira-UNASSIGNED issue leaves Lark untouched
+    (R8: a Lark-only assignee must survive sweeps) (put is a no-op when the Assignee field
     is unmapped). Returns True when an unmapped person's clear was queued, i.e.
     exactly when a warning row is due (never when Lark is already empty)."""
+    if not lark_assignee and not unmapped:
+        return False  # Jira-unassigned: sweeps never clear (R8); only webhooks do
     if lark_assignee != _lark_select(lark_fields.get(field_mappings.F_ASSIGNEE)):
         put(updates, field_mappings.F_ASSIGNEE, [lark_assignee] if lark_assignee else None)
         return bool(unmapped and field_mappings.F_ASSIGNEE in updates)
@@ -550,7 +553,7 @@ def _backfill(cfg: dict) -> dict:
             if assignee_lark and not jira_name:
                 history.warn_unmapped_assignee(
                     jira_key=new_key, name=assignee_lark, lark_id=rid, type=itype,
-                    outcome="Jira Assignee unchanged", direction="lark→jira")
+                    outcome="Jira Assignee left unassigned", direction="lark→jira")
         except Exception as e:
             log.error(f"backfill: create Jira for {rid}: {e}")
 

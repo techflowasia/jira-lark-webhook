@@ -401,10 +401,25 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
         if assignee_lark and not jira_name:
             history.warn_unmapped_assignee(
                 jira_key=new_key, name=assignee_lark, lark_id=rid, type=itype,
-                outcome="Jira Assignee unchanged", direction="lark→jira")
+                outcome="Jira Assignee left unassigned", direction="lark→jira")
     finally:
         with _create_lock:
             _create_in_flight.discard(rid)
+
+
+_assignee_warned: dict = {}
+_assignee_warned_lock = threading.Lock()
+_ASSIGNEE_WARN_TTL = 3600
+
+
+def _assignee_warn_due(rid: str, name: str) -> bool:
+    key = (projects.current_id(), rid, name)
+    now = time.time()
+    with _assignee_warned_lock:
+        if now < _assignee_warned.get(key, 0):
+            return False
+        _assignee_warned[key] = now + _ASSIGNEE_WARN_TTL
+        return True
 
 
 def _handle_update(rid: str, table_id: str, cfg: dict,
@@ -533,8 +548,8 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
                      if field_mappings.reads_for_jira(field_mappings.F_ASSIGNEE) else None)
     if assignee_lark:
         jira_name = config.lark_to_jira_assignee().get(assignee_lark, "")
-        if not jira_name:
-            # Jira stays as-is; one warning per event that carries this person.
+        if not jira_name and _assignee_warn_due(rid, assignee_lark):
+            # Jira stays as-is; at most one warning per (project, record, person) per hour.
             history.warn_unmapped_assignee(
                 jira_key=jira_key, name=assignee_lark, lark_id=rid,
                 outcome="Jira Assignee unchanged", direction="lark→jira",

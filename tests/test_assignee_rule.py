@@ -10,6 +10,13 @@ from tests.test_unmapped_fields import (  # noqa: F401  (fixtures)
     CFG2, _clean, _full_issue, _p2_record, four, lark_mocks, mock_lark, rec_mocks)
 
 
+@pytest.fixture(autouse=True)
+def _reset_warned():
+    lark_handler._assignee_warned.clear()
+    yield
+    lark_handler._assignee_warned.clear()
+
+
 def _warnings():
     return [r for r in history._fallback if "not in people list" in r["description"]]
 
@@ -115,9 +122,9 @@ def test_reconcile_unmapped_already_empty_is_silent(four, rec_mocks):
     assert _warnings() == []
 
 
-def test_reconcile_unassigned_clears_no_warning(four, rec_mocks):
+def test_reconcile_unassigned_leaves_lark_unchanged(four, rec_mocks):
     ml = _sweep(rec_mocks, _issue("TWO-5", None), _rec("rec5", "TWO-5", "Ada"))
-    assert any(c[0][4].get("Assignee", 1) is None for c in ml.update_record.call_args_list)
+    assert not any("Assignee" in c[0][4] for c in ml.update_record.call_args_list)
     assert _warnings() == []
 
 
@@ -131,6 +138,15 @@ def test_reconcile_create_unmapped_warns(four, rec_mocks):
     ml = _sweep(rec_mocks, _issue("TWO-9", "Bob Stranger"), _rec("rec5", "TWO-5", "Ada"))
     assert "Assignee" not in ml.create_record.call_args[0][3]
     assert len(_warnings()) == 1
+
+
+def test_backfill_unassigned_leaves_lark_unchanged(four, rec_mocks):
+    ml, mj = rec_mocks
+    ml.fetch_all_records.return_value = [_rec("rec5", "TWO-5", "Ada")]
+    mj.fetch_all_issues.return_value = [_issue("TWO-5", None)]
+    reconcile.backfill(CFG2)
+    assert not any("Assignee" in c[0][4] for c in ml.update_record.call_args_list)
+    assert _warnings() == []
 
 
 def test_backfill_unmapped_clears_and_warns_once(four, rec_mocks):
@@ -188,4 +204,15 @@ def test_lark_create_unmapped_creates_unassigned_and_warns(four, lark_mocks):
     ml.get_record.return_value["fields"]["Jira Key"] = None
     lark_handler.process({"action": "record_added", "record_id": "recNew"}, P2_TABLE, CFG2)
     assert mj.create_issue.call_args[1]["assignee_id"] is None
+    assert len(_warnings()) == 1
+
+
+def test_lark_second_event_on_same_record_does_not_rewarn(four, lark_mocks):
+    _lark_update(lark_mocks, "Zed")
+    assert len(_warnings()) == 1
+    ml, mj = lark_mocks
+    rec = _rec("rec5", "TWO-5", "Zed")
+    rec["fields"]["Title"] = "Edited title"
+    ml.get_record.return_value = rec
+    lark_handler.process({"action": "record_edited", "record_id": "rec5"}, P2_TABLE, CFG2)
     assert len(_warnings()) == 1
