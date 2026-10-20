@@ -70,7 +70,13 @@ JIRA_TO_LARK_ASSIGNEE = _env_json("ASSIGNEE_MAP", {
 })
 # Seed for project #1 only (projects._env_project / bootstrap). At runtime use
 # jira_to_lark_assignee() / lark_to_jira_assignee(), which read the current project.
-LARK_TO_JIRA_ASSIGNEE = {v: k for k, v in JIRA_TO_LARK_ASSIGNEE.items()}
+def _invert_assignees(m: dict) -> dict:
+    """Lark name -> Jira name. Skips ignored people (Lark name "" or blank),
+    so an empty Lark Assignee never resolves to an ignored Jira user."""
+    return {v: k for k, v in m.items() if isinstance(v, str) and v.strip()}
+
+
+LARK_TO_JIRA_ASSIGNEE = _invert_assignees(JIRA_TO_LARK_ASSIGNEE)
 
 
 def set_active_table(table_id: str, table_name: str = "") -> None:
@@ -105,7 +111,7 @@ def jira_to_lark_assignee() -> dict:
 
 
 def lark_to_jira_assignee() -> dict:
-    return {v: k for k, v in jira_to_lark_assignee().items()}
+    return _invert_assignees(jira_to_lark_assignee())
 
 
 _collision_warned: set = set()
@@ -118,6 +124,8 @@ def lark_assignee_for(display_name: "str | None", *, jira_key: str = "",
 
     - Unassigned -> (None, False): a webhook update clears Lark, sweeps don't.
     - In the people list -> (mapped name, False).
+    - Ignored (in the people list with Lark name "" or blank) -> (None, True):
+      Lark is left unchanged, nothing is added and no row is written.
     - Not in the people list -> auto-added as {name: name} to the project's
       people list (one "Added" history row the first time) -> (name, False).
     - Not addable -> (None, True): the caller leaves Lark Assignee unchanged.
@@ -128,6 +136,8 @@ def lark_assignee_for(display_name: "str | None", *, jira_key: str = "",
         return None, False
     lark_name = jira_to_lark_assignee().get(display_name)
     if lark_name is not None:
+        if not lark_name.strip():
+            return None, True  # ignored person
         return lark_name, False
     import field_mappings, history, projects
     if not field_mappings.F_ASSIGNEE:
@@ -154,7 +164,10 @@ def lark_assignee_for(display_name: "str | None", *, jira_key: str = "",
         history.record(direction="jira→lark", event="config", jira_key=jira_key,
                        description=f"Added '{display_name}' to People list and Lark Assignee",
                        status="ok", type=type)
-    return jira_to_lark_assignee().get(display_name, display_name), False
+    final = jira_to_lark_assignee().get(display_name, display_name)
+    if not final.strip():
+        return None, True  # marked ignored concurrently
+    return final, False
 
 
 def get_cfg() -> dict:

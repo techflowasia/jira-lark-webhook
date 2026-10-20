@@ -255,18 +255,30 @@ async function addDefault(jf) {
 
 /* ── step 6 ──────────────────────────────────────────────────────────── */
 var PEOPLE = {};
+// Lark name "" = ignored: that person's Jira assignment is never synced to Lark.
+function personRow(k, v) {
+  var ign = !String(v || '').trim();
+  return '<tr><td>' + esc(k) + '</td><td>' + (ign ? '<em>(ignored)</em>' : esc(v)) +
+    '</td><td><button class="sec" data-k="' + esc(k) + '" onclick="rmPerson(this.dataset.k)">Remove</button></td></tr>';
+}
 function drawPeople() {
   var h = '';
-  Object.keys(PEOPLE).sort().forEach(function (k, i) {
-    h += '<tr><td>' + esc(k) + '</td><td>' + esc(PEOPLE[k]) + '</td><td><button class="sec" data-k="' + esc(k) + '" onclick="rmPerson(this.dataset.k)">Remove</button></td></tr>';
-  });
-  $('ptable').innerHTML = '<table><tr><th>Jira user</th><th>Lark name</th><th></th></tr>' + (h || '<tr><td colspan="3">No one mapped. Unmapped Jira assignees clear the Lark Assignee on webhook.</td></tr>') + '</table>';
+  Object.keys(PEOPLE).sort().forEach(function (k) { h += personRow(k, PEOPLE[k]); });
+  $('ptable').innerHTML = '<table><tr><th>Jira user</th><th>Lark name</th><th></th></tr>' + (h || '<tr><td colspan="3">No one mapped yet. A Jira assignee not listed here is added automatically under their Jira name.</td></tr>') + '</table>';
 }
 function rmPerson(k) { delete PEOPLE[k]; drawPeople(); }
+// Returns '' when added, else an error message (nothing is added).
+function addPersonTo(people, j, l, ign) {
+  j = (j || '').trim(); l = (l || '').trim();
+  if (!j) return 'Enter a Jira user.';
+  if (!ign && !l) return 'Enter a Lark name for ' + j + ', or tick Ignore.';
+  people[j] = ign ? '' : l;
+  return '';
+}
 function addPerson() {
-  var j = $('pj').value.trim(), l = $('pl').value.trim();
-  if (!j || !l) return;
-  PEOPLE[j] = l; $('pj').value = ''; $('pl').value = ''; drawPeople();
+  var err = addPersonTo(PEOPLE, $('pj').value, $('pl').value, $('pign').checked);
+  if (err) { say('pmsg', 'bad', err); return; }
+  $('pj').value = ''; $('pl').value = ''; $('pign').checked = false; drawPeople();
 }
 async function loadPeople() {
   try {
@@ -459,11 +471,14 @@ def _step_html(p: "projects.Project", n: int) -> str:
                 '<div class="msg" id="chmsg"></div><div id="chtable"></div><div class="msg warn" id="chpeople"></div>')
     if n == 6:
         return ("<h3>Step 6 - People</h3>"
-                "<p>Map Jira users to Lark Assignee names. An unassigned or unmapped Jira assignee clears the Lark Assignee.</p>"
+                "<p>Map Jira users to Lark Assignee names. A Jira assignee not listed here is added automatically "
+                "under their Jira name. Tick <b>Ignore</b> for a person whose assignment should never be synced to Lark "
+                "(the Lark Assignee is left unchanged).</p>"
                 '<div id="ptable"></div><div class="msg warn" id="pnote"></div>'
                 '<label for="pj">Jira user</label><input type="text" id="pj" list="jl">'
                 '<datalist id="jl"></datalist>'
                 '<label for="pl">Lark name</label><input type="text" id="pl" list="ll"><datalist id="ll"></datalist>'
+                '<label><input type="checkbox" id="pign"> Ignore (never sync this person to Lark)</label>'
                 '<button type="button" class="sec" onclick="addPerson()">Add</button>'
                 '<button type="button" onclick="savePeople()">Save people</button><div class="msg" id="pmsg"></div>')
     if n == 7:

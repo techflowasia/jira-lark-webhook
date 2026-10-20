@@ -339,3 +339,11 @@ def test_parse_base_link(monkeypatch):
         lark_api.parse_base_link("tok", "https://example.com/hello")
     with pytest.raises(ValueError, match="Not a Lark Base link"):
         lark_api.parse_base_link("tok", "garbage")
+
+
+def test_people_put_round_trips_ignored_entry():
+    m = {"Ada Lovelace": "Ada", "Ivy Ignored": ""}
+    r = client.put("/api/p/1/people", json={"assignee_map": m})
+    assert r.status_code == 200 and r.json() == {"assignee_map": m}
+    assert projects.get(1).assignee_map == m
+    assert client.get("/api/p/1/people").json() == {"assignee_map": m}

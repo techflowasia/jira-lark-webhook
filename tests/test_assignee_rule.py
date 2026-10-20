@@ -488,3 +488,141 @@ def test_concurrent_option_adds_keep_every_option(lark_http):
     assert final[:len(_OLD_OPTIONS)] == _OLD_OPTIONS
     assert {o["name"] for o in final[len(_OLD_OPTIONS):]} == {"A", "B"}
     assert {o["name"] for o in lark_http["options"]} == {"Tawan", "Lin", "Nurse", "A", "B"}
+
+
+# ── ignored people: assignee_map value "" ───────────────────────────────
+
+IGNORED = "Ivy Ignored"
+
+
+@pytest.fixture
+def ignored(four):
+    projects.update(2, {"assignee_map": {"Ada Lovelace": "Ada", IGNORED: ""}})
+    history._fallback.clear()
+    return four
+
+
+def _no_side_rows():
+    """No warning / added / skipped row of any kind for the ignored person."""
+    assert [r for r in history._fallback
+            if r["event"] == "config" or r["status"] != "ok"
+            or IGNORED in r["description"]] == []
+
+
+def test_ignored_lark_assignee_for(ignored, map_writes):
+    with projects.use(2):
+        assert config.lark_assignee_for(IGNORED, jira_key="TWO-5") == (None, True)
+    assert map_writes == [] and list(history._fallback) == []
+
+
+@pytest.mark.parametrize("cur", ["Ada", None])
+def test_jira_update_ignored_leaves_lark_and_writes_no_row(ignored, mock_lark, map_writes, cur):
+    _update(mock_lark, _issue("TWO-5", IGNORED), IGNORED, cur=cur)
+    mock_lark.update_record.assert_not_called()
+    assert list(history._fallback) == [] and map_writes == []
+    assert _map()[IGNORED] == ""
+
+
+def test_jira_create_ignored_writes_no_assignee(ignored, mock_lark, map_writes):
+    jira_handler.process("jira:issue_created", _issue("TWO-6", IGNORED), {}, CFG2)
+    assert "Assignee" not in mock_lark.create_record.call_args[0][3]
+    _no_side_rows()
+    assert map_writes == [] and _map()[IGNORED] == ""
+
+
+@pytest.mark.parametrize("cur", ["Ada", None])
+def test_reconcile_ignored_leaves_lark(ignored, rec_mocks, map_writes, cur):
+    ml = _sweep(rec_mocks, _issue("TWO-5", IGNORED), _rec("rec5", "TWO-5", cur))
+    assert _assignee_writes(ml) == []
+    _no_side_rows()
+    assert map_writes == []
+
+
+def test_reconcile_create_ignored_writes_no_assignee(ignored, rec_mocks, map_writes):
+    ml = _sweep(rec_mocks, _issue("TWO-9", IGNORED), _rec("rec5", "TWO-5", "Ada"))
+    assert "Assignee" not in ml.create_record.call_args[0][3]
+    _no_side_rows()
+    assert map_writes == []
+
+
+@pytest.mark.parametrize("cur", ["Ada", None])
+def test_backfill_ignored_leaves_lark(ignored, rec_mocks, map_writes, cur):
+    ml, mj = rec_mocks
+    ml.fetch_all_records.return_value = [_rec("rec5", "TWO-5", cur)]
+    mj.fetch_all_issues.return_value = [_issue("TWO-5", IGNORED)]
+    reconcile.backfill(CFG2)
+    assert _assignee_writes(ml) == []
+    _no_side_rows()
+    assert map_writes == []
+
+
+def test_backfill_create_ignored_writes_no_assignee(ignored, rec_mocks):
+    ml, mj = rec_mocks
+    ml.fetch_all_records.return_value = []
+    mj.fetch_all_issues.return_value = [_issue("TWO-9", IGNORED)]
+    reconcile.backfill(CFG2)
+    assert "Assignee" not in ml.create_record.call_args[0][3]
+    _no_side_rows()
+
+
+def test_ignored_person_never_adds_a_lark_option(ignored, lark_http):
+    """End to end through the real lark_api: the ignored person produces no
+    record write naming them and no field PUT."""
+    lark_http["reject"] = {IGNORED}
+    with patch("jira_handler.lark_api.get_token", return_value="tok"), \
+         patch("jira_handler.lark_api.get_cached_or_fetch_record",
+               return_value={"fields": {"Assignee": [{"text": "Ada"}]}}):
+        with projects.use(2):
+            index.add("TWO-5", "rec5")
+        cl = {"items": [{"field": "assignee", "fieldId": "assignee", "toString": IGNORED}]}
+        jira_handler.process("jira:issue_updated", _issue("TWO-5", IGNORED), cl, CFG2)
+    assert _field_puts(lark_http) == []
+    assert not any(IGNORED in str(b) for _, _, b in lark_http["calls"])
+
+
+def test_empty_lark_name_never_resolves_to_ignored_jira_user(ignored):
+    with projects.use(2):
+        inv = config.lark_to_jira_assignee()
+    assert inv == {"Ada": "Ada Lovelace"}
+    assert "" not in inv
+    projects.update(2, {"assignee_map": {"Ada Lovelace": "Ada", IGNORED: "  "}})
+    with projects.use(2):
+        assert config.lark_to_jira_assignee() == {"Ada": "Ada Lovelace"}
+
+
+def test_lark_update_with_empty_assignee_never_assigns_ignored_user(ignored, lark_mocks):
+    ml, mj = lark_mocks
+    mj.get_account_ids.return_value = {"Ada Lovelace": "acc-ada", IGNORED: "acc-ivy"}
+    for empty in (None, [], [{"text": ""}]):
+        mj.update_issue.reset_mock()
+        with projects.use(2):
+            index.add("TWO-5", "rec5")
+        rec = _rec("rec5", "TWO-5", None)
+        rec["fields"]["Assignee"] = empty
+        ml.get_record.return_value = rec
+        mj.get_issue.return_value = {"fields": {
+            "summary": "Old", "duedate": None, config.JF_START: None,
+            "assignee": {"accountId": "acc-ada"}, "fixVersions": [],
+            "parent": None, "status": {"name": "To Do"}, config.JF_SPRINT: []}}
+        lark_handler.process({"action": "record_edited", "record_id": "rec5"}, P2_TABLE, CFG2)
+        for c in mj.update_issue.call_args_list:
+            assert c[0][2].get("assignee") != {"id": "acc-ivy"}
+
+
+def test_auto_add_treats_ignored_entry_as_existing(ignored, map_writes):
+    with projects.use(2):
+        assert projects.add_assignee(2, IGNORED, IGNORED) == "exists"
+    assert _map()[IGNORED] == "" and map_writes == []
+
+
+def test_assignee_map_env_seed_accepts_ignored(monkeypatch):
+    import importlib
+    monkeypatch.setenv("ASSIGNEE_MAP", '{"X": "", "Tawan Vongsombun": "Tawan"}')
+    try:
+        importlib.reload(config)
+        assert config.JIRA_TO_LARK_ASSIGNEE == {"X": "", "Tawan Vongsombun": "Tawan"}
+        assert config.LARK_TO_JIRA_ASSIGNEE == {"Tawan": "Tawan Vongsombun"}
+        assert projects._env_project().assignee_map == {"X": "", "Tawan Vongsombun": "Tawan"}
+    finally:
+        monkeypatch.delenv("ASSIGNEE_MAP")
+        importlib.reload(config)

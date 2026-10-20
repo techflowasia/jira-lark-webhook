@@ -425,7 +425,8 @@ def do_check(pid: int) -> dict:
                     token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], f_assignee))
                 # A user-type column has no options to compare against.
                 if options:
-                    people["unknown_lark"] = sorted({v for v in amap.values() if v not in options})
+                    people["unknown_lark"] = sorted({v for v in amap.values()
+                                                    if v.strip() and v not in options})
             except Exception as e:
                 out["people_error"] = f"could not read Lark assignee options: {e}"
         return out

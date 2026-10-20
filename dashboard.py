@@ -736,21 +736,49 @@ async function saveSyncTypes() {
 
 // ── People ──
 var _unmappedJira = [];
-function peopleRow(j, l) {
+// An ignored person has Lark name "" in the map: their Jira assignment is
+// never synced to Lark (Lark Assignee left unchanged, nothing auto-added).
+function peopleRow(j, l, ign) {
   return '<tr><td><input type="text" class="pp-jira" value="' + esc(j) + '" placeholder="Jira display name"></td>' +
-    '<td><input type="text" class="pp-lark" value="' + esc(l) + '" placeholder="Lark name"></td>' +
+    '<td><input type="text" class="pp-lark" value="' + (ign ? '' : esc(l)) + '" placeholder="' +
+      (ign ? '(ignored)' : 'Lark name') + '"' + (ign ? ' disabled' : '') + '>' +
+      '<span class="pp-ign-tag"' + (ign ? '' : ' style="display:none"') + '> (ignored)</span></td>' +
+    '<td><label><input type="checkbox" class="pp-ign" onchange="ppIgnore(this)"' + (ign ? ' checked' : '') + '> Ignore</label></td>' +
     '<td><button class="fm-edit-btn fm-delete" onclick="this.closest(\\'tr\\').remove()">Remove</button></td></tr>';
 }
+function ppIgnore(cb) {
+  var tr = cb.closest('tr'), inp = tr.querySelector('.pp-lark');
+  inp.disabled = cb.checked;
+  inp.placeholder = cb.checked ? '(ignored)' : 'Lark name';
+  if (cb.checked) inp.value = '';
+  tr.querySelector('.pp-ign-tag').style.display = cb.checked ? '' : 'none';
+}
 function addPeopleRow(j, l) {
-  document.getElementById('people-tbody').insertAdjacentHTML('beforeend', peopleRow(j || '', l || ''));
+  document.getElementById('people-tbody').insertAdjacentHTML('beforeend', peopleRow(j || '', l || '', false));
+}
+// rows: [{j, l, ign}] -> {map, missing}. Ignored -> "", a named row -> its
+// name, a row with a Jira name but no Lark name and not ignored -> missing
+// (never silently dropped). Rows with no Jira name are blank and skipped.
+function collectPeople(rows) {
+  var map = {}, missing = [];
+  rows.forEach(function(r) {
+    var j = (r.j || '').trim(), l = (r.l || '').trim();
+    if (!j) return;
+    if (r.ign) map[j] = '';
+    else if (l) map[j] = l;
+    else missing.push(j);
+  });
+  return {map: map, missing: missing};
 }
 async function loadPeople() {
   var tb = document.getElementById('people-tbody');
   try {
     var d = await (await fetch(API + 'people')).json();
     var m = d.assignee_map || {};
-    tb.innerHTML = Object.keys(m).sort().map(function(k) { return peopleRow(k, m[k]); }).join('');
-  } catch(e) { tb.innerHTML = '<tr><td colspan="3" class="empty">Failed to load.</td></tr>'; }
+    tb.innerHTML = Object.keys(m).sort().map(function(k) {
+      return peopleRow(k, m[k], !String(m[k] || '').trim());
+    }).join('');
+  } catch(e) { tb.innerHTML = '<tr><td colspan="4" class="empty">Failed to load.</td></tr>'; }
   loadPeopleCheck();
 }
 async function loadPeopleCheck() {
@@ -775,14 +803,19 @@ function addUnmapped() {
   _unmappedJira.forEach(function(n) { if (have.indexOf(n) === -1) addPeopleRow(n, ''); });
 }
 async function savePeople() {
-  var m = {};
-  var rows = document.querySelectorAll('#people-tbody tr');
-  rows.forEach(function(r) {
-    var j = r.querySelector('.pp-jira').value.trim();
-    var l = r.querySelector('.pp-lark').value.trim();
-    if (j && l) m[j] = l;
+  var rows = Array.from(document.querySelectorAll('#people-tbody tr')).filter(function(r) {
+    return r.querySelector('.pp-jira');
+  }).map(function(r) {
+    return {j: r.querySelector('.pp-jira').value, l: r.querySelector('.pp-lark').value,
+            ign: r.querySelector('.pp-ign').checked};
   });
+  var c = collectPeople(rows), m = c.map, missing = c.missing;
   var msg = document.getElementById('people-msg');
+  if (missing.length) {
+    msg.textContent = 'Lark name missing for: ' + missing.join(', ') + '. Enter a name or tick Ignore.';
+    msg.style.color = '#ef4444';
+    return;
+  }
   msg.textContent = 'Saving…'; msg.style.color = '#64748b';
   try {
     var res = await fetch(API + 'people', {
@@ -934,8 +967,8 @@ def render_project(p, request, history_result: dict) -> str:
         <button class="change-btn" onclick="addPeopleRow()">+ Add person</button></span>
     </div>
     <table id="people-table">
-      <thead><tr><th>Jira name</th><th>Lark name</th><th></th></tr></thead>
-      <tbody id="people-tbody"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
+      <thead><tr><th>Jira name</th><th>Lark name</th><th>Ignore</th><th></th></tr></thead>
+      <tbody id="people-tbody"><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
     </table>
     <div class="sync-save-row">
       <button class="sync-save-btn" onclick="savePeople()">Save People</button>
