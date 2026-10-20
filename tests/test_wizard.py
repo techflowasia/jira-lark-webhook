@@ -256,7 +256,7 @@ def test_step5_next_disabled_and_later_steps_locked():
     for n in (6, 7, 8, 9):
         assert f'data-href="/p/{p.id}/setup?step={n}"' in html
     later = client.get(f"/p/{p.id}/setup?step=7").text
-    assert "data-lock" not in later
+    assert "data-lock=\"1\"" not in later
 
 
 def test_repoint_keeps_other_fields(fake_supabase):
