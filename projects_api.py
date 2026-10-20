@@ -65,20 +65,25 @@ def _valid_str_list(v) -> bool:
     return isinstance(v, list) and all(isinstance(x, str) for x in v)
 
 
+def _rebuild_now(pid: int) -> None:
+    """Rebuild one project's index synchronously. Raises on any failure."""
+    p = projects.get(pid)
+    if p is None:
+        raise KeyError(f"project {pid} not found")
+    cfg = projects.cfg_for(p)
+    token = _lark_token(cfg)
+    records = lark_api.fetch_all_records(token, p.lark_base_token, p.lark_table_id)
+    with projects.use(pid):
+        index.rebuild(records)
+        log.info(f"Project {pid}: table '{p.lark_table_name}' ({p.lark_table_id}), "
+                 f"{len(index._jira_to_lark)} records indexed")
+        history.record(direction="system", event="config",
+                       description=f"Index rebuilt for Lark table '{p.lark_table_name}' ({p.lark_table_id})")
+
+
 def _rebuild_sync(pid: int) -> None:
     try:
-        p = projects.get(pid)
-        if p is None:
-            return
-        cfg = projects.cfg_for(p)
-        token = _lark_token(cfg)
-        records = lark_api.fetch_all_records(token, p.lark_base_token, p.lark_table_id)
-        with projects.use(pid):
-            index.rebuild(records)
-            log.info(f"Project {pid}: table '{p.lark_table_name}' ({p.lark_table_id}), "
-                     f"{len(index._jira_to_lark)} records indexed")
-            history.record(direction="system", event="config",
-                           description=f"Index rebuilt for Lark table '{p.lark_table_name}' ({p.lark_table_id})")
+        _rebuild_now(pid)
     except Exception as e:
         log.error(f"Index rebuild failed for project {pid}: {e}")
 
@@ -238,6 +243,11 @@ def do_patch(pid: int, body: dict) -> "projects.Project":
                 missing = field_mappings.missing_required()
             if missing:
                 raise ValueError("required mapping missing: " + ", ".join(missing))
+            # Server-side gate for wizard step 5: every mapping must check out.
+            chk = do_check(pid)
+            if not chk["ready"]:
+                raise ValueError("field check failed: " + "; ".join(
+                    pr["problem"] for pr in chk["fields"]))
         changes["setup_state"] = body["setup_state"]
     for k in ("sync_enabled", "reconcile_enabled"):
         if k in body:
@@ -255,12 +265,17 @@ def do_patch(pid: int, body: dict) -> "projects.Project":
         table_changed = body["lark_table_id"] != cur.lark_table_id
         changes["lark_table_id"] = str(body["lark_table_id"]).strip()
         changes["lark_table_name"] = str(body.get("lark_table_name", "")).strip()
+    if going_live:
+        # The index must exist before sync turns on. Build it now; on failure
+        # nothing is changed and the project stays draft with sync off.
+        try:
+            _rebuild_now(pid)
+        except Exception as e:
+            log.error(f"Go-live index rebuild failed for project {pid}: {e}")
+            raise ValueError(f"could not build the index, project left as draft: {e}")
     p = projects.update(pid, changes)  # raises ValueError on duplicate table
     if table_changed:
         _on_table_changed()
-        _start_rebuild(pid)
-    elif going_live:
-        # Cheap insurance: a project whose index was never built since boot.
         _start_rebuild(pid)
     return p
 
@@ -527,7 +542,8 @@ async def resolve_link(request: Request):
     except ValueError as e:
         return _err(400, str(e))
     except Exception as e:
-        return _err(502, f"Lark lookup failed: {e}")
+        log.warning(f"resolve-link failed: {e}")
+        return _err(502, "Lark lookup failed (see server log)")
 
 
 @router.get("/api/p/{pid}/people/suggestions")

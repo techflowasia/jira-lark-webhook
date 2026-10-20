@@ -231,14 +231,16 @@ def delete(pid: int) -> None:
             raise ValueError("project 1 cannot be deleted")
         if cur.setup_state != "draft":
             raise ValueError("only a draft project can be deleted")
+        if cur.sync_enabled:
+            raise ValueError("turn sync off before deleting")
         client = history._get_client()
         if client:
             client.table("field_mappings").delete().eq("project_id", pid).execute()
             if _persisted:
                 client.table(_TABLE).delete().eq("id", pid).execute()
         del _projects[pid]
-    import field_mappings
-    field_mappings._by_project.pop(pid, None)
+        import field_mappings
+        field_mappings._by_project.pop(pid, None)
 
 
 @contextlib.contextmanager

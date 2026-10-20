@@ -2,6 +2,7 @@
 import asyncio
 import html as _html
 import json
+import re
 import logging
 import urllib.request
 import urllib.parse
@@ -141,10 +142,9 @@ async def auth_start(project: str = ""):
     connects that project's Base (no param -> legacy state, project #1)."""
     state = "add_bot"
     if project != "":
-        try:
-            pid = int(project)
-        except ValueError:
-            raise HTTPException(400, "project must be a number")
+        if not re.fullmatch(r"[1-9][0-9]*", project):
+            raise HTTPException(400, "project must be a positive number")
+        pid = int(project)
         if projects.get(pid) is None:
             raise HTTPException(404, f"project {pid} not found")
         state = f"project:{pid}"
@@ -166,12 +166,12 @@ async def auth_callback(request: Request):
 
     # state: "project:<id>" (wizard) or the legacy "add_bot" (project #1).
     state = request.query_params.get("state", "")
-    pid = 1
-    if state.startswith("project:"):
-        try:
-            pid = int(state.split(":", 1)[1])
-        except ValueError:
-            return HTMLResponse("<h2>Error: bad project in state</h2>", status_code=400)
+    if state == "add_bot":
+        pid = 1
+    elif re.fullmatch(r"project:[1-9][0-9]*", state):
+        pid = int(state.split(":", 1)[1])
+    else:
+        return HTMLResponse("<h2>Error: invalid state</h2>", status_code=400)
     proj = projects.get(pid)
     if proj is None:
         return HTMLResponse(f"<h2>Error: project {_html.escape(str(pid))} not found</h2>", status_code=400)

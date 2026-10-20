@@ -33,6 +33,7 @@ _CSS = """
   .stepper { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 18px; }
   .stepper a { padding: 6px 10px; border-radius: 6px; background: #e2e8f0; color: #334155;
                font-size: 12px; text-decoration: none; }
+  .stepper a.locked { opacity: .45; cursor: not-allowed; }
   .stepper a.cur { background: #0f172a; color: #fff; font-weight: 600; }
   .wz .panel { background: #fff; border-radius: 10px; padding: 20px 22px;
                box-shadow: 0 1px 2px rgba(0,0,0,.06); }
@@ -99,7 +100,7 @@ async function readLink() {
     var sel = $('tbl'); sel.innerHTML = '';
     LARK.tables.forEach(function (t) {
       sel.innerHTML += '<option value="' + esc(t.table_id) + '"' + (t.table_id === j.table_id ? ' selected' : '') +
-        '>' + esc(t.name) + ' (' + esc(t.table_id) + ')</option>';
+        ' data-name="' + esc(t.name) + '">' + esc(t.name) + ' (' + esc(t.table_id) + ')</option>';
     });
     if (!LARK.tables.length) {
       if (!j.table_id) { say('lmsg', 'bad', 'The bot cannot list this Base yet and the link names no table. Use a link ending in ?table=tbl... (open the table in Lark and copy the link).'); return; }
@@ -114,7 +115,7 @@ async function createDraft() {
   if (!JIRA.name) { say('cmsg', 'bad', 'Check the Jira project first (step 1)'); return; }
   $('create').disabled = true;
   var key = $('jkey').value.trim().toUpperCase();
-  var tsel = $('tbl'), tname = tsel.selectedIndex >= 0 ? tsel.options[tsel.selectedIndex].text.replace(/ \(.*\)$/, '') : '';
+  var tsel = $('tbl'), tname = tsel.selectedIndex >= 0 ? (tsel.options[tsel.selectedIndex].getAttribute('data-name') || '') : '';
   try {
     var p = await api('POST', '/api/projects', {name: $('pname').value.trim() || key, jira_project_key: key,
       lark_base_token: LARK.base, lark_table_id: tsel.value});
@@ -147,7 +148,7 @@ async function loadTables() {
     var j = await api('GET', '/api/p/' + PID + '/tables');
     if (j.error) { say('tmsg', 'warn', 'Cannot list tables yet: ' + j.error + ' (connect Lark in step 3)'); return; }
     var sel = $('tbl'); sel.innerHTML = '';
-    (j.tables || []).forEach(function (t) { sel.innerHTML += '<option value="' + esc(t.table_id) + '"' + (t.table_id === j.active_table_id ? ' selected' : '') + '>' + esc(t.name) + ' (' + esc(t.table_id) + ')</option>'; });
+    (j.tables || []).forEach(function (t) { sel.innerHTML += '<option value="' + esc(t.table_id) + '"' + (t.table_id === j.active_table_id ? ' selected' : '') + ' data-name="' + esc(t.name) + '">' + esc(t.name) + ' (' + esc(t.table_id) + ')</option>'; });
   } catch (x) { say('tmsg', 'bad', x.message); }
 }
 async function saveTable() {
@@ -155,7 +156,7 @@ async function saveTable() {
   if (sel.selectedIndex < 0) return;
   try {
     await api('PATCH', '/api/p/' + PID, {lark_table_id: sel.value,
-      lark_table_name: sel.options[sel.selectedIndex].text.replace(/ \(.*\)$/, '')});
+      lark_table_name: sel.options[sel.selectedIndex].getAttribute('data-name') || ''});
     say('tmsg', 'ok', 'Saved');
   } catch (x) { say('tmsg', 'bad', x.message); }
 }
@@ -224,9 +225,16 @@ async function runCheck() {
     if (j.people && (j.people.unmapped_jira.length || j.people.unknown_lark.length))
       warn = 'People still to review in step 6: ' + j.people.unmapped_jira.length + ' Jira user(s) unmapped, ' + j.people.unknown_lark.length + ' mapped name(s) not in the Lark Assignee options.';
     $('chpeople').textContent = warn;
+    setLock(!j.ready);
     if (j.ready) { say('chmsg', 'ok', 'All mappings match. You can continue.'); $('next5').disabled = false; }
     else say('chmsg', 'bad', j.fields.length + ' problem(s). Re-point or delete each mapped column (deleting means that field does not sync) before continuing. Title, Jira Key and Type are required.');
   } catch (x) { say('chmsg', 'bad', x.message); }
+}
+function setLock(on) {
+  Array.prototype.forEach.call(document.querySelectorAll('.stepper a[data-lock]'), function (a) {
+    if (on) { a.classList.add('locked'); a.setAttribute('href', '#'); a.onclick = function () { return false; }; }
+    else { a.classList.remove('locked'); a.setAttribute('href', a.getAttribute('data-href')); a.onclick = null; }
+  });
 }
 async function repoint(id, i) {
   var v = $('rp' + i).value; if (!v) return;
@@ -334,7 +342,11 @@ def _stepper(pid: "int | None", cur: int) -> str:
     out = ""
     for n, label in STEPS:
         cls = ' class="cur"' if n == cur else ""
-        if pid is None:
+        if pid is not None and cur <= 5 and n > 5:
+            # Inert until step 5's check has passed (runCheck unlocks them).
+            out += (f'<a{cls} class="locked" data-lock="1" href="#" '
+                    f'data-href="/p/{pid}/setup?step={n}" onclick="return false">{n}. {e(label)}</a>')
+        elif pid is None:
             out += f'<a{cls} href="#" onclick="return false">{n}. {e(label)}</a>'
         else:
             out += f'<a{cls} href="/p/{pid}/setup?step={n}">{n}. {e(label)}</a>'
@@ -393,7 +405,7 @@ def _clamp(step) -> int:
 
 def _nav(pid: int, n: int, next_id: str = "") -> str:
     prev = f'<a class="btn sec" href="/p/{pid}/setup?step={n - 1}">Back</a>' if n > 1 else ""
-    nxt = (f'<button type="button" id="{next_id}" onclick="go({n + 1})">Next</button>' if next_id
+    nxt = (f'<button type="button" id="{next_id}" disabled onclick="go({n + 1})">Next</button>' if next_id
            else f'<a class="btn" href="/p/{pid}/setup?step={n + 1}">Next</a>') if n < len(STEPS) else ""
     return f'<div>{prev}{nxt}</div>'
 
