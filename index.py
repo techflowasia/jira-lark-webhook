@@ -1,9 +1,9 @@
 """Shared in-memory index: jira_key <-> lark record_id, one pair of maps per
 project. `index._jira_to_lark` / `index._lark_to_jira` resolve to the
 current project's maps (see projects.use)."""
+import field_mappings
 import projects
 from utils import _lark_text
-from config import F_JIRA_KEY
 
 # project id -> (jira_key → record_id, record_id → jira_key)
 _maps: "dict[int, tuple[dict, dict]]" = {}
@@ -13,6 +13,8 @@ def _for(pid: "int | None" = None) -> "tuple[dict, dict]":
     return _maps.setdefault(projects.current_id() if pid is None else pid, ({}, {}))
 
 
+# Reads only: assigning or monkeypatch.setattr-ing index._jira_to_lark would
+# create a real module attribute that shadows this per-project lookup.
 def __getattr__(name: str):
     if name == "_jira_to_lark":
         return _for()[0]
@@ -29,8 +31,9 @@ def rebuild(records: list) -> None:
     j2l, l2j = _for()
     j2l.clear()
     l2j.clear()
+    key_col = field_mappings.F_JIRA_KEY
     for rec in records:
-        jk = _lark_text(rec["fields"].get(F_JIRA_KEY))
+        jk = _lark_text(rec["fields"].get(key_col))
         if jk:
             j2l[jk] = rec["record_id"]
             l2j[rec["record_id"]] = jk

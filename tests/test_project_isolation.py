@@ -121,6 +121,7 @@ def test_cfg_without_project_id_uses_current_project(two_projects, mock_lark):
         jira_handler.process("jira:issue_created", _issue("NEW-3"), {}, CFG2 | {"PROJECT_ID": 2})
         jira_handler.process("jira:issue_created", _issue("NEW-4"), {},
                              {k: v for k, v in CFG2.items() if k != "PROJECT_ID"})
+    assert mock_lark.create_record.call_count == 2
     for call in mock_lark.create_record.call_args_list:
         assert "Name" in call[0][3]
 
@@ -269,10 +270,9 @@ def test_reconcile_backfill_runs_in_its_project(two_projects):
         ml.fetch_all_records.return_value = [
             {"record_id": "recQ", "fields": {"Jira Key": "TWO-5", "Type": "Epic"}}]
         mj.fetch_all_issues.return_value = []
-        try:
-            reconcile.backfill(CFG2)
-        except Exception:
-            pass
+        ml.get_base_tz_hours.return_value = 0.0
+        result = reconcile.backfill(CFG2)
+        assert isinstance(result, dict)
         assert mj.fetch_all_issues.call_args[1]["types"] and \
             set(mj.fetch_all_issues.call_args[1]["types"]) == set(P2_TYPES)
     assert seen and seen[0] == 2
@@ -367,3 +367,34 @@ def test_field_mappings_copy_from(fake_supabase, two_projects):
     with projects.use(p3.id):
         assert field_mappings.F_TITLE == "Title"
     field_mappings._by_project.pop(p3.id, None)
+
+
+def test_index_rebuild_uses_projects_jira_key_column(two_projects):
+    field_mappings._by_project[2] = [
+        dict(d, lark_field="Key") if d["jira_field"] == "key" else dict(d)
+        for d in field_mappings._by_project[2]]
+    recs = [{"record_id": "recK", "fields": {"Key": "TWO-7", "Jira Key": "WRONG-1"}},
+            {"record_id": "recJ", "fields": {"Jira Key": "PROJ-7"}}]
+    with projects.use(2):
+        index.rebuild(recs)
+        assert index._jira_to_lark == {"TWO-7": "recK"}
+    with projects.use(1):
+        index.rebuild(recs)
+        assert index._jira_to_lark == {"WRONG-1": "recK", "PROJ-7": "recJ"}
+
+
+def test_bootstrap_adopts_null_project_history_rows(fake_supabase):
+    saved = (projects._projects, projects._persisted)
+    try:
+        fake_supabase.insert_row("sync_history", {"description": "old", "status": "error",
+                                                  "project_id": None})
+        fake_supabase.insert_row("sync_history", {"description": "other", "project_id": 9})
+        p = projects.bootstrap_default()
+        rows = {r["description"]: r["project_id"] for r in fake_supabase.rows("sync_history")}
+        assert rows["old"] == p.id and rows["other"] == 9
+        projects.bootstrap_default()  # idempotent rerun
+        rows = {r["description"]: r["project_id"] for r in fake_supabase.rows("sync_history")}
+        assert rows["old"] == p.id and rows["other"] == 9
+        assert "old" in [r["description"] for r in history.query(project_id=p.id)["rows"]]
+    finally:
+        projects._projects, projects._persisted = saved

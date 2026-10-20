@@ -211,6 +211,8 @@ def copy_from(src_pid: int, dst_pid: int) -> int:
 class _Module(types.ModuleType):
     """`field_mappings._cache` reads and replaces the current project's rows."""
 
+    # Assigning (or monkeypatch.setattr-ing) _cache replaces only the CURRENT
+    # project's rows; it does not shadow the per-project store.
     @property
     def _cache(self) -> list:
         return _rows()

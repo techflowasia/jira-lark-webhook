@@ -32,9 +32,7 @@ def setup_function():
     index._lark_to_jira["recEpic"] = "PROJ-10"
     import lark_handler
     lark_handler._version_cache.clear()
-    lark_handler._version_cache.update({"data": {}, "expires_at": 0})
     lark_handler._sprint_cache.clear()
-    lark_handler._sprint_cache.update({"data": {}, "expires_at": 0})
 
 
 @patch("lark_handler.jira_api")

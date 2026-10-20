@@ -307,6 +307,9 @@ def bootstrap_default() -> Project:
         created = True
 
     # Idempotent repair steps: safe to rerun after a partial earlier run.
+    # Adopt pre-multi-project history rows so per-project history views and
+    # error counts include them.
+    client.table("sync_history").update({"project_id": pid}).is_("project_id", "null").execute()
     # Adopt existing field mappings and add any system mapping the table lacks.
     client.table("field_mappings").update({"project_id": pid}).is_("project_id", "null").execute()
     have = {r["jira_field"] for r in (client.table("field_mappings").select("jira_field,is_system")
