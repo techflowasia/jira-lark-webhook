@@ -1,7 +1,8 @@
 # Multi-project sync — design
 
 Date: 2026-10-20
-Status: draft, awaiting approval
+Status: approved 2026-10-20
+Built on: draft PR techflowasia/jira-lark-webhook#6 (`refactor/workspace-profile-env`), which already moves the Lark secret/Base token and Jira custom-field ids out of code. Env values it introduced for per-project things (assignee map, sync types, Base token, table, Jira project) only seed project #1.
 
 ## Intent
 
