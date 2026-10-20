@@ -3,16 +3,22 @@ import json
 import time
 import threading
 import logging
-import lark_api, jira_api, index, dedup, history, field_mappings, config
-from config import (LARK_TO_JIRA_ASSIGNEE, LARK_API_HOST,
+import lark_api, jira_api, index, dedup, history, field_mappings, config, projects
+from config import (LARK_API_HOST,
                     JF_START, JF_SPRINT)
-from utils import _lark_text, _lark_select, _lark_ts_to_jira_date, _norm, _lark_link_rid
+from utils import _lark_text, _lark_select, _lark_ts_to_jira_date, _norm, _lark_link_rid, put
 
 log = logging.getLogger(__name__)
 
-_account_ids_cache: dict = {"data": None, "expires_at": 0}
-_version_cache: dict = {"data": {}, "expires_at": 0}
-_sprint_cache: dict = {"data": {}, "expires_at": 0}
+# Jira lookup caches, one slot per project id (see _slot).
+_account_ids_cache: dict = {}
+_version_cache: dict = {}
+_sprint_cache: dict = {}
+
+
+def _slot(cache: dict) -> dict:
+    """The current project's entry in one of the caches above."""
+    return cache.setdefault(projects.current_id(), {"data": None, "expires_at": 0})
 
 # Serializes concurrent record_added handlers for the same rid. Lark sometimes
 # delivers the same event multiple times in parallel; without this guard each
@@ -26,17 +32,19 @@ _create_lock = threading.Lock()
 # the parallel calls trip Lark's per-Base QPS cap (429s in history). When a
 # handler is already in flight, additional events just flag a re-run so the
 # in-flight handler does one more pass with fresh state at the end.
-_update_in_flight: set[str] = set()
-_update_pending: set[str] = set()
+# Keyed by (project id, rid).
+_update_in_flight: set = set()
+_update_pending: set = set()
 _update_lock = threading.Lock()
 
 
 def _get_account_ids(cfg: dict) -> dict:
     now = time.time()
-    if _account_ids_cache["data"] and now < _account_ids_cache["expires_at"]:
-        return _account_ids_cache["data"]
+    cache = _slot(_account_ids_cache)
+    if cache["data"] and now < cache["expires_at"]:
+        return cache["data"]
     data = jira_api.get_account_ids(cfg)
-    _account_ids_cache.update({"data": data, "expires_at": now + 3600})
+    cache.update({"data": data, "expires_at": now + 3600})
     return data
 
 
@@ -48,27 +56,29 @@ _FORCED_REFRESH_INTERVAL = 60
 
 def _get_version_map(cfg: dict, force: bool = False) -> dict:
     now = time.time()
-    if not force and _version_cache["data"] and now < _version_cache["expires_at"]:
-        return _version_cache["data"]
+    cache = _slot(_version_cache)
+    if not force and cache["data"] and now < cache["expires_at"]:
+        return cache["data"]
     try:
         data = {_norm(v["name"]): v["id"] for v in jira_api.get_project_versions(cfg)}
     except Exception:
         data = {}
-    _version_cache.update({"data": data, "expires_at": now + 3600})
+    cache.update({"data": data, "expires_at": now + 3600})
     return data
 
 
 def _get_sprint_map(cfg: dict, force: bool = False) -> dict:
     now = time.time()
-    if not force and _sprint_cache["data"] and now < _sprint_cache["expires_at"]:
-        return _sprint_cache["data"]
+    cache = _slot(_sprint_cache)
+    if not force and cache["data"] and now < cache["expires_at"]:
+        return cache["data"]
     try:
         bid = jira_api.get_board_id(cfg)
         data = ({_norm(s["name"]): s["id"] for s in jira_api.get_board_sprints(cfg, bid)}
                 if bid else {})
     except Exception:
         data = {}
-    _sprint_cache.update({"data": data, "expires_at": now + 3600})
+    cache.update({"data": data, "expires_at": now + 3600})
     return data
 
 
@@ -90,7 +100,24 @@ def _resolve_id(cache: dict, getter, cfg: dict, name: str):
     return getter(cfg, force=True).get(name)
 
 
+def _owned(jira_key: str, rid: str, event: str, op: str, itype: str = "") -> bool:
+    """Ownership check right before a Jira write. A key of another Jira
+    project (e.g. a Lark Base duplicated with its data) gets no Jira call and
+    an error history row instead."""
+    if projects.owns_key(jira_key):
+        return True
+    p = projects.current()
+    msg = (f"Refused to {op} Jira {jira_key}: it is not an issue of project "
+           f"#{p.id}'s Jira project {p.jira_project_key}")
+    log.error(f"lark_handler: {msg} (Lark {rid})")
+    history.record(direction="lark→jira", event=event, lark_id=rid, jira_key=jira_key,
+                   description=msg, status="error", error=msg, type=itype)
+    return False
+
+
 def _resolve_parent(rec: dict) -> "str | None":
+    if not field_mappings.reads_for_jira(field_mappings.F_PARENT):
+        return None  # parent not mapped in this project
     parent_data = rec["fields"].get(field_mappings.F_PARENT) or []
     for item in parent_data:
         rid = _lark_link_rid([item])
@@ -113,14 +140,18 @@ def _relevant_lark_fields() -> set:
     bundles into the same webhook) is ignored during decode so it doesn't
     needlessly force a get_record fallback.
 
-    `field_mappings.F_JIRA_STATUS` is included only when its configured direction covers
-    Lark→Jira (`both` or `lark_to_jira`). The default is `jira_to_lark` — for
-    users who didn't opt in, decoding the status from the webhook would be
-    wasted work (the value-compare in the update branch would still skip
-    the write, but it would force a get_record on every Jira-status webhook).
+    Only MAPPED system fields are included (an unmapped one is None and is
+    never read — see field_mappings.reads_for_jira; direction is not checked
+    for them, ruling R7). `F_JIRA_STATUS` additionally needs an active row
+    whose direction covers Lark→Jira (`both` / `lark_to_jira`, via
+    field_mappings.syncs) — for users who didn't opt in, decoding status
+    would force a get_record on every Jira-status webhook for nothing.
+    Active custom Lark→Jira mappings are included as well.
     """
-    names = {field_mappings.F_TITLE, field_mappings.F_START, field_mappings.F_END, field_mappings.F_ASSIGNEE, field_mappings.F_RELEASE, field_mappings.F_PARENT}
-    if field_mappings.get_direction(field_mappings.F_JIRA_STATUS) in ("both", "lark_to_jira"):
+    names = {n for n in (field_mappings.F_TITLE, field_mappings.F_START, field_mappings.F_END,
+                         field_mappings.F_ASSIGNEE, field_mappings.F_RELEASE, field_mappings.F_PARENT)
+             if field_mappings.reads_for_jira(n)}
+    if field_mappings.syncs(field_mappings.F_JIRA_STATUS, "lark_to_jira"):
         names.add(field_mappings.F_JIRA_STATUS)
     names.update(m["lark_field"] for m in field_mappings.get_custom_lark_to_jira())
     return names
@@ -265,6 +296,11 @@ def _decode_after_value(after_value, token, cfg, before_value=None, record_id=No
 
 
 def process(action: dict, table_id: str, cfg: dict) -> None:
+    with projects.use(cfg["PROJECT_ID"] if "PROJECT_ID" in cfg else projects.current_id()):
+        _process(action, table_id, cfg)
+
+
+def _process(action: dict, table_id: str, cfg: dict) -> None:
     act = action.get("action")
     rid = action.get("record_id", "")
     if table_id and table_id != cfg.get("LARK_TABLE_ID"):
@@ -272,6 +308,12 @@ def process(action: dict, table_id: str, cfg: dict) -> None:
                  f"is not the configured table ({cfg.get('LARK_TABLE_ID')})")
         return
     log.info(f"lark_handler: action={act} record_id={rid} table_id={table_id}")
+    missing = field_mappings.missing_required()
+    if missing:
+        log.warning(f"lark_handler: skipping {act} {rid} — project "
+                    f"{projects.current_id()} has no mapping for required {missing}")
+        field_mappings.report_skipped(missing, "lark_handler")
+        return
     try:
         if act == "record_added":
             _handle_create(rid, table_id, cfg)
@@ -322,6 +364,10 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
 
         existing_key = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
         if existing_key:
+            if not projects.owns_key(existing_key):
+                log.warning(f"lark_handler: skipping create {rid} — Jira Key {existing_key} "
+                            f"belongs to another Jira project; not linking")
+                return
             log.info(f"lark_handler: skipping create {rid} — Jira Key already set ({existing_key})")
             index.add(existing_key, rid)  # backfill the index so future edits sync
             return
@@ -338,13 +384,19 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
                            status="skipped", type=itype)
             return
 
-        title = _lark_text(rec["fields"].get(field_mappings.F_TITLE)) or f"[Lark] {rid}"
-        start = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_START), tz_hours)
-        end = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_END), tz_hours)
+        # Read a Lark column only when it is mapped — an unmapped column
+        # (even one that exists with a value) never reaches Jira.
+        f = rec["fields"]
+        title = _lark_text(f.get(field_mappings.F_TITLE)) or f"[Lark] {rid}"
+        start = (_lark_ts_to_jira_date(f.get(field_mappings.F_START), tz_hours)
+                 if field_mappings.reads_for_jira(field_mappings.F_START) else None)
+        end = (_lark_ts_to_jira_date(f.get(field_mappings.F_END), tz_hours)
+               if field_mappings.reads_for_jira(field_mappings.F_END) else None)
         parent_jira_key = _resolve_parent(rec) if itype in ("Story", "Task") else None
 
-        assignee_lark = _lark_select(rec["fields"].get(field_mappings.F_ASSIGNEE))
-        jira_name = LARK_TO_JIRA_ASSIGNEE.get(assignee_lark, "")
+        assignee_lark = (_lark_select(f.get(field_mappings.F_ASSIGNEE))
+                         if field_mappings.reads_for_jira(field_mappings.F_ASSIGNEE) else None)
+        jira_name = config.lark_to_jira_assignee().get(assignee_lark, "")
         assignee_id = _get_account_ids(cfg).get(jira_name)
 
         new_key = jira_api.create_issue(cfg, itype, title,
@@ -358,17 +410,36 @@ def _handle_create(rid: str, table_id: str, cfg: dict) -> None:
         dedup.mark(f"lark:{rid}")
         index.add(new_key, rid)
 
-        lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid, {
-            field_mappings.F_JIRA_KEY: new_key,
-            field_mappings.F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{new_key}",
-        })
+        link: dict = {}
+        put(link, field_mappings.F_JIRA_KEY, new_key)
+        put(link, field_mappings.F_JIRA_URL, f"https://{cfg['JIRA_DOMAIN']}/browse/{new_key}")
+        lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid, link)
         log.info(f"lark_handler: created Jira {new_key} from Lark {rid}")
         history.record(direction="lark→jira", event="created", lark_id=rid,
                        jira_key=new_key, description=f"Created {itype}: \"{title}\"",
                        type=itype)
+        if assignee_lark and not jira_name:
+            history.warn_unmapped_assignee(
+                jira_key=new_key, name=assignee_lark, lark_id=rid, type=itype,
+                outcome="Jira Assignee left unassigned", direction="lark→jira")
     finally:
         with _create_lock:
             _create_in_flight.discard(rid)
+
+
+_assignee_warned: dict = {}
+_assignee_warned_lock = threading.Lock()
+_ASSIGNEE_WARN_TTL = 3600
+
+
+def _assignee_warn_due(rid: str, name: str) -> bool:
+    key = (projects.current_id(), rid, name)
+    now = time.time()
+    with _assignee_warned_lock:
+        if now < _assignee_warned.get(key, 0):
+            return False
+        _assignee_warned[key] = now + _ASSIGNEE_WARN_TTL
+        return True
 
 
 def _handle_update(rid: str, table_id: str, cfg: dict,
@@ -382,26 +453,27 @@ def _handle_update(rid: str, table_id: str, cfg: dict,
     # get_record). The coalesced re-run intentionally passes after_value=None so
     # it re-reads fresh full state via get_record — the coalesced events that
     # triggered the re-run carried their own (now-discarded) payloads.
+    key = (projects.current_id(), rid)
     with _update_lock:
-        if rid in _update_in_flight:
-            _update_pending.add(rid)
+        if key in _update_in_flight:
+            _update_pending.add(key)
             log.info(f"lark_handler: coalescing update {rid} — handler already in flight")
             return
-        _update_in_flight.add(rid)
+        _update_in_flight.add(key)
     try:
         _handle_update_impl(rid, table_id, cfg,
                             after_value=after_value, before_value=before_value)
         while True:
             with _update_lock:
-                if rid not in _update_pending:
+                if key not in _update_pending:
                     break
-                _update_pending.discard(rid)
+                _update_pending.discard(key)
             _handle_update_impl(rid, table_id, cfg,
                                 after_value=None, before_value=None)
     finally:
         with _update_lock:
-            _update_in_flight.discard(rid)
-            _update_pending.discard(rid)
+            _update_in_flight.discard(key)
+            _update_pending.discard(key)
 
 
 def _handle_update_impl(rid: str, table_id: str, cfg: dict,
@@ -410,6 +482,8 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     tz_hours = lark_api.get_base_tz_hours(token, cfg["LARK_BASE_TOKEN"])
 
     jira_key = index._lark_to_jira.get(rid)
+    if jira_key and not _owned(jira_key, rid, "updated", "update"):
+        return
     rec = None
 
     # Fast path: we already know the Jira link AND the webhook handed us the
@@ -439,6 +513,10 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     if not jira_key:
         # Not in index — check if the record itself has a Jira Key (auto-discover)
         jira_key = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
+        if jira_key and not projects.owns_key(jira_key):
+            log.warning(f"lark_handler: {rid} has Jira Key {jira_key} of another Jira "
+                        f"project — not linking, no Jira call")
+            return
         if jira_key:
             index.add(jira_key, rid)
             log.info(f"lark_handler: auto-discovered link {rid} → {jira_key}")
@@ -461,7 +539,10 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     updates: dict = {}
     changed: list = []
 
-    title = _lark_text(rec["fields"].get(field_mappings.F_TITLE))
+    # Every system field below is read only when mapped (reads_for_jira):
+    # an unmapped Lark column must never be read as "empty" and clear Jira.
+    title = (_lark_text(rec["fields"].get(field_mappings.F_TITLE))
+             if field_mappings.reads_for_jira(field_mappings.F_TITLE) else None)
     if title and title != jira_fields.get("summary"):
         updates["summary"] = title
         changed.append(f"Title: \"{title}\"")
@@ -473,23 +554,32 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     # webhook"). Gate on presence instead: a full snapshot always has an
     # authoritative answer for every field; a partial fast-path decode only
     # has one for fields whose raw value actually changed this event.
-    if full_snapshot or field_mappings.F_START in rec["fields"]:
+    if field_mappings.reads_for_jira(field_mappings.F_START) and (
+            full_snapshot or field_mappings.F_START in rec["fields"]):
         start = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_START), tz_hours)
         if (start != jira_fields.get(JF_START)
                 and not dedup.is_ours(dedup.date_echo_key(jira_key, "start", start))):
             updates[JF_START] = start
             changed.append(f"Start: {start or '(cleared)'}")
 
-    if full_snapshot or field_mappings.F_END in rec["fields"]:
+    if field_mappings.reads_for_jira(field_mappings.F_END) and (
+            full_snapshot or field_mappings.F_END in rec["fields"]):
         end = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_END), tz_hours)
         if (end != jira_fields.get("duedate")
                 and not dedup.is_ours(dedup.date_echo_key(jira_key, "end", end))):
             updates["duedate"] = end
             changed.append(f"Due: {end or '(cleared)'}")
 
-    assignee_lark = _lark_select(rec["fields"].get(field_mappings.F_ASSIGNEE))
+    assignee_lark = (_lark_select(rec["fields"].get(field_mappings.F_ASSIGNEE))
+                     if field_mappings.reads_for_jira(field_mappings.F_ASSIGNEE) else None)
     if assignee_lark:
-        jira_name = LARK_TO_JIRA_ASSIGNEE.get(assignee_lark, "")
+        jira_name = config.lark_to_jira_assignee().get(assignee_lark, "")
+        if not jira_name and _assignee_warn_due(rid, assignee_lark):
+            # Jira stays as-is; at most one warning per (project, record, person) per hour.
+            history.warn_unmapped_assignee(
+                jira_key=jira_key, name=assignee_lark, lark_id=rid,
+                outcome="Jira Assignee unchanged", direction="lark→jira",
+                type=_lark_select(rec["fields"].get(field_mappings.F_TYPE)) or "")
         account_id = _get_account_ids(cfg).get(jira_name)
         if account_id:
             current_account_id = (jira_fields.get("assignee") or {}).get("accountId")
@@ -497,10 +587,11 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
                 updates["assignee"] = {"id": account_id}
                 changed.append(f"Assignee: {assignee_lark}")
 
-    release_raw = (_lark_text(rec["fields"].get(field_mappings.F_RELEASE))
-                   or _lark_select(rec["fields"].get(field_mappings.F_RELEASE)))
+    release_raw = ((_lark_text(rec["fields"].get(field_mappings.F_RELEASE))
+                    or _lark_select(rec["fields"].get(field_mappings.F_RELEASE)))
+                   if field_mappings.reads_for_jira(field_mappings.F_RELEASE) else None)
     if release_raw:
-        vid = _resolve_id(_version_cache, _get_version_map, cfg, _norm(release_raw))
+        vid = _resolve_id(_slot(_version_cache), _get_version_map, cfg, _norm(release_raw))
         if vid:
             current_version_ids = [v["id"] for v in (jira_fields.get("fixVersions") or [])]
             if vid not in current_version_ids:
@@ -523,7 +614,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     # normal update_issue / move_to_sprint path below. Value-compare against
     # current Jira status: same value → skip, no Jira call.
     status_change_target = None
-    if field_mappings.get_direction(field_mappings.F_JIRA_STATUS) in ("both", "lark_to_jira"):
+    if field_mappings.syncs(field_mappings.F_JIRA_STATUS, "lark_to_jira"):
         new_status = _lark_text(rec["fields"].get(field_mappings.F_JIRA_STATUS))
         cur_status = (jira_fields.get("status") or {}).get("name") or ""
         if new_status and new_status != cur_status:
@@ -581,7 +672,7 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
     # "new sprint doesn't sync" bug.
     sid = None
     if release_raw:
-        sid = _resolve_id(_sprint_cache, _get_sprint_map, cfg, _norm(release_raw))
+        sid = _resolve_id(_slot(_sprint_cache), _get_sprint_map, cfg, _norm(release_raw))
         if sid:
             current_sprint_ids = [s.get("id") for s in
                                   (jira_fields.get(JF_SPRINT) or [])]
@@ -592,6 +683,8 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
         log.info(f"lark_handler: no relevant updates for {jira_key}")
         return
 
+    if not _owned(jira_key, rid, "updated", "update"):
+        return
     if updates:
         log.info(f"lark_handler: sending to Jira {jira_key} fields={list(updates.keys())}")
         jira_api.update_issue(cfg, jira_key, updates)
@@ -603,14 +696,14 @@ def _handle_update_impl(rid: str, table_id: str, cfg: dict,
         if "duedate" in updates:
             dedup.mark(dedup.date_echo_key(jira_key, "end", updates["duedate"]))
 
-    if sid:
+    if sid and _owned(jira_key, rid, "updated", "move to a sprint"):
         try:
             jira_api.move_to_sprint(cfg, sid, jira_key)
             changed.append(f"Sprint: {release_raw}")
         except Exception as e:
             log.warning(f"Sprint move {jira_key}: {e}")
 
-    if status_change_target:
+    if status_change_target and _owned(jira_key, rid, "updated", "transition"):
         # Fire after update_issue/move_to_sprint so a "Jira status push" bug
         # doesn't blow up a successful normal-field write. `False` return =
         # workflow has no transition to the target (e.g. Done → To Do) — log
@@ -646,6 +739,8 @@ def _handle_delete(rid: str, cfg: dict) -> None:
     jira_key = index._lark_to_jira.get(rid)
     if not jira_key:
         return
+    if not _owned(jira_key, rid, "deleted", "delete"):
+        return
 
     # Verify the record is actually gone — Lark sometimes fires record_deleted spuriously.
     try:
@@ -667,6 +762,8 @@ def _handle_delete(rid: str, cfg: dict) -> None:
 
     # Cascade delete to Jira. Mark dedup first so the jira:issue_deleted webhook
     # firing back for this delete is recognized as our own.
+    if not _owned(jira_key, rid, "deleted", "delete", itype):
+        return
     dedup.mark(f"jira:{jira_key}")
     try:
         jira_api.delete_issue(cfg, jira_key)

@@ -4,12 +4,12 @@ import logging
 import time
 from datetime import datetime
 from collections import Counter
-import lark_api, jira_api, index, dedup, config, history, field_mappings
-from config import (JIRA_TO_LARK_ASSIGNEE, LARK_TO_JIRA_ASSIGNEE, LOCAL_TZ,
+import lark_api, jira_api, index, dedup, config, history, field_mappings, projects
+from config import (LOCAL_TZ,
                     JF_START, JF_STORY_POINTS, JF_ACTUAL_START, JF_ACTUAL_END, JF_SPRINT)
 from utils import (_lark_text, _lark_select, _jira_datetime_to_lark_ts,
                    _jira_date_to_lark_ts, _lark_ts_to_jira_date,
-                   _lark_link_rid, _lark_multi)
+                   _lark_link_rid, _lark_multi, put)
 
 log = logging.getLogger(__name__)
 
@@ -21,7 +21,14 @@ _FULL_SWEEP_INTERVAL_MS = 24 * 3600 * 1000
 _INCREMENTAL_BUFFER_MS = 10 * 60 * 1000
 
 
+def _wm(key: str) -> str:
+    """Reconcile watermarks are per project: settings key `last_reconcile_ts:1`."""
+    return f"{key}:{projects.current_id()}"
+
+
 def _get_setting(key: str) -> "str | None":
+    """Read the CURRENT project's watermark `key`."""
+    key = _wm(key)
     client = history._get_client()
     if not client:
         return None
@@ -34,6 +41,8 @@ def _get_setting(key: str) -> "str | None":
 
 
 def _set_setting(key: str, value: str) -> None:
+    """Write the CURRENT project's watermark `key`."""
+    key = _wm(key)
     client = history._get_client()
     if not client:
         return
@@ -41,6 +50,27 @@ def _set_setting(key: str, value: str) -> None:
         client.table("settings").upsert({"key": key, "value": value}).execute()
     except Exception as e:
         log.warning(f"Reconcile: could not persist setting {key}: {e}")
+
+
+def _group_own(lark_records: list, where: str) -> dict:
+    """Lark records grouped by Jira Key, OWN keys only. A row whose Jira Key
+    belongs to another Jira project (e.g. a Base duplicated with its data) is
+    left alone: never linked, never treated as a duplicate, never "Jira gone"
+    (it is not in this project's Jira issue list), never deleted."""
+    grouped: dict = {}
+    foreign: list = []
+    for rec in lark_records:
+        jk = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
+        if not jk:
+            continue
+        if not projects.owns_key(jk):
+            foreign.append(jk)
+            continue
+        grouped.setdefault(jk, []).append(rec)
+    if foreign:
+        log.warning(f"{where}: project {projects.current_id()} ignored {len(foreign)} Lark row(s) "
+                    f"with another Jira project's key (e.g. {sorted(set(foreign))[:5]})")
+    return grouped
 
 
 def _ms_to_jira_jql(ts_ms: int) -> str:
@@ -51,6 +81,11 @@ def _ms_to_jira_jql(ts_ms: int) -> str:
 
 
 def run(cfg: dict) -> None:
+    with projects.use(cfg["PROJECT_ID"] if "PROJECT_ID" in cfg else projects.current_id()):
+        _run(cfg)
+
+
+def _run(cfg: dict) -> None:
     """Dispatcher: full sweep daily, lightweight incremental in between.
 
     Falls back to a full sweep whenever the incremental path can't be trusted
@@ -59,6 +94,12 @@ def run(cfg: dict) -> None:
     original full reconcile, never to a missed sync.
     """
     log.info("Reconcile: starting")
+    missing = field_mappings.missing_required()
+    if missing:
+        log.warning(f"Reconcile: skipped — project {projects.current_id()} has no "
+                    f"mapping for required {missing}")
+        field_mappings.report_skipped(missing, "Reconcile")
+        return
     try:
         token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     except Exception as e:
@@ -120,11 +161,8 @@ def _run_incremental(cfg: dict, token: str, mod_field: str, since_ms: int) -> No
     # Lark records that already carry a Jira Key, indexed by key. Records whose
     # Jira issue changed but whose own row didn't won't be here — fetched
     # per-issue below so the field diff stays accurate (no blind overwrites).
-    lark_by_jira_key: dict = {}
-    for rec in lark_records:
-        jk = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
-        if jk:
-            lark_by_jira_key[jk] = rec
+    lark_by_jira_key: dict = {jk: recs[-1] for jk, recs in
+                              _group_own(lark_records, "Reconcile incremental").items()}
 
     for issue in jira_issues:
         key = issue["key"]
@@ -155,11 +193,7 @@ def _run_full(cfg: dict, token: str) -> None:
     jira_by_key = {i["key"]: i for i in jira_issues}
 
     # Group linked Lark records by Jira Key, resolve duplicates by title match
-    lark_grouped: dict = {}
-    for rec in lark_records:
-        jk = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
-        if jk:
-            lark_grouped.setdefault(jk, []).append(rec)
+    lark_grouped = _group_own(lark_records, "Reconcile")
 
     lark_by_jira_key: dict = {}
     for jk, recs in lark_grouped.items():
@@ -220,7 +254,7 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
     itype = jf["issuetype"]["name"]
 
     assignee_name = (jf.get("assignee") or {}).get("displayName")
-    lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
+    lark_assignee, _ = config.lark_assignee_for(assignee_name, jira_key=key, type=itype)
     sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
     jira_status = (jf.get("status") or {}).get("name")
     actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
@@ -237,8 +271,7 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
         rid = rec["record_id"]
         updates = {}
 
-        if lark_assignee and _lark_select(rec["fields"].get(field_mappings.F_ASSIGNEE)) != lark_assignee:
-            updates[field_mappings.F_ASSIGNEE] = [lark_assignee]
+        _assignee_update(updates, rec["fields"], lark_assignee)
         cur_md = rec["fields"].get(field_mappings.F_MD)
         # Lark's bitable API returns Number fields as STRINGS (e.g. "3"), so the
         # old `isinstance(int,float)` guard coerced the current value to None and
@@ -248,24 +281,24 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
         # skipped when nothing actually changed.
         cur_md_num = _sp_to_num(cur_md)
         if sp_num != cur_md_num:
-            updates[field_mappings.F_MD] = sp_num
+            put(updates, field_mappings.F_MD, sp_num)
         if jira_status and _lark_text(rec["fields"].get(field_mappings.F_JIRA_STATUS)) != jira_status:
-            updates[field_mappings.F_JIRA_STATUS] = jira_status
+            put(updates, field_mappings.F_JIRA_STATUS, jira_status)
         if actual_start is not None and rec["fields"].get(field_mappings.F_ACTUAL_START) != actual_start:
-            updates[field_mappings.F_ACTUAL_START] = actual_start
+            put(updates, field_mappings.F_ACTUAL_START, actual_start)
         if actual_end is not None and rec["fields"].get(field_mappings.F_ACTUAL_END) != actual_end:
-            updates[field_mappings.F_ACTUAL_END] = actual_end
+            put(updates, field_mappings.F_ACTUAL_END, actual_end)
         if start_ts is not None and rec["fields"].get(field_mappings.F_START) != start_ts:
-            updates[field_mappings.F_START] = start_ts
+            put(updates, field_mappings.F_START, start_ts)
         if end_ts is not None and rec["fields"].get(field_mappings.F_END) != end_ts:
-            updates[field_mappings.F_END] = end_ts
+            put(updates, field_mappings.F_END, end_ts)
         cur_parent_rid = _lark_link_rid(rec["fields"].get(field_mappings.F_PARENT))
         if parent_rid and cur_parent_rid != parent_rid:
-            updates[field_mappings.F_PARENT] = [parent_rid]
+            put(updates, field_mappings.F_PARENT, [parent_rid])
         # Reconcile Release vs Jira's current sprint (Jira is source of truth);
         # without this the 6 h loop never corrects a diverged Lark Release.
         if sprint_names and set(sprint_names) != set(_lark_multi(rec["fields"].get(field_mappings.F_RELEASE))):
-            updates[field_mappings.F_RELEASE] = sprint_names
+            put(updates, field_mappings.F_RELEASE, sprint_names)
 
         if updates:
             dedup.mark(f"lark:{rid}")
@@ -276,21 +309,20 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
             except Exception as e:
                 log.error(f"Reconcile: update {rid}: {e}")
     else:
-        fields = {
-            field_mappings.F_TITLE:    jf.get("summary", ""),
-            field_mappings.F_JIRA_KEY: key,
-            field_mappings.F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{key}",
-            field_mappings.F_TYPE:     itype,
-        }
-        if lark_assignee:      fields[field_mappings.F_ASSIGNEE]     = [lark_assignee]
-        if sp_num is not None: fields[field_mappings.F_MD]           = sp_num
-        if jira_status:        fields[field_mappings.F_JIRA_STATUS]  = jira_status
-        if actual_start:       fields[field_mappings.F_ACTUAL_START] = actual_start
-        if actual_end:         fields[field_mappings.F_ACTUAL_END]   = actual_end
-        if start_ts:           fields[field_mappings.F_START]        = start_ts
-        if end_ts:             fields[field_mappings.F_END]          = end_ts
-        if parent_rid:         fields[field_mappings.F_PARENT]       = [parent_rid]
-        if sprint_names:       fields[field_mappings.F_RELEASE]      = sprint_names
+        fields: dict = {}  # only mapped fields (put skips unmapped)
+        put(fields, field_mappings.F_TITLE,    jf.get("summary", ""))
+        put(fields, field_mappings.F_JIRA_KEY, key)
+        put(fields, field_mappings.F_JIRA_URL, f"https://{cfg['JIRA_DOMAIN']}/browse/{key}")
+        put(fields, field_mappings.F_TYPE,     itype)
+        if lark_assignee:      put(fields, field_mappings.F_ASSIGNEE,     [lark_assignee])
+        if sp_num is not None: put(fields, field_mappings.F_MD,           sp_num)
+        if jira_status:        put(fields, field_mappings.F_JIRA_STATUS,  jira_status)
+        if actual_start:       put(fields, field_mappings.F_ACTUAL_START, actual_start)
+        if actual_end:         put(fields, field_mappings.F_ACTUAL_END,   actual_end)
+        if start_ts:           put(fields, field_mappings.F_START,        start_ts)
+        if end_ts:             put(fields, field_mappings.F_END,          end_ts)
+        if parent_rid:         put(fields, field_mappings.F_PARENT,       [parent_rid])
+        if sprint_names:       put(fields, field_mappings.F_RELEASE,      sprint_names)
         try:
             rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"],
                                          cfg["LARK_TABLE_ID"], fields)
@@ -301,7 +333,33 @@ def _sync_issue_to_lark(cfg: dict, token: str, issue: dict, rec: "dict | None") 
             log.error(f"Reconcile: create for {key}: {e}")
 
 
+def _assignee_update(updates: dict, lark_fields: dict, lark_assignee: "str | None") -> None:
+    """Queue a Lark Assignee set for a sweep when it differs. Sweeps never
+    clear: a Jira-UNASSIGNED issue leaves Lark untouched (R8: a Lark-only
+    assignee must survive sweeps), and so does a person who could not be
+    added to the people list (lark_assignee None). An unmapped person was
+    already auto-added by config.lark_assignee_for, so lark_assignee is
+    their name. put is a no-op when the Assignee field is unmapped."""
+    if not lark_assignee:
+        return
+    if lark_assignee != _lark_select(lark_fields.get(field_mappings.F_ASSIGNEE)):
+        put(updates, field_mappings.F_ASSIGNEE, [lark_assignee])
+
+
+def _link_fields(cfg: dict, jira_key: str) -> dict:
+    """Jira Key (+ Jira URL when mapped) written back to a Lark record."""
+    out: dict = {}
+    put(out, field_mappings.F_JIRA_KEY, jira_key)
+    put(out, field_mappings.F_JIRA_URL, f"https://{cfg['JIRA_DOMAIN']}/browse/{jira_key}")
+    return out
+
+
 def backfill(cfg: dict) -> dict:
+    with projects.use(cfg["PROJECT_ID"] if "PROJECT_ID" in cfg else projects.current_id()):
+        return _backfill(cfg)
+
+
+def _backfill(cfg: dict) -> dict:
     """Bidirectional backfill for pre-existing unlinked records.
 
     Steps:
@@ -314,6 +372,10 @@ def backfill(cfg: dict) -> dict:
     Returns summary dict.
     """
     log.info("backfill: starting")
+    missing = field_mappings.missing_required()
+    if missing:
+        raise RuntimeError(f"backfill: project {projects.current_id()} has no mapping "
+                           f"for required {missing}")
     try:
         token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
         tz_hours = lark_api.get_base_tz_hours(token, cfg["LARK_BASE_TOKEN"])
@@ -331,11 +393,7 @@ def backfill(cfg: dict) -> dict:
 
     # ── Step 1: Remove duplicate Lark records — keep the one whose title ──
     #           matches the Jira issue summary; fallback to first seen      ─
-    lark_grouped: dict = {}
-    for rec in lark_records:
-        jk = _lark_text(rec["fields"].get(field_mappings.F_JIRA_KEY))
-        if jk:
-            lark_grouped.setdefault(jk, []).append(rec)
+    lark_grouped = _group_own(lark_records, "backfill")
 
     lark_by_jira_key: dict = {}
     removed_duplicates = 0
@@ -389,10 +447,8 @@ def backfill(cfg: dict) -> dict:
         rid = rec["record_id"]
         dedup.mark(f"lark:{rid}")
         try:
-            lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid, {
-                field_mappings.F_JIRA_KEY: jira_key,
-                field_mappings.F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{jira_key}",
-            })
+            lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid,
+                                   _link_fields(cfg, jira_key))
             index.add(jira_key, rid)
             lark_by_jira_key[jira_key] = rec
             just_matched_ids.add(rid)
@@ -417,7 +473,7 @@ def backfill(cfg: dict) -> dict:
         if itype not in allowed_jira:
             continue
         assignee_name = (jf.get("assignee") or {}).get("displayName")
-        lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
+        lark_assignee, _ = config.lark_assignee_for(assignee_name, jira_key=key, type=itype)
         sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
         jira_status = (jf.get("status") or {}).get("name")
         actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
@@ -428,21 +484,20 @@ def backfill(cfg: dict) -> dict:
                         if s.get("name")]
         parent_jira_key = (jf.get("parent") or {}).get("key")
         parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
-        fields = {
-            field_mappings.F_TITLE:    jf.get("summary", ""),
-            field_mappings.F_JIRA_KEY: key,
-            field_mappings.F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{key}",
-            field_mappings.F_TYPE:     itype,
-        }
-        if lark_assignee:      fields[field_mappings.F_ASSIGNEE]     = [lark_assignee]
-        if sp_num is not None: fields[field_mappings.F_MD]           = sp_num
-        if jira_status:        fields[field_mappings.F_JIRA_STATUS]  = jira_status
-        if actual_start:       fields[field_mappings.F_ACTUAL_START] = actual_start
-        if actual_end:         fields[field_mappings.F_ACTUAL_END]   = actual_end
-        if start_ts:           fields[field_mappings.F_START]        = start_ts
-        if end_ts:             fields[field_mappings.F_END]          = end_ts
-        if parent_rid:         fields[field_mappings.F_PARENT]       = [parent_rid]
-        if sprint_names:       fields[field_mappings.F_RELEASE]      = sprint_names
+        fields: dict = {}  # only mapped fields (put skips unmapped)
+        put(fields, field_mappings.F_TITLE,    jf.get("summary", ""))
+        put(fields, field_mappings.F_JIRA_KEY, key)
+        put(fields, field_mappings.F_JIRA_URL, f"https://{cfg['JIRA_DOMAIN']}/browse/{key}")
+        put(fields, field_mappings.F_TYPE,     itype)
+        if lark_assignee:      put(fields, field_mappings.F_ASSIGNEE,     [lark_assignee])
+        if sp_num is not None: put(fields, field_mappings.F_MD,           sp_num)
+        if jira_status:        put(fields, field_mappings.F_JIRA_STATUS,  jira_status)
+        if actual_start:       put(fields, field_mappings.F_ACTUAL_START, actual_start)
+        if actual_end:         put(fields, field_mappings.F_ACTUAL_END,   actual_end)
+        if start_ts:           put(fields, field_mappings.F_START,        start_ts)
+        if end_ts:             put(fields, field_mappings.F_END,          end_ts)
+        if parent_rid:         put(fields, field_mappings.F_PARENT,       [parent_rid])
+        if sprint_names:       put(fields, field_mappings.F_RELEASE,      sprint_names)
         try:
             rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], fields)
             dedup.mark(f"lark:{rid}")
@@ -469,12 +524,19 @@ def backfill(cfg: dict) -> dict:
                 account_ids = jira_api.get_account_ids(cfg)
             except Exception:
                 account_ids = {}
-        assignee_lark = _lark_select(rec["fields"].get(field_mappings.F_ASSIGNEE))
-        jira_name = LARK_TO_JIRA_ASSIGNEE.get(assignee_lark, "") if assignee_lark else ""
+        # Read a Lark column only when it is mapped — an unmapped column
+        # (even one that exists with a value) never reaches Jira.
+        f = rec["fields"]
+        assignee_lark = (_lark_select(f.get(field_mappings.F_ASSIGNEE))
+                         if field_mappings.reads_for_jira(field_mappings.F_ASSIGNEE) else None)
+        jira_name = config.lark_to_jira_assignee().get(assignee_lark, "") if assignee_lark else ""
         assignee_id = account_ids.get(jira_name)
-        start = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_START), tz_hours)
-        end   = _lark_ts_to_jira_date(rec["fields"].get(field_mappings.F_END), tz_hours)
-        p_rid = _lark_link_rid(rec["fields"].get(field_mappings.F_PARENT))
+        start = (_lark_ts_to_jira_date(f.get(field_mappings.F_START), tz_hours)
+                 if field_mappings.reads_for_jira(field_mappings.F_START) else None)
+        end   = (_lark_ts_to_jira_date(f.get(field_mappings.F_END), tz_hours)
+                 if field_mappings.reads_for_jira(field_mappings.F_END) else None)
+        p_rid = (_lark_link_rid(f.get(field_mappings.F_PARENT))
+                 if field_mappings.reads_for_jira(field_mappings.F_PARENT) else None)
         parent_jira_key = index._lark_to_jira.get(p_rid) if p_rid else None
         dedup.mark(f"lark:{rid}")
         try:
@@ -483,13 +545,15 @@ def backfill(cfg: dict) -> dict:
                                              assignee_id=assignee_id,
                                              parent_key=parent_jira_key)
             dedup.mark(f"jira:{new_key}")
-            lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid, {
-                field_mappings.F_JIRA_KEY: new_key,
-                field_mappings.F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{new_key}",
-            })
+            lark_api.update_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid,
+                                   _link_fields(cfg, new_key))
             index.add(new_key, rid)
             created_jira += 1
             log.info(f"backfill: created Jira {new_key} for Lark {rid}")
+            if assignee_lark and not jira_name:
+                history.warn_unmapped_assignee(
+                    jira_key=new_key, name=assignee_lark, lark_id=rid, type=itype,
+                    outcome="Jira Assignee left unassigned", direction="lark→jira")
         except Exception as e:
             log.error(f"backfill: create Jira for {rid}: {e}")
 
@@ -503,7 +567,8 @@ def backfill(cfg: dict) -> dict:
         rid = lark_rec["record_id"]
         cur = lark_rec["fields"]
         assignee_name = (jf.get("assignee") or {}).get("displayName")
-        lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
+        lark_assignee, _ = config.lark_assignee_for(
+            assignee_name, jira_key=jira_key, type=jf["issuetype"]["name"])
         sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
         jira_status  = (jf.get("status") or {}).get("name")
         actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
@@ -515,29 +580,28 @@ def backfill(cfg: dict) -> dict:
         parent_jira_key = (jf.get("parent") or {}).get("key")
         parent_rid = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
         updates: dict = {}
-        if lark_assignee and _lark_select(cur.get(field_mappings.F_ASSIGNEE)) != lark_assignee:
-            updates[field_mappings.F_ASSIGNEE] = [lark_assignee]
+        _assignee_update(updates, cur, lark_assignee)
         cur_md = cur.get(field_mappings.F_MD)
         # See _sync_issue_to_lark: Lark returns Number fields as strings, so
         # parse through _sp_to_num for a stable numeric compare (no phantom write).
         cur_md_num = _sp_to_num(cur_md)
         if sp_num != cur_md_num:
-            updates[field_mappings.F_MD] = sp_num
+            put(updates, field_mappings.F_MD, sp_num)
         if jira_status and _lark_text(cur.get(field_mappings.F_JIRA_STATUS)) != jira_status:
-            updates[field_mappings.F_JIRA_STATUS] = jira_status
+            put(updates, field_mappings.F_JIRA_STATUS, jira_status)
         if actual_start is not None and cur.get(field_mappings.F_ACTUAL_START) != actual_start:
-            updates[field_mappings.F_ACTUAL_START] = actual_start
+            put(updates, field_mappings.F_ACTUAL_START, actual_start)
         if actual_end is not None and cur.get(field_mappings.F_ACTUAL_END) != actual_end:
-            updates[field_mappings.F_ACTUAL_END] = actual_end
+            put(updates, field_mappings.F_ACTUAL_END, actual_end)
         if start_ts is not None and cur.get(field_mappings.F_START) != start_ts:
-            updates[field_mappings.F_START] = start_ts
+            put(updates, field_mappings.F_START, start_ts)
         if end_ts is not None and cur.get(field_mappings.F_END) != end_ts:
-            updates[field_mappings.F_END] = end_ts
+            put(updates, field_mappings.F_END, end_ts)
         if sprint_names and set(sprint_names) != set(_lark_multi(cur.get(field_mappings.F_RELEASE))):
-            updates[field_mappings.F_RELEASE] = sprint_names
+            put(updates, field_mappings.F_RELEASE, sprint_names)
         cur_parent_rid = _lark_link_rid(cur.get(field_mappings.F_PARENT))
         if parent_rid and cur_parent_rid != parent_rid:
-            updates[field_mappings.F_PARENT] = [parent_rid]
+            put(updates, field_mappings.F_PARENT, [parent_rid])
         if updates:
             dedup.mark(f"lark:{rid}")
             try:

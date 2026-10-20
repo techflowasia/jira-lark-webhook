@@ -58,7 +58,7 @@ def test_defaults_reproduce_the_original_hardcoded_workspace():
         "summary", "issuetype", "assignee", "customfield_10015", "duedate",
         "customfield_10016", "parent", "status", "customfield_10175",
         "customfield_10176", "customfield_10020"]
-    assert got["jql"] == "project=P AND issuetype in (Epic, Story, Task) ORDER BY key ASC"
+    assert got["jql"] == 'project = "P" AND issuetype in (Epic, Story, Task) ORDER BY key ASC'
     assert {"customfield_10015", "customfield_10016", "customfield_10020",
             "customfield_10175", "customfield_10176"} <= set(got["changelog_fields"])
     assert got["start_mapping"] == ["customfield_10015"]
@@ -94,7 +94,7 @@ def test_env_overrides_reach_the_code_that_uses_them():
         "summary", "issuetype", "assignee", "customfield_20001", "duedate",
         "customfield_20002", "parent", "status", "customfield_20003",
         "customfield_20004", "customfield_20005"]
-    assert got["jql"] == "project=P AND issuetype in (Epic, Bug) ORDER BY key ASC"
+    assert got["jql"] == 'project = "P" AND issuetype in (Epic, Bug) ORDER BY key ASC'
     assert not [f for f in got["changelog_fields"] if f.startswith("customfield_10")]
     assert got["start_mapping"] == ["customfield_20001"]
     assert got["f_start"] == "Timeline - Start"

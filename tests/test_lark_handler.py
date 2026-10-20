@@ -24,6 +24,14 @@ RECORD = {
 }
 
 
+def _with_defaults(rows):
+    """`rows` plus the default system mappings they don't override — a
+    project needs its required mappings (Title, Jira Key, Type) to sync."""
+    import field_mappings
+    taken = {r["jira_field"] for r in rows if r.get("is_system")}
+    return rows + [dict(d) for d in field_mappings._DEFAULTS if d["jira_field"] not in taken]
+
+
 def setup_function():
     dedup._cache.clear()
     index._jira_to_lark.clear()
@@ -32,9 +40,7 @@ def setup_function():
     index._lark_to_jira["recEpic"] = "PROJ-10"
     import lark_handler
     lark_handler._version_cache.clear()
-    lark_handler._version_cache.update({"data": {}, "expires_at": 0})
     lark_handler._sprint_cache.clear()
-    lark_handler._sprint_cache.update({"data": {}, "expires_at": 0})
 
 
 @patch("lark_handler.jira_api")
@@ -722,7 +728,7 @@ def test_new_sprint_synced_when_stale_cache_misses(mock_lark, mock_jira):
     index._jira_to_lark["PROJ-90"] = "recSP"
 
     # Cache is fresh (expires in the future) but does NOT contain the new sprint.
-    lark_handler._sprint_cache.update(
+    lark_handler._slot(lark_handler._sprint_cache).update(
         {"data": {"old sprint": 11}, "expires_at": _t.time() + 3600,
          "last_forced": 0})
 
@@ -753,7 +759,7 @@ def test_forced_refresh_throttled_for_version_only_release(mock_lark, mock_jira)
     index._lark_to_jira["recVO"] = "PROJ-91"
     index._jira_to_lark["PROJ-91"] = "recVO"
 
-    lark_handler._sprint_cache.update(
+    lark_handler._slot(lark_handler._sprint_cache).update(
         {"data": {"some sprint": 5}, "expires_at": _t.time() + 3600,
          "last_forced": _t.time()})  # just force-refreshed → throttled
 
@@ -807,11 +813,11 @@ def test_decoder_filters_unchanged_fields(mock_lark, mock_jira):
     on every webhook (the spurious 'QA Manday: 1.0' / 'Sprint: Beta 1.2'
     rows when nothing changed)."""
     import lark_handler, field_mappings
-    field_mappings._cache = [
+    field_mappings._cache = _with_defaults([
         {"id": 99, "lark_field": "P. QA md", "jira_field": "customfield_10178",
          "jira_label": "QA Manday", "direction": "both", "field_type": "number",
          "is_system": False, "active": True},
-    ]
+    ])
     try:
         index._lark_to_jira["recBurst"] = "PROJ-281"
         index._jira_to_lark["PROJ-281"] = "recBurst"
@@ -865,11 +871,11 @@ def test_custom_mapping_skips_when_value_matches_jira(mock_lark, mock_jira):
     supplied), the custom-mapping loop must value-compare against current
     Jira state and skip re-writing a matching value."""
     import lark_handler, field_mappings
-    field_mappings._cache = [
+    field_mappings._cache = _with_defaults([
         {"id": 99, "lark_field": "P. QA md", "jira_field": "customfield_10178",
          "jira_label": "QA Manday", "direction": "both", "field_type": "number",
          "is_system": False, "active": True},
-    ]
+    ])
     try:
         index._lark_to_jira["recC"] = "PROJ-100"
         index._jira_to_lark["PROJ-100"] = "recC"
@@ -900,11 +906,11 @@ def test_custom_mapping_skips_when_value_matches_jira(mock_lark, mock_jira):
 def test_custom_mapping_writes_when_value_differs(mock_lark, mock_jira):
     """Value-compare gate must not over-block: a real change still propagates."""
     import lark_handler, field_mappings
-    field_mappings._cache = [
+    field_mappings._cache = _with_defaults([
         {"id": 99, "lark_field": "P. QA md", "jira_field": "customfield_10178",
          "jira_label": "QA Manday", "direction": "both", "field_type": "number",
          "is_system": False, "active": True},
-    ]
+    ])
     try:
         index._lark_to_jira["recC2"] = "PROJ-101"
         index._jira_to_lark["PROJ-101"] = "recC2"
@@ -960,7 +966,7 @@ def test_custom_number_clear_fast_path(mock_lark, mock_jira):
     The custom-mapping loop's `if raw is None: continue` dropped it, so Jira
     kept the old QA Manday forever."""
     import lark_handler, field_mappings
-    field_mappings._cache = [_QA_MAPPING]
+    field_mappings._cache = _with_defaults([_QA_MAPPING])
     try:
         _qa_clear_mocks(mock_lark, mock_jira, "recQA1", "PROJ-300", 1.5)
         lark_handler.process({
@@ -980,7 +986,7 @@ def test_custom_number_clear_fast_path(mock_lark, mock_jira):
 def test_custom_number_clear_full_snapshot(mock_lark, mock_jira):
     """get_record omits empty fields, so no 'P. QA md' key = empty now."""
     import lark_handler, field_mappings
-    field_mappings._cache = [_QA_MAPPING]
+    field_mappings._cache = _with_defaults([_QA_MAPPING])
     try:
         _qa_clear_mocks(mock_lark, mock_jira, "recQA2", "PROJ-301", 2.0)
         mock_lark.get_record.return_value = {
@@ -998,7 +1004,7 @@ def test_custom_number_clear_full_snapshot(mock_lark, mock_jira):
 def test_custom_number_zero_syncs(mock_lark, mock_jira):
     """0 is a real value — the old `if not val` guard silently dropped it."""
     import lark_handler, field_mappings
-    field_mappings._cache = [_QA_MAPPING]
+    field_mappings._cache = _with_defaults([_QA_MAPPING])
     try:
         _qa_clear_mocks(mock_lark, mock_jira, "recQA3", "PROJ-302", 1.0)
         lark_handler.process({
@@ -1016,7 +1022,7 @@ def test_custom_number_zero_syncs(mock_lark, mock_jira):
 def test_custom_number_untouched_is_not_cleared(mock_lark, mock_jira):
     """Guard: a Title-only edit on the fast path must not false-clear QA Manday."""
     import lark_handler, field_mappings
-    field_mappings._cache = [_QA_MAPPING]
+    field_mappings._cache = _with_defaults([_QA_MAPPING])
     try:
         _qa_clear_mocks(mock_lark, mock_jira, "recQA4", "PROJ-303", 1.5)
         lark_handler.process({
@@ -1036,7 +1042,7 @@ def test_custom_number_untouched_is_not_cleared(mock_lark, mock_jira):
 def test_custom_number_clear_when_jira_already_empty_is_noop(mock_lark, mock_jira):
     """Echo convergence: Lark empty + Jira empty → no Jira write."""
     import lark_handler, field_mappings
-    field_mappings._cache = [_QA_MAPPING]
+    field_mappings._cache = _with_defaults([_QA_MAPPING])
     try:
         _qa_clear_mocks(mock_lark, mock_jira, "recQA5", "PROJ-304", None)
         lark_handler.process({
@@ -1145,11 +1151,11 @@ def _seed_jira_status_map():
     (or replace the list) and call this in a finally to restore the default.
     """
     import field_mappings
-    field_mappings._cache = [
+    field_mappings._cache = _with_defaults([
         {"id": 12, "lark_field": "Jira status", "jira_field": "status",
          "jira_label": "Status", "direction": "jira_to_lark",
          "field_type": "select", "is_system": True, "active": True},
-    ]
+    ])
     return field_mappings
 
 

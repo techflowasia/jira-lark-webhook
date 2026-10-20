@@ -1,11 +1,10 @@
 """Jira webhook events → Lark actions."""
 import logging
-import lark_api, index, dedup, history, field_mappings, config
-from config import (JIRA_TO_LARK_ASSIGNEE,
-                    JF_START, JF_STORY_POINTS, JF_ACTUAL_START, JF_ACTUAL_END, JF_SPRINT)
+import lark_api, index, dedup, history, field_mappings, config, projects
+from config import (JF_START, JF_STORY_POINTS, JF_ACTUAL_START, JF_ACTUAL_END, JF_SPRINT)
 from utils import (_jira_datetime_to_lark_ts, _jira_date_to_lark_ts,
                    _lark_ts_to_jira_date, _lark_text, _lark_select,
-                   _lark_link_rid, _lark_multi)
+                   _lark_link_rid, _lark_multi, put)
 
 log = logging.getLogger(__name__)
 
@@ -28,9 +27,20 @@ RELEVANT_CHANGELOG_FIELDS = {
 
 
 def process(event: str, issue: dict, changelog: dict, cfg: dict) -> None:
+    with projects.use(cfg["PROJECT_ID"] if "PROJECT_ID" in cfg else projects.current_id()):
+        _process(event, issue, changelog, cfg)
+
+
+def _process(event: str, issue: dict, changelog: dict, cfg: dict) -> None:
     key = issue.get("key", "")
     itype = ((issue.get("fields") or {}).get("issuetype") or {}).get("name", "")
     log.info(f"jira_handler: event={event} key={key}")
+    missing = field_mappings.missing_required()
+    if missing:
+        log.warning(f"jira_handler: skipping {event} {key} — project "
+                    f"{projects.current_id()} has no mapping for required {missing}")
+        field_mappings.report_skipped(missing, "jira_handler")
+        return
     try:
         if event == "jira:issue_created":
             _handle_create(issue, cfg)
@@ -57,7 +67,8 @@ def _handle_create(issue: dict, cfg: dict) -> None:
         return
 
     assignee_name = (jf.get("assignee") or {}).get("displayName")
-    lark_assignee = JIRA_TO_LARK_ASSIGNEE.get(assignee_name) if assignee_name else None
+    # Unmapped person -> auto-added to the people list (never left empty).
+    lark_assignee, _ = config.lark_assignee_for(assignee_name, jira_key=key, type=itype)
     sp_num = _sp_to_num(jf.get(JF_STORY_POINTS))
     jira_status = (jf.get("status") or {}).get("name")
     actual_start = _jira_datetime_to_lark_ts(jf.get(JF_ACTUAL_START))
@@ -69,21 +80,21 @@ def _handle_create(issue: dict, cfg: dict) -> None:
     sprint_data = jf.get(JF_SPRINT) or []
     sprint_names = _sprint_names(sprint_data)
 
-    fields = {
-        field_mappings.F_TITLE:    jf.get("summary", ""),
-        field_mappings.F_JIRA_KEY: key,
-        field_mappings.F_JIRA_URL: f"https://{cfg['JIRA_DOMAIN']}/browse/{key}",
-        field_mappings.F_TYPE:     itype,
-    }
-    if lark_assignee:        fields[field_mappings.F_ASSIGNEE]     = [lark_assignee]
-    if sp_num is not None:   fields[field_mappings.F_MD]           = sp_num
-    if jira_status:      fields[field_mappings.F_JIRA_STATUS]  = jira_status
-    if actual_start:     fields[field_mappings.F_ACTUAL_START] = actual_start
-    if actual_end:       fields[field_mappings.F_ACTUAL_END]   = actual_end
-    if start_ts:         fields[field_mappings.F_START]        = start_ts
-    if end_ts:           fields[field_mappings.F_END]          = end_ts
-    if parent_record_id: fields[field_mappings.F_PARENT]       = [parent_record_id]
-    if sprint_names:     fields[field_mappings.F_RELEASE]      = sprint_names
+    # Only mapped fields are written (put skips an unmapped field).
+    fields: dict = {}
+    put(fields, field_mappings.F_TITLE,    jf.get("summary", ""))
+    put(fields, field_mappings.F_JIRA_KEY, key)
+    put(fields, field_mappings.F_JIRA_URL, f"https://{cfg['JIRA_DOMAIN']}/browse/{key}")
+    put(fields, field_mappings.F_TYPE,     itype)
+    if lark_assignee:        put(fields, field_mappings.F_ASSIGNEE,     [lark_assignee])
+    if sp_num is not None:   put(fields, field_mappings.F_MD,           sp_num)
+    if jira_status:      put(fields, field_mappings.F_JIRA_STATUS,  jira_status)
+    if actual_start:     put(fields, field_mappings.F_ACTUAL_START, actual_start)
+    if actual_end:       put(fields, field_mappings.F_ACTUAL_END,   actual_end)
+    if start_ts:         put(fields, field_mappings.F_START,        start_ts)
+    if end_ts:           put(fields, field_mappings.F_END,          end_ts)
+    if parent_record_id: put(fields, field_mappings.F_PARENT,       [parent_record_id])
+    if sprint_names:     put(fields, field_mappings.F_RELEASE,      sprint_names)
 
     token = lark_api.get_token(cfg["LARK_APP_ID"], cfg["LARK_APP_SECRET"])
     rid = lark_api.create_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], fields)
@@ -125,6 +136,7 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
         lark_fields = {}
 
     updates: dict = {}
+    itype = ((issue.get("fields") or {}).get("issuetype") or {}).get("name", "")
     for item in items:
         field = item.get("fieldId") or item.get("field")
         to_str = item.get("toString")
@@ -132,12 +144,16 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
 
         if field == "summary":
             if to_str is not None and to_str != _lark_text(lark_fields.get(field_mappings.F_TITLE)):
-                updates[field_mappings.F_TITLE] = to_str
+                put(updates, field_mappings.F_TITLE, to_str)
 
         elif field == "assignee":
-            lark_a = JIRA_TO_LARK_ASSIGNEE.get(to_str) if to_str else None
-            if lark_a != _lark_select(lark_fields.get(field_mappings.F_ASSIGNEE)):
-                updates[field_mappings.F_ASSIGNEE] = [lark_a] if lark_a else None
+            # Unassigned -> clear the Lark Assignee. A person not in the
+            # people list is auto-added and written; nothing is cleared for
+            # them (leave_unchanged covers a person who can't be added).
+            lark_a, leave_unchanged = config.lark_assignee_for(to_str, jira_key=key, type=itype)
+            if (not leave_unchanged
+                    and lark_a != _lark_select(lark_fields.get(field_mappings.F_ASSIGNEE))):
+                put(updates, field_mappings.F_ASSIGNEE, [lark_a] if lark_a else None)
 
         elif field == JF_STORY_POINTS:
             sp_num = _sp_to_num(to_str)
@@ -147,21 +163,21 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
             # update re-wrote R. MD — same class of phantom write reconcile hit).
             cur_num = _sp_to_num(cur)
             if sp_num != cur_num:
-                updates[field_mappings.F_MD] = sp_num  # may be None to clear
+                put(updates, field_mappings.F_MD, sp_num)  # may be None to clear
 
         elif field == JF_ACTUAL_START:
             ts = _jira_datetime_to_lark_ts(to_raw or to_str)
             if ts is not None and ts != lark_fields.get(field_mappings.F_ACTUAL_START):
-                updates[field_mappings.F_ACTUAL_START] = ts
+                put(updates, field_mappings.F_ACTUAL_START, ts)
 
         elif field == JF_ACTUAL_END:
             ts = _jira_datetime_to_lark_ts(to_raw or to_str)
             if ts is not None and ts != lark_fields.get(field_mappings.F_ACTUAL_END):
-                updates[field_mappings.F_ACTUAL_END] = ts
+                put(updates, field_mappings.F_ACTUAL_END, ts)
 
         elif field == "status":
             if to_str and to_str != _lark_select(lark_fields.get(field_mappings.F_JIRA_STATUS)):
-                updates[field_mappings.F_JIRA_STATUS] = to_str
+                put(updates, field_mappings.F_JIRA_STATUS, to_str)
 
         elif field == JF_START:  # Jira Start date → Timeline - Start
             # `ts` may legitimately be None here (Jira Start date cleared) — a
@@ -173,14 +189,14 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
             if (ts != lark_fields.get(field_mappings.F_START)
                     and not dedup.is_ours(
                         dedup.date_echo_key(key, "start", _lark_ts_to_jira_date(ts)))):
-                updates[field_mappings.F_START] = ts  # may be None to clear
+                put(updates, field_mappings.F_START, ts)  # may be None to clear
 
         elif field == "duedate":  # Jira Due date → Timeline - End
             ts = _jira_date_to_lark_ts(to_raw or to_str)
             if (ts != lark_fields.get(field_mappings.F_END)
                     and not dedup.is_ours(
                         dedup.date_echo_key(key, "end", _lark_ts_to_jira_date(ts)))):
-                updates[field_mappings.F_END] = ts  # may be None to clear
+                put(updates, field_mappings.F_END, ts)  # may be None to clear
 
     # Reconcile parent on every update. Jira fires the parent-change changelog
     # as field 'IssueParentAssociation' (fieldId None) — `toString` is the new
@@ -195,8 +211,10 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
         parent_jira_key = parent_change.get("toString") or None
     parent_record_id = index._jira_to_lark.get(parent_jira_key) if parent_jira_key else None
     parent_deferred = None
-    if parent_record_id and _lark_link_rid(lark_fields.get(field_mappings.F_PARENT)) != parent_record_id:
-        updates[field_mappings.F_PARENT] = [parent_record_id]
+    if field_mappings.F_PARENT is None:
+        pass  # parent not mapped in this project — never synced
+    elif parent_record_id and _lark_link_rid(lark_fields.get(field_mappings.F_PARENT)) != parent_record_id:
+        put(updates, field_mappings.F_PARENT, [parent_record_id])
     elif parent_change and parent_jira_key and not parent_record_id:
         # Parent changed but its Lark record isn't linked yet — never silently
         # drop it (a parent that's set in Jira but missing in Lark is exactly
@@ -221,9 +239,9 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     sprint_changed = any((it.get("fieldId") or it.get("field")) == JF_SPRINT
                          for it in items)
     if jira_sprints and set(jira_sprints) != set(lark_release):
-        updates[field_mappings.F_RELEASE] = jira_sprints
+        put(updates, field_mappings.F_RELEASE, jira_sprints)
     elif not jira_sprints and sprint_changed and lark_release:
-        updates[field_mappings.F_RELEASE] = None  # moved to backlog → clear
+        put(updates, field_mappings.F_RELEASE, None)  # moved to backlog → clear
 
     # Apply custom (dashboard-configured) Jira → Lark mappings from changelog.
     # Coerce by the mapping's field_type — writing a raw string to a Lark
@@ -256,7 +274,6 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
 
     if not updates:
         if parent_deferred:
-            itype = ((issue.get("fields") or {}).get("issuetype") or {}).get("name", "")
             log.info(f"jira_handler: {key} parent → {parent_deferred} deferred "
                      f"(parent not yet linked in Lark)")
             history.record(direction="jira→lark", event="updated", jira_key=key,
@@ -277,7 +294,6 @@ def _handle_update(issue: dict, changelog: dict, cfg: dict) -> None:
     desc = ", ".join(f"{item.get('field')}: {item.get('toString','')}" for item in items
                      if (item.get("fieldId") or item.get("field")) in RELEVANT_CHANGELOG_FIELDS)
     log.info(f"jira_handler: updated Lark {record_id} from Jira {key} — {desc}")
-    itype = ((issue.get("fields") or {}).get("issuetype") or {}).get("name", "")
     history.record(direction="jira→lark", event="updated", jira_key=key, lark_id=record_id,
                    description=desc or "updated", type=itype)
 

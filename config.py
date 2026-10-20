@@ -1,11 +1,14 @@
 """Env var loading, field constants, assignee maps."""
 import os
 import json
+import logging
 from datetime import timezone, timedelta
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 load_dotenv()
+
+log = logging.getLogger(__name__)
 
 F_TITLE          = "Title"
 F_START          = "Timeline - Start"
@@ -65,70 +68,108 @@ JIRA_TO_LARK_ASSIGNEE = _env_json("ASSIGNEE_MAP", {
     "Moe Pyae Pyae Kyaw":      "Iris",
     "Waritsara Matnok":        "Min",
 })
-LARK_TO_JIRA_ASSIGNEE = {v: k for k, v in JIRA_TO_LARK_ASSIGNEE.items()}
+# Seed for project #1 only (projects._env_project / bootstrap). At runtime use
+# jira_to_lark_assignee() / lark_to_jira_assignee(), which read the current project.
+def _invert_assignees(m: dict) -> dict:
+    """Lark name -> Jira name. Skips ignored people (Lark name "" or blank),
+    so an empty Lark Assignee never resolves to an ignored Jira user."""
+    return {v: k for k, v in m.items() if isinstance(v, str) and v.strip()}
 
 
-_active_table_id:   str = ""
-_active_table_name: str = ""
-
-_allowed_jira_types: set = set(DEFAULT_SYNC_TYPES)
-_allowed_lark_types: set = set(DEFAULT_SYNC_TYPES)
+LARK_TO_JIRA_ASSIGNEE = _invert_assignees(JIRA_TO_LARK_ASSIGNEE)
 
 
 def set_active_table(table_id: str, table_name: str = "") -> None:
-    global _active_table_id, _active_table_name
-    _active_table_id   = table_id
-    _active_table_name = table_name
+    """Point the CURRENT project at a different Lark table (persisted when
+    Supabase is available, in-memory otherwise)."""
+    import projects
+    projects.update(projects.current_id(),
+                    {"lark_table_id": table_id, "lark_table_name": table_name})
 
 
 def get_allowed_jira_types() -> set:
-    return set(_allowed_jira_types)
+    import projects
+    return set(projects.current().allowed_jira_types)
 
 
 def get_allowed_lark_types() -> set:
-    return set(_allowed_lark_types)
-
-
-def load_sync_types() -> None:
-    global _allowed_jira_types, _allowed_lark_types
-    try:
-        import history
-        client = history._get_client()
-        if not client:
-            return
-        rows = client.table("settings").select("*").in_(
-            "key", ["allowed_jira_types", "allowed_lark_types"]).execute()
-        for row in (rows.data or []):
-            if row["key"] == "allowed_jira_types":
-                _allowed_jira_types = set(json.loads(row["value"]))
-            elif row["key"] == "allowed_lark_types":
-                _allowed_lark_types = set(json.loads(row["value"]))
-    except Exception:
-        pass  # keep defaults on any error
+    import projects
+    return set(projects.current().allowed_lark_types)
 
 
 def save_sync_types(jira_types: list, lark_types: list) -> None:
-    global _allowed_jira_types, _allowed_lark_types
-    import history
-    client = history._get_client()
-    if not client:
-        raise RuntimeError("Supabase not configured")
-    client.table("settings").upsert(
-        {"key": "allowed_jira_types", "value": json.dumps(jira_types)}).execute()
-    client.table("settings").upsert(
-        {"key": "allowed_lark_types", "value": json.dumps(lark_types)}).execute()
-    _allowed_jira_types = set(jira_types)
-    _allowed_lark_types = set(lark_types)
+    """Save the CURRENT project's allowed sync types."""
+    import projects
+    projects.update(projects.current_id(), {"allowed_jira_types": list(jira_types),
+                                            "allowed_lark_types": list(lark_types)})
+
+
+def jira_to_lark_assignee() -> dict:
+    """The CURRENT project's Jira display name -> Lark name map."""
+    import projects
+    return dict(projects.current().assignee_map)
+
+
+def lark_to_jira_assignee() -> dict:
+    return _invert_assignees(jira_to_lark_assignee())
+
+
+_collision_warned: set = set()
+
+
+def lark_assignee_for(display_name: "str | None", *, jira_key: str = "",
+                      type: str = "") -> "tuple[str | None, bool]":
+    """(lark_name_or_None, leave_unchanged) for a Jira assignee display name
+    in the CURRENT project (Jira->Lark).
+
+    - Unassigned -> (None, False): a webhook update clears Lark, sweeps don't.
+    - In the people list -> (mapped name, False).
+    - Ignored (in the people list with Lark name "" or blank) -> (None, True):
+      Lark is left unchanged, nothing is added and no row is written.
+    - Not in the people list -> auto-added as {name: name} to the project's
+      people list (one "Added" history row the first time) -> (name, False).
+    - Not addable -> (None, True): the caller leaves Lark Assignee unchanged.
+      That is the case when the Lark Assignee field is unmapped (nothing is
+      synced) or when `display_name` is already ANOTHER person's Lark name
+      (adding it would make Lark->Jira ambiguous; warned once per process)."""
+    if not display_name:
+        return None, False
+    lark_name = jira_to_lark_assignee().get(display_name)
+    if lark_name is not None:
+        if not lark_name.strip():
+            return None, True  # ignored person
+        return lark_name, False
+    import field_mappings, history, projects
+    if not field_mappings.F_ASSIGNEE:
+        return None, True
+    pid = projects.current_id()
+    try:
+        outcome = projects.add_assignee(pid, display_name, display_name)
+    except Exception as e:
+        # Persisting failed: still write the true name to Lark; the next
+        # event retries the add.
+        log.error(f"config: could not add '{display_name}' to project {pid} people list: {e}")
+        return display_name, False
+    if outcome == "collision":
+        if (pid, display_name) not in _collision_warned:
+            _collision_warned.add((pid, display_name))
+            history.record(direction="jira→lark", event="config", jira_key=jira_key,
+                           description=f"Assignee '{display_name}' not added: "
+                                       f"'{display_name}' is already the Lark name of "
+                                       f"another person — Lark Assignee unchanged",
+                           status="skipped", type=type)
+        return None, True
+    if outcome == "added":
+        log.info(f"config: added '{display_name}' to project {pid} people list")
+        history.record(direction="jira→lark", event="config", jira_key=jira_key,
+                       description=f"Added '{display_name}' to People list and Lark Assignee",
+                       status="ok", type=type)
+    final = jira_to_lark_assignee().get(display_name, display_name)
+    if not final.strip():
+        return None, True  # marked ignored concurrently
+    return final, False
 
 
 def get_cfg() -> dict:
-    return {
-        "JIRA_EMAIL":      os.environ["JIRA_EMAIL"],
-        "JIRA_TOKEN":      os.environ["JIRA_TOKEN"],
-        "JIRA_DOMAIN":     os.environ["JIRA_DOMAIN"],
-        "JIRA_PROJECT":    os.environ["JIRA_PROJECT"],
-        "LARK_APP_ID":     os.environ["LARK_APP_ID"],
-        "LARK_APP_SECRET": os.environ["LARK_APP_SECRET"],
-        "LARK_BASE_TOKEN": os.environ["LARK_BASE_TOKEN"],
-        "LARK_TABLE_ID":   _active_table_id or os.environ["LARK_TABLE_ID"],
-    }
+    import projects
+    return projects.cfg_for(projects.current())

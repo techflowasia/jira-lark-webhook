@@ -9,6 +9,16 @@ Latest commit: **2026-05-13** (`910c9cb` — split lark dedup key so writes don'
 
 ---
 
+## 2026-10-20 — Multi-project: new-project wizard and per-project Lark connect
+
+| Commit | Type | Summary |
+|--------|------|---------|
+| _pending_ | feat | **People can be marked ignored (Lark name `""`).** When the Jira assignee is an ignored person, every Jira → Lark path (webhook create/update, reconcile, backfill) leaves the Lark Assignee unchanged: nothing cleared, written or auto-added, no option added, no history row. `config.lark_to_jira_assignee()` and `LARK_TO_JIRA_ASSIGNEE` skip empty values, so an empty Lark Assignee never maps to an ignored Jira user; `/api/p/{pid}/check` no longer reports `""` as an unknown Lark name. Auto-add treats an ignored entry as existing. `PUT /api/p/{pid}/people` round-trips `""`. The dashboard People section gets an *Ignore* column and the wizard step 6 an *Ignore* checkbox; ignored rows show `(ignored)`; saving refuses (with a message) a row that has a Jira name but no Lark name and is not ignored, instead of silently dropping it. `ASSIGNEE_MAP` accepts `""` values. New tests in `test_assignee_rule.py`, `test_projects_api.py` and `tests/test_people_ui.py` (runs the pages' JS in node). |
+| _pending_ | feat | **An unmapped Jira assignee is auto-added to the project's People list instead of clearing Lark.** Every Jira → Lark path (webhook create/update, reconcile, backfill) now adds `{displayName: displayName}` to the current project's `assignee_map` (`projects.add_assignee`, under the registry lock, re-reading the map, never overwriting an entry or reusing another person's Lark name), writes `[displayName]` to the Lark Assignee, and logs one `Added '<name>' to People list and Lark Assignee` row the first time. Unassigned is unchanged (webhook clears, sweeps leave Lark). If Lark rejects the write because the name is not an Assignee option, `lark_api.add_select_options` adds it (all existing options resent with id/name/colour) and the write is retried once. The old Jira → Lark `not in people list — Lark Assignee cleared/left empty` warnings are gone; the Lark → Jira warning stays. `tests/test_assignee_rule.py` rewritten (18 → 29 tests). |
+| _pending_ | feat | **`/p/new` and `/p/{pid}/setup?step=N` are the 9-step setup wizard** (Name + Jira, Lark table, Connect Lark, Copy from, Check fields, People, Sync types, Backfill, Go live), rendered in the sidebar layout. The draft is created (sync off) at the end of step 2; Go live is blocked while Title / Jira Key / Type mappings are missing and rebuilds the project's index. `/auth/start?project={pid}` carries `state=project:{pid}`; `/auth/callback` adds the bot and subscribes events on **that project's** Base (legacy `add_bot` → project #1). Also: Jira keys are upper-cased on create (duplicates are case-insensitive), `DELETE /api/p/{pid}` deletes a draft only (registry row + its mappings; project 1 refused; Jira/Lark untouched), `POST /api/p/{pid}/fields/seed-defaults`, `POST /api/p/{pid}/copy-from`, `POST /api/lark/resolve-link`, `GET /api/p/{pid}/people/suggestions`; `PATCH /api/p/{pid}` accepts `sync_enabled` / `reconcile_enabled` (only once active). 28 new tests. |
+
+---
+
 ## 2026-10-05 — Workspace-specific values moved from code to env vars
 
 | Commit | Type | Summary |

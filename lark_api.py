@@ -7,6 +7,7 @@ from collections import defaultdict
 from datetime import datetime
 import requests
 import field_mappings
+import history
 from config import LARK_API_BASE, LOCAL_TZ, TZ_LABEL
 
 log = logging.getLogger(__name__)
@@ -14,9 +15,10 @@ log = logging.getLogger(__name__)
 LARK_BASE_URL = LARK_API_BASE
 _token_cache = {"token": None, "expires_at": 0}
 
-# Cached Base timezone offset (hours from UTC). Populated by get_base_tz_hours().
+# Cached Base timezone offset (hours from UTC) per base token:
+# {base_token: {"offset", "expires_at"}}. Populated by get_base_tz_hours().
 # If unavailable, defaults to 0 (UTC) preserving legacy behavior.
-_base_tz_cache: dict = {"offset": 0, "expires_at": 0}
+_base_tz_cache: dict = {}
 
 
 def _iana_to_offset(tz_name: str) -> float:
@@ -45,8 +47,8 @@ def _iana_to_offset(tz_name: str) -> float:
 
 
 def invalidate_base_tz_cache() -> None:
-    """Force re-fetch of the Base timezone on next call."""
-    _base_tz_cache["expires_at"] = 0
+    """Force re-fetch of every Base timezone on next call."""
+    _base_tz_cache.clear()
 
 
 def get_base_tz_hours(token: str, base_token: str) -> float:
@@ -56,8 +58,9 @@ def get_base_tz_hours(token: str, base_token: str) -> float:
     Returns the offset (e.g. 7.0 for UTC+7 Bangkok), or 0.0 on error/unknown.
     """
     now = time.time()
-    if now < _base_tz_cache["expires_at"]:
-        return _base_tz_cache["offset"]
+    cached = _base_tz_cache.get(base_token)
+    if cached and now < cached["expires_at"]:
+        return cached["offset"]
     try:
         url = f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}"
         resp = _request("GET", url, headers=_headers(token))
@@ -71,7 +74,7 @@ def get_base_tz_hours(token: str, base_token: str) -> float:
             offset = _iana_to_offset(tz_name)
         else:
             offset = 0.0
-        _base_tz_cache.update({"offset": offset, "expires_at": now + 3600})
+        _base_tz_cache[base_token] = {"offset": offset, "expires_at": now + 3600}
         log.info(f"lark_api: Base timezone = '{tz_name}' (offset UTC{offset:+g}h)")
         return offset
     except Exception as e:
@@ -111,7 +114,7 @@ def _classify(method: str, url: str) -> str:
         if method == "DELETE":
             return "delete_record"
     if "/fields" in url:
-        return "list_fields"
+        return "update_field" if method == "PUT" else "list_fields"
     if url.rstrip("/").endswith("/tables"):
         return "list_tables"
     return f"{method.lower()}_other"
@@ -383,26 +386,177 @@ def get_cached_or_fetch_record(token: str, base_token: str, table_id: str,
     return get_record(token, base_token, table_id, record_id)
 
 
-def create_record(token: str, base_token: str, table_id: str, fields: dict) -> str:
-    resp = _request("POST",
-        f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records",
-        headers=_headers(token), json={"fields": fields})
+# (base_token, table_id, column) -> time before which a missing-column
+# warning is not repeated.
+_skip_warned: dict = {}
+_skip_warned_lock = threading.Lock()
+_SKIP_WARN_TTL = 3600
+
+
+def _known_columns(token: str, base_token: str, table_id: str, fields: dict,
+                   event: str, record_id: str = "") -> dict:
+    """`fields` minus keys that are not columns of the table (a mapping that
+    names a Lark column which doesn't exist, e.g. renamed in Lark). Each
+    dropped key is logged and recorded in history as skipped (at most once an
+    hour per base/table/column). When the schema
+    can't be read (error or empty), `fields` is returned unchanged — Lark
+    then rejects an unknown column itself, as before. Uses the 60 s schema
+    cache, so this adds no Lark call on the hot path."""
+    try:
+        names = {f["field_name"] for f in list_fields(token, base_token, table_id)}
+    except Exception as e:
+        log.warning(f"lark_api: schema check skipped for {table_id}: {e}")
+        return fields
+    if not names:
+        return fields
+    kept = {}
+    for k, v in fields.items():
+        if k in names:
+            kept[k] = v
+            continue
+        # Warn + history once per (base, table, column) per hour, so every
+        # write/sweep naming a missing column doesn't flood sync_history.
+        wkey = (base_token, table_id, k)
+        now = time.time()
+        with _skip_warned_lock:
+            due = now >= _skip_warned.get(wkey, 0)
+            if due:
+                _skip_warned[wkey] = now + _SKIP_WARN_TTL
+        if due:
+            msg = f"Lark column '{k}' not found — field not synced"
+            log.warning(f"lark_api: {msg} (table {table_id}, record {record_id or 'new'})")
+            history.record(direction="jira→lark", event=event, lark_id=record_id,
+                           description=msg, status="skipped")
+    return kept
+
+
+_SELECT_TYPES = (3, 4)  # SingleSelect, MultiSelect
+
+
+def _write_adding_missing_options(send, token: str, base_token: str, table_id: str,
+                                  fields: dict):
+    """Run `send()` (one record write). If Lark rejects it while the Assignee
+    value names a person who is not yet an option of the Assignee select
+    column (a person just auto-added to the people list), add the missing
+    option(s) and retry the write ONCE. Any other failure — or a failure to
+    read/extend the column — re-raises the original error unchanged. It is
+    unknown whether Lark auto-creates options on write, so the write is always
+    tried first and a successful write never touches the column."""
+    try:
+        return send()
+    except Exception as err:
+        col = field_mappings.F_ASSIGNEE
+        names = fields.get(col) if col else None
+        if not isinstance(names, list) or not names:
+            raise
+        try:
+            added = add_select_options(token, base_token, table_id, col, names)
+        except Exception as e:
+            log.error(f"lark_api: could not add {names} to '{col}' options: {e}")
+            raise err
+        if not added:
+            raise
+        log.warning(f"lark_api: write rejected ({err}); added option(s) {added} "
+                    f"to '{col}' and retrying once")
+        return send()
+
+
+_option_locks: dict = {}
+_option_locks_guard = threading.Lock()
+
+
+def _option_lock(base_token: str, table_id: str) -> threading.Lock:
+    with _option_locks_guard:
+        return _option_locks.setdefault((base_token, table_id), threading.Lock())
+
+
+def add_select_options(token: str, base_token: str, table_id: str, field_name: str,
+                       names: list) -> list:
+    """Serialized per (base, table): two concurrent GET->PUT sequences (a
+    webhook thread and the reconcile thread) would otherwise each send
+    "old options + their own new one", and the second PUT would drop the
+    first one's option. The fresh GET happens inside the lock."""
+    with _option_lock(base_token, table_id):
+        return _add_select_options_locked(token, base_token, table_id, field_name, names)
+
+
+def _add_select_options_locked(token: str, base_token: str, table_id: str,
+                               field_name: str, names: list) -> list:
+    """Add each of `names` that is not yet an option of select column
+    `field_name`; returns the names added ([] when none were missing, the
+    column doesn't exist or isn't a select).
+
+    The schema is read FRESH (never from the 60 s cache) and the PUT sends
+    EVERY existing option with its id, name and colour unchanged, followed by
+    the new ones: Lark replaces the whole option list, so a dropped or renamed
+    option would blank that value on every record."""
+    invalidate_fields_cache(base_token, table_id)
+    items = _fetch_field_items(token, base_token, table_id)
+    fld = next((f for f in items if f.get("field_name") == field_name), None)
+    if fld is None or fld.get("type") not in _SELECT_TYPES or not fld.get("field_id"):
+        return []
+    prop = fld.get("property") or {}
+    existing = prop.get("options") or []
+    have = {o.get("name") for o in existing}
+    new = [n for n in dict.fromkeys(names) if isinstance(n, str) and n and n not in have]
+    if not new:
+        return []
+    options = ([{k: o[k] for k in ("id", "name", "color") if k in o} for o in existing]
+               + [{"name": n} for n in new])
+    body = {"field_name": fld["field_name"], "type": fld["type"],
+            "property": {**prop, "options": options}}
+    resp = _request("PUT",
+        f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields/{fld['field_id']}",
+        headers=_headers(token), json=body)
     resp.raise_for_status()
     data = resp.json()
+    invalidate_fields_cache(base_token, table_id)
     if data.get("code") != 0:
-        raise RuntimeError(f"Lark create error: {data.get('msg')}")
-    return data["data"]["record"]["record_id"]
+        raise RuntimeError(f"Lark update_field error: {data.get('msg')}")
+    log.info(f"lark_api: added option(s) {new} to '{field_name}' in {table_id}")
+    return new
+
+
+def create_record(token: str, base_token: str, table_id: str, fields: dict) -> str:
+    sent = _known_columns(token, base_token, table_id, fields, "created")
+    # Never create a record without its link / title / type: a record missing
+    # its Jira Key column can't be matched again, so every reconcile would
+    # create another duplicate.
+    required = {field_mappings.F_TITLE, field_mappings.F_JIRA_KEY, field_mappings.F_TYPE}
+    lost = sorted(k for k in fields if k not in sent and k in required)
+    if lost:
+        raise RuntimeError(f"Lark column(s) {lost} not found — required, record not created")
+    fields = sent
+
+    def send():
+        resp = _request("POST",
+            f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records",
+            headers=_headers(token), json={"fields": fields})
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Lark create error: {data.get('msg')}")
+        return data["data"]["record"]["record_id"]
+
+    return _write_adding_missing_options(send, token, base_token, table_id, fields)
 
 
 def update_record(token: str, base_token: str, table_id: str,
                   record_id: str, fields: dict) -> None:
-    resp = _request("PUT",
-        f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records/{record_id}",
-        headers=_headers(token), json={"fields": fields})
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code") != 0:
-        raise RuntimeError(f"Lark update error: {data.get('msg')}")
+    fields = _known_columns(token, base_token, table_id, fields, "updated", record_id)
+    if not fields:
+        return
+
+    def send():
+        resp = _request("PUT",
+            f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/records/{record_id}",
+            headers=_headers(token), json={"fields": fields})
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Lark update error: {data.get('msg')}")
+
+    _write_adding_missing_options(send, token, base_token, table_id, fields)
     # Merge written fields into existing cache entry so the next read sees
     # them without a get_record fetch. We do NOT seed a new entry from a
     # write alone — partial data would mislead value-compares for fields
@@ -458,14 +612,26 @@ def _fetch_field_items(token: str, base_token: str, table_id: str) -> list:
     now = time.time()
     if entry and now < entry["expires_at"]:
         return entry["items"]
-    resp = _request("GET",
-        f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
-        headers=_headers(token), params={"page_size": 300})
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code") != 0:
-        raise RuntimeError(f"Lark fields error: {data.get('msg')}")
-    items = data.get("data", {}).get("items", [])
+    # Paginate: a column missing from a truncated first page would otherwise
+    # be treated as unknown and dropped from writes by _known_columns.
+    items: list = []
+    page_token = None
+    while True:
+        params = {"page_size": 300}
+        if page_token:
+            params["page_token"] = page_token
+        resp = _request("GET",
+            f"{LARK_BASE_URL}/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
+            headers=_headers(token), params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Lark fields error: {data.get('msg')}")
+        page = data.get("data") or {}
+        items.extend(page.get("items") or [])
+        page_token = page.get("page_token")
+        if not page.get("has_more") or not page_token:
+            break
     _fields_cache[key] = {"items": items, "expires_at": now + _FIELDS_TTL}
     return items
 
@@ -521,3 +687,31 @@ def get_field_meta_by_id(token: str, base_token: str, table_id: str) -> dict:
             "options": {o["id"]: o["name"] for o in options if o.get("id")},
         }
     return meta
+
+
+def parse_base_link(token: str, url: str) -> "tuple[str, str | None]":
+    """(base_token, table_id | None) from a Lark Base link.
+
+    `/base/{token}?table=tbl…` is read directly. `/wiki/{node}` is resolved
+    through the wiki API (`token` is the tenant access token) and must point
+    at a bitable. Anything else raises ValueError("Not a Lark Base link").
+    """
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse((url or "").strip())
+    parts = [s for s in parsed.path.split("/") if s]
+    table = (parse_qs(parsed.query).get("table") or [None])[0]
+    if "base" in parts and parts.index("base") + 1 < len(parts):
+        return parts[parts.index("base") + 1], table
+    if "wiki" in parts and parts.index("wiki") + 1 < len(parts):
+        node = parts[parts.index("wiki") + 1]
+        resp = _request("GET", f"{LARK_BASE_URL}/wiki/v2/spaces/get_node",
+                        headers=_headers(token), params={"token": node})
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise ValueError(f"Could not resolve wiki link: {data.get('msg')}")
+        n = (data.get("data") or {}).get("node") or {}
+        if n.get("obj_type") != "bitable" or not n.get("obj_token"):
+            raise ValueError("Not a Lark Base link (the wiki page is not a Base)")
+        return n["obj_token"], table
+    raise ValueError("Not a Lark Base link")

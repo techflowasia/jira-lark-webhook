@@ -1,0 +1,506 @@
+"""Sync project registry: one row per Jira project <-> Lark table pair.
+
+Backed by Supabase `sync_projects`; without Supabase a single in-memory
+project #1 built from env/config is used, so behaviour matches the old
+single-pair service. `use(pid)` scopes the current project to the calling
+thread/task via a contextvar.
+"""
+import contextlib
+import contextvars
+import json
+import logging
+import os
+import re
+import threading
+from dataclasses import dataclass, field, fields as dc_fields
+
+import config
+import history
+
+log = logging.getLogger(__name__)
+
+_TABLE = "sync_projects"
+_lock = threading.RLock()
+_projects: dict = {}
+_persisted: bool = False  # True when _projects mirrors rows in Supabase
+# Set when Supabase is configured but the registry could not be loaded from
+# it: project #1 is then a fail-closed stand-in (reconcile off) and main.py
+# keeps retrying load_all() + bootstrap_default().
+_fallback_reason: "str | None" = None
+_MIGRATION_HINT = "run migrations/003_multi_project.sql in the Supabase SQL editor"
+JIRA_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]+")
+_current_id: contextvars.ContextVar = contextvars.ContextVar("project_id", default=None)
+
+
+@dataclass
+class Project:
+    id: int
+    name: str
+    jira_project_key: str
+    jira_board_id: "str | None"
+    lark_base_token: str
+    lark_table_id: str
+    lark_table_name: str
+    sync_enabled: bool
+    reconcile_enabled: bool
+    allowed_jira_types: list = field(default_factory=list)
+    allowed_lark_types: list = field(default_factory=list)
+    assignee_map: dict = field(default_factory=dict)
+    setup_state: str = "draft"
+
+
+_COLUMNS = [f.name for f in dc_fields(Project)]
+_UPDATABLE = set(_COLUMNS) - {"id"}
+
+
+def _json(v, default):
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except ValueError:
+            return default
+    return default if v is None else v
+
+
+def _from_row(r: dict) -> Project:
+    return Project(
+        id=int(r["id"]),
+        name=r.get("name") or "",
+        jira_project_key=r.get("jira_project_key") or "",
+        jira_board_id=(str(r["jira_board_id"]) if r.get("jira_board_id") not in (None, "") else None),
+        lark_base_token=r.get("lark_base_token") or "",
+        lark_table_id=r.get("lark_table_id") or "",
+        lark_table_name=r.get("lark_table_name") or "",
+        sync_enabled=bool(r.get("sync_enabled")),
+        reconcile_enabled=bool(r.get("reconcile_enabled")),
+        allowed_jira_types=list(_json(r.get("allowed_jira_types"), [])),
+        allowed_lark_types=list(_json(r.get("allowed_lark_types"), [])),
+        assignee_map=dict(_json(r.get("assignee_map"), {})),
+        setup_state=r.get("setup_state") or "draft",
+    )
+
+
+def _to_row(p: Project) -> dict:
+    row = {k: getattr(p, k) for k in _COLUMNS if k != "id"}
+    return row
+
+
+def _required_env(name: str) -> str:
+    v = (os.environ.get(name) or "").strip()
+    if not v:
+        raise RuntimeError(f"environment variable {name} is required for project #1 "
+                           "(no project registry to read it from)")
+    return v
+
+
+def _env_project() -> Project:
+    """Project #1 as the old single-pair service saw it (env + config).
+    Raises RuntimeError when JIRA_PROJECT, LARK_BASE_TOKEN or LARK_TABLE_ID
+    is missing, instead of silently syncing an empty key/table."""
+    key = _required_env("JIRA_PROJECT")
+    base = _required_env("LARK_BASE_TOKEN")
+    table = _required_env("LARK_TABLE_ID")
+    return Project(
+        id=1,
+        name=key,
+        jira_project_key=key,
+        jira_board_id=None,
+        lark_base_token=base,
+        lark_table_id=table,
+        lark_table_name="",
+        sync_enabled=True,
+        reconcile_enabled=True,
+        allowed_jira_types=list(config.DEFAULT_SYNC_TYPES),
+        allowed_lark_types=list(config.DEFAULT_SYNC_TYPES),
+        assignee_map=dict(config.JIRA_TO_LARK_ASSIGNEE),
+        setup_state="active",
+    )
+
+
+_SETTINGS_KEYS = ["active_table_id", "active_table_name", "sync_enabled", "reconcile_enabled",
+                  "allowed_jira_types", "allowed_lark_types",
+                  "last_reconcile_ts", "last_full_reconcile_ts"]
+
+
+def _read_settings(client) -> dict:
+    rows = client.table("settings").select("key,value").in_("key", _SETTINGS_KEYS).execute().data or []
+    return {r["key"]: r["value"] for r in rows}
+
+
+def _settings_project(client, prev: "Project | None") -> Project:
+    """Fail-closed project #1 for when the registry can't be read: built from
+    the stored `settings` rows the same way bootstrap_default seeds the
+    registry (table, sync toggle, sync types). Reconcile is always OFF — a
+    sweep on a guessed configuration could delete records. If settings can't
+    be read either, keep what was known before (prev), else env."""
+    base = _env_project()
+    try:
+        kv = _read_settings(client)
+    except Exception as e:
+        log.error(f"projects: settings read failed too ({e}); project #1 keeps "
+                  f"{'its last known' if prev else 'env'} table/types/sync, reconcile off")
+        src = prev or base
+        return Project(**{**{k: getattr(src, k) for k in _COLUMNS}, "id": 1,
+                          "reconcile_enabled": False})
+    return Project(
+        id=1,
+        name=base.name,
+        jira_project_key=base.jira_project_key,
+        jira_board_id=None,
+        lark_base_token=base.lark_base_token,
+        lark_table_id=kv.get("active_table_id") or base.lark_table_id,
+        lark_table_name=kv.get("active_table_name") or "",
+        sync_enabled=_bool_setting(kv.get("sync_enabled"), True),
+        reconcile_enabled=False,
+        allowed_jira_types=_list_setting(kv.get("allowed_jira_types"), config.DEFAULT_SYNC_TYPES),
+        allowed_lark_types=_list_setting(kv.get("allowed_lark_types"), config.DEFAULT_SYNC_TYPES),
+        assignee_map=base.assignee_map,
+        setup_state="active",
+    )
+
+
+def _is_missing_table(e: Exception) -> bool:
+    msg = str(e)
+    return ("PGRST205" in msg or "42P01" in msg
+            or (_TABLE in msg and ("does not exist" in msg or "Could not find the table" in msg)))
+
+
+def is_fallback() -> bool:
+    """True while project #1 is a stand-in because the registry could not be
+    read from Supabase (see load_all). Reconcile must not run in this state."""
+    return _fallback_reason is not None
+
+
+def load_all() -> None:
+    """(Re)load the registry from Supabase.
+
+    - No Supabase configured: the env project (legacy single-pair mode).
+    - Read OK, table empty (before bootstrap_default): the env project,
+      flagged as fallback until bootstrap creates the row.
+    - Read FAILED: keep a previously loaded persisted registry untouched;
+      otherwise a fail-closed project #1 from the stored settings with
+      reconcile off (see _settings_project). A missing table is logged as an
+      ERROR telling the operator to run migration 003."""
+    global _projects, _persisted, _fallback_reason
+    client = history._get_client()
+    if not client:
+        env = _env_project()
+        with _lock:
+            _projects, _persisted, _fallback_reason = {env.id: env}, False, None
+        return
+    try:
+        rows = client.table(_TABLE).select("*").order("id").execute()
+        loaded = {int(r["id"]): _from_row(r) for r in (rows.data or [])}
+    except Exception as e:
+        if _is_missing_table(e):
+            reason = "missing"
+            log.error(f"projects: table {_TABLE} does not exist - {_MIGRATION_HINT}. "
+                      f"Using project #1 from stored settings with reconcile OFF. ({e})")
+        else:
+            reason = "error"
+            log.error(f"projects: could not read {_TABLE} (transient?): {e}")
+        with _lock:
+            if _persisted and _projects:
+                log.warning("projects: keeping the previously loaded registry")
+                return
+            prev = _projects.get(1)
+            fb = _settings_project(client, prev)
+            _projects, _persisted, _fallback_reason = {fb.id: fb}, False, reason
+        return
+    with _lock:
+        if loaded:
+            _projects, _persisted, _fallback_reason = loaded, True, None
+        else:
+            env = _env_project()
+            _projects, _persisted, _fallback_reason = {env.id: env}, False, "empty"
+
+
+def owns_key(key: "str | None") -> bool:
+    """True when Jira issue `key` belongs to the CURRENT project's Jira
+    project. A Lark row whose Jira Key names another project (e.g. a Base
+    duplicated with its data) must never be indexed, written to Jira,
+    deleted or counted as "Jira gone"."""
+    key = (key or "").strip()
+    if "-" not in key:
+        return False
+    mine = (current().jira_project_key or "").strip().upper()
+    return bool(mine) and key.rsplit("-", 1)[0].upper() == mine
+
+
+def valid_jira_key(key: str) -> bool:
+    return bool(JIRA_KEY_RE.fullmatch(key or ""))
+
+
+def _ensure_loaded() -> None:
+    if not _projects:
+        load_all()
+
+
+def all_projects() -> list:
+    _ensure_loaded()
+    with _lock:
+        return [_projects[k] for k in sorted(_projects)]
+
+
+def get(pid: int) -> "Project | None":
+    _ensure_loaded()
+    return _projects.get(pid)
+
+
+def find_by_jira_key(project_key: str) -> "Project | None":
+    for p in all_projects():
+        if p.jira_project_key == project_key:
+            return p
+    return None
+
+
+def find_by_lark(base_token: str, table_id: str) -> "Project | None":
+    for p in all_projects():
+        if p.lark_base_token == base_token and p.lark_table_id == table_id:
+            return p
+    return None
+
+
+def _check_unique(fields: dict, exclude_id: "int | None" = None) -> None:
+    for p in all_projects():
+        if p.id == exclude_id:
+            continue
+        if (fields.get("jira_project_key")
+                and fields["jira_project_key"].upper() == p.jira_project_key.upper()):
+            raise ValueError(f"Jira project {p.jira_project_key} is already synced by project #{p.id}")
+        if (fields.get("lark_base_token") and fields.get("lark_table_id")
+                and fields["lark_base_token"] == p.lark_base_token
+                and fields["lark_table_id"] == p.lark_table_id):
+            raise ValueError(f"Lark table {p.lark_table_id} is already synced by project #{p.id}")
+
+
+def _warn_memory_only(op: str, pid: "int | None" = None) -> None:
+    if history._get_client():  # Supabase reachable but registry not persisted
+        log.warning(f"projects.{op}{'' if pid is None else f' (project {pid})'}: registry is not "
+                    "persisted (migration 003 applied but bootstrap not complete?) - "
+                    "change is memory-only and will be lost on restart")
+
+
+def create(fields: dict) -> Project:
+    """Create a project. Always starts draft with sync and reconcile off."""
+    global _persisted
+    _ensure_loaded()
+    data = {k: v for k, v in fields.items() if k in _UPDATABLE}
+    data.update(sync_enabled=False, reconcile_enabled=False, setup_state="draft")
+    if isinstance(data.get("jira_project_key"), str):
+        data["jira_project_key"] = data["jira_project_key"].strip().upper()  # R9a
+    for req in ("jira_project_key", "lark_base_token", "lark_table_id"):
+        if not data.get(req):
+            raise ValueError(f"{req} is required")
+    if not valid_jira_key(data["jira_project_key"]):
+        raise ValueError("jira_project_key must be a Jira project key "
+                         "(letters, digits, underscore; starting with a letter)")
+    _check_unique(data)
+    data.setdefault("name", data["jira_project_key"])
+    data.setdefault("jira_board_id", None)
+    data.setdefault("lark_table_name", "")
+    data.setdefault("allowed_jira_types", list(config.DEFAULT_SYNC_TYPES))
+    data.setdefault("allowed_lark_types", list(config.DEFAULT_SYNC_TYPES))
+    data.setdefault("assignee_map", {})
+    with _lock:
+        client = history._get_client() if _persisted else None
+        if not client:
+            _warn_memory_only("create")
+        if client:
+            res = client.table(_TABLE).insert(data).execute()
+            p = _from_row(res.data[0])
+        else:
+            pid = max(_projects) + 1 if _projects else 1
+            p = _from_row({"id": pid, **data})
+        _projects[p.id] = p
+    return p
+
+
+def update(pid: int, fields: dict) -> Project:
+    _ensure_loaded()
+    with _lock:
+        cur = _projects.get(pid)
+        if cur is None:
+            raise KeyError(f"project {pid} not found")
+        changes = {k: v for k, v in fields.items() if k in _UPDATABLE}
+        _check_unique({**_to_row(cur), **changes}, exclude_id=pid)
+        merged = {**{k: getattr(cur, k) for k in _COLUMNS}, **changes}
+        new = _from_row(merged)
+        client = history._get_client() if _persisted else None
+        if not client:
+            _warn_memory_only("update", pid)
+        if client and changes:
+            client.table(_TABLE).update(changes).eq("id", pid).execute()
+        _projects[pid] = new
+        return new
+
+
+def add_assignee(pid: int, jira_name: str, lark_name: str) -> str:
+    """Add one {jira_name: lark_name} entry to project `pid`'s people list.
+
+    Read-merge-write under the registry lock, re-reading the CURRENT map (not
+    a caller's snapshot), so concurrent adds never lose an entry. Never
+    overwrites an existing entry and never reuses a Lark name another person
+    already has (Lark->Jira would then be ambiguous). Returns "added",
+    "exists" or "collision"."""
+    _ensure_loaded()
+    with _lock:
+        cur = _projects.get(pid)
+        if cur is None:
+            raise KeyError(f"project {pid} not found")
+        m = dict(cur.assignee_map)
+        if jira_name in m:
+            return "exists"
+        if lark_name in m.values():
+            return "collision"
+        m[jira_name] = lark_name
+        update(pid, {"assignee_map": m})
+        return "added"
+
+
+def delete(pid: int) -> None:
+    """Delete a DRAFT project: its registry row and its field_mappings rows,
+    nothing else. Never touches Jira or Lark records. Project #1 is never
+    deletable. Raises KeyError (unknown) / ValueError (#1 or not a draft)."""
+    _ensure_loaded()
+    with _lock:
+        cur = _projects.get(pid)
+        if cur is None:
+            raise KeyError(f"project {pid} not found")
+        if pid == 1:
+            raise ValueError("project 1 cannot be deleted")
+        if cur.setup_state != "draft":
+            raise ValueError("only a draft project can be deleted")
+        if cur.sync_enabled:
+            raise ValueError("turn sync off before deleting")
+        client = history._get_client()
+        if client:
+            client.table("field_mappings").delete().eq("project_id", pid).execute()
+            if _persisted:
+                client.table(_TABLE).delete().eq("id", pid).execute()
+        del _projects[pid]
+        import field_mappings
+        field_mappings._by_project.pop(pid, None)
+
+
+@contextlib.contextmanager
+def use(pid: int):
+    token = _current_id.set(pid)
+    try:
+        yield
+    finally:
+        _current_id.reset(token)
+
+
+def current_id() -> int:
+    pid = _current_id.get()
+    if pid is not None:
+        return pid
+    _ensure_loaded()
+    return min(_projects)
+
+
+def current() -> Project:
+    pid = current_id()
+    p = get(pid)
+    if p is None:
+        raise RuntimeError(f"project {pid} is not in the registry")
+    return p
+
+
+def cfg_for(p: Project) -> dict:
+    return {
+        "JIRA_EMAIL":      os.environ["JIRA_EMAIL"],
+        "JIRA_TOKEN":      os.environ["JIRA_TOKEN"],
+        "JIRA_DOMAIN":     os.environ["JIRA_DOMAIN"],
+        "JIRA_PROJECT":    p.jira_project_key,
+        "LARK_APP_ID":     os.environ["LARK_APP_ID"],
+        "LARK_APP_SECRET": os.environ["LARK_APP_SECRET"],
+        "LARK_BASE_TOKEN": p.lark_base_token,
+        "LARK_TABLE_ID":   p.lark_table_id,
+        "PROJECT_ID":      p.id,
+        "JIRA_BOARD_ID":   p.jira_board_id,
+    }
+
+
+def _bool_setting(v, default: bool) -> bool:
+    if v is None:
+        return default
+    return str(v).lower() != "false"
+
+
+def _list_setting(v, default: list) -> list:
+    if v is None:
+        return list(default)
+    out = _json(v, None)
+    return list(out) if isinstance(out, list) else list(default)
+
+
+def bootstrap_default() -> Project:
+    """Create project #1 from the live single-pair config when the registry
+    is empty. Never writes to Jira or Lark. Idempotent."""
+    client = history._get_client()
+    if not client:
+        _ensure_loaded()
+        return current()
+    existing = client.table(_TABLE).select("*").order("id").execute().data or []
+
+    kv = _read_settings(client)
+
+    created = False
+    if existing:
+        pid = min(int(r["id"]) for r in existing)
+    else:
+        base = _env_project()
+        row = {
+            "name": base.name,
+            "jira_project_key": base.jira_project_key,
+            "jira_board_id": None,
+            "lark_base_token": base.lark_base_token,
+            "lark_table_id": kv.get("active_table_id") or base.lark_table_id,
+            "lark_table_name": kv.get("active_table_name") or "",
+            "sync_enabled": _bool_setting(kv.get("sync_enabled"), True),
+            "reconcile_enabled": _bool_setting(kv.get("reconcile_enabled"), True),
+            "allowed_jira_types": _list_setting(kv.get("allowed_jira_types"), config.DEFAULT_SYNC_TYPES),
+            "allowed_lark_types": _list_setting(kv.get("allowed_lark_types"), config.DEFAULT_SYNC_TYPES),
+            "assignee_map": base.assignee_map,
+            "setup_state": "active",
+        }
+        res = client.table(_TABLE).insert(row).execute()
+        pid = int(res.data[0]["id"])
+        created = True
+
+    # Idempotent repair steps: safe to rerun after a partial earlier run.
+    # Adopt pre-multi-project history rows so per-project history views and
+    # error counts include them.
+    client.table("sync_history").update({"project_id": pid}).is_("project_id", "null").execute()
+    # Adopt existing field mappings (every run).
+    client.table("field_mappings").update({"project_id": pid}).is_("project_id", "null").execute()
+    # Add any system mapping the table lacks — only in the run that creates
+    # project #1 (R4). Afterwards the mapping table decides what syncs: a
+    # built-in mapping the user deleted must stay deleted across restarts.
+    if created:
+        have = {r["jira_field"] for r in (client.table("field_mappings").select("jira_field,is_system")
+                .eq("project_id", pid).execute().data or []) if r.get("is_system")}
+        import field_mappings
+        for d in field_mappings._DEFAULTS:
+            if d["jira_field"] not in have:
+                client.table("field_mappings").insert(
+                    {**{k: v for k, v in d.items() if k != "id"}, "project_id": pid}).execute()
+
+    # Per-project reconcile watermarks, carried over from the global ones
+    # only when the per-project key is absent.
+    scoped = [f"{k}:{pid}" for k in ("last_reconcile_ts", "last_full_reconcile_ts")]
+    present = {r["key"] for r in (client.table("settings").select("key,value")
+               .in_("key", scoped).execute().data or [])}
+    for k in ("last_reconcile_ts", "last_full_reconcile_ts"):
+        if kv.get(k) is not None and f"{k}:{pid}" not in present:
+            client.table("settings").upsert({"key": f"{k}:{pid}", "value": kv[k]}).execute()
+
+    load_all()
+    if created:
+        p = _projects[pid]
+        history.record(direction="system", event="config",
+                       description=f"Multi-project bootstrap: created project #{pid} "
+                                   f"({p.jira_project_key} <-> {p.lark_table_id}) from existing config")
+    return _projects[pid]
