@@ -267,7 +267,7 @@ def fetch_all_records(token: str, base_token: str, table_id: str) -> list:
         if data.get("code") != 0:
             raise RuntimeError(f"Lark API error: {data.get('msg')}")
         now_expires = time.time() + _RECORD_CACHE_TTL
-        for item in data["data"]["items"]:
+        for item in (data.get("data") or {}).get("items") or []:
             fields = item.get("fields", {})
             records.append({"record_id": item["record_id"], "fields": fields})
             # Bulk-populate the value cache. Reconcile uses this as its drift
@@ -329,7 +329,7 @@ def search_records_modified_since(token: str, base_token: str, table_id: str,
         if data.get("code") != 0:
             raise RuntimeError(f"Lark search error: {data.get('msg')}")
         now_expires = time.time() + _RECORD_CACHE_TTL
-        for item in data.get("data", {}).get("items", []):
+        for item in (data.get("data") or {}).get("items") or []:
             fields = item.get("fields", {})
             records.append({"record_id": item["record_id"], "fields": fields})
             _record_cache[item["record_id"]] = {
