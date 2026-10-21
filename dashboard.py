@@ -313,7 +313,8 @@ def _direction_badge(d) -> str:
 
 
 def _event_badge(ev) -> str:
-    colors = {"created": "#22c55e", "updated": "#3b82f6", "deleted": "#ef4444", "config": "#a855f7"}
+    colors = {"created": "#22c55e", "updated": "#3b82f6", "deleted": "#ef4444", "config": "#a855f7",
+              "backfill": "#0ea5e9"}
     return f'<span class="evbadge" style="background:{colors.get(ev, "#888")}">{e(ev)}</span>'
 
 
