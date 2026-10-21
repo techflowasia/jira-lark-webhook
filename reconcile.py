@@ -356,7 +356,21 @@ def _link_fields(cfg: dict, jira_key: str) -> dict:
 
 def backfill(cfg: dict) -> dict:
     with projects.use(cfg["PROJECT_ID"] if "PROJECT_ID" in cfg else projects.current_id()):
-        return _backfill(cfg)
+        try:
+            return _backfill(cfg)
+        except Exception as e:
+            history.record(direction="system", event="backfill",
+                           description=f"Backfill failed: {e}", status="error", error=str(e))
+            raise
+
+
+def _bf_record(direction: str, event: str, description: str, *, jira_key: str = "",
+               lark_id: str = "", type: str = "", error: str = "") -> None:
+    """One Activity row per write a backfill makes, so a manual run is traceable
+    from the dashboard and not only from the server log."""
+    history.record(direction=direction, event=event, jira_key=jira_key, lark_id=lark_id,
+                   description=f"Backfill: {description}", type=type,
+                   status="error" if error else "ok", error=error)
 
 
 def _backfill(cfg: dict) -> dict:
@@ -413,8 +427,12 @@ def _backfill(cfg: dict) -> dict:
                 lark_api.delete_record(token, cfg["LARK_BASE_TOKEN"], cfg["LARK_TABLE_ID"], rid)
                 removed_duplicates += 1
                 log.warning(f'backfill: deleted duplicate Lark {rid} (kept {keeper["record_id"]} for {jk}) — "{_lark_text(rec["fields"].get(field_mappings.F_TITLE))}"')
+                _bf_record("jira→lark", "deleted", jira_key=jk, lark_id=rid,
+                           description=f'deleted duplicate Lark record (kept {keeper["record_id"]})')
             except Exception as e:
                 log.error(f"backfill: delete duplicate {rid}: {e}")
+                _bf_record("jira→lark", "deleted", jira_key=jk, lark_id=rid,
+                           description="delete duplicate Lark record failed", error=str(e))
 
     # ── Step 2: Match unlinked Lark records to Jira issues by title ───────
     unlinked = [r for r in lark_records if not _lark_text(r["fields"].get(field_mappings.F_JIRA_KEY))]
@@ -455,8 +473,12 @@ def _backfill(cfg: dict) -> dict:
             matched += 1
             pairs.append({"jira_key": jira_key, "lark_id": rid, "title": title})
             log.info(f"backfill: matched {jira_key} ↔ {rid} ('{title}')")
+            _bf_record("jira→lark", "updated", jira_key=jira_key, lark_id=rid,
+                       description=f'linked by title: "{title}"')
         except Exception as e:
             log.error(f"backfill: match {rid}: {e}")
+            _bf_record("jira→lark", "updated", jira_key=jira_key, lark_id=rid,
+                       description=f'link by title failed: "{title}"', error=str(e))
 
     for title, count in jira_title_counts.items():
         if count > 1:
@@ -505,8 +527,12 @@ def _backfill(cfg: dict) -> dict:
             lark_by_jira_key[key] = {"record_id": rid, "fields": fields}
             created_lark += 1
             log.info(f"backfill: created Lark {rid} for Jira {key}")
+            _bf_record("jira→lark", "created", jira_key=key, lark_id=rid, type=itype,
+                       description=f'created {itype}: "{jf.get("summary", "")}"')
         except Exception as e:
             log.error(f"backfill: create Lark for {key}: {e}")
+            _bf_record("jira→lark", "created", jira_key=key, type=itype,
+                       description="create Lark record failed", error=str(e))
 
     # ── Step 4: Create Jira issues for still-unlinked Lark records ────────
     created_jira = 0
@@ -550,12 +576,16 @@ def _backfill(cfg: dict) -> dict:
             index.add(new_key, rid)
             created_jira += 1
             log.info(f"backfill: created Jira {new_key} for Lark {rid}")
+            _bf_record("lark→jira", "created", jira_key=new_key, lark_id=rid, type=itype,
+                       description=f'created {itype}: "{title}"')
             if assignee_lark and not jira_name:
                 history.warn_unmapped_assignee(
                     jira_key=new_key, name=assignee_lark, lark_id=rid, type=itype,
                     outcome="Jira Assignee left unassigned", direction="lark→jira")
         except Exception as e:
             log.error(f"backfill: create Jira for {rid}: {e}")
+            _bf_record("lark→jira", "created", lark_id=rid, type=itype,
+                       description=f'create Jira issue failed: "{title}"', error=str(e))
 
     # ── Step 5: Sync fields on all linked records (Jira → Lark) ──────────
     synced = 0
@@ -609,8 +639,14 @@ def _backfill(cfg: dict) -> dict:
                                        cfg["LARK_TABLE_ID"], rid, updates)
                 synced += 1
                 log.info(f"backfill: synced {jira_key} → Lark {rid}")
+                _bf_record("jira→lark", "updated", jira_key=jira_key, lark_id=rid,
+                           type=jf["issuetype"]["name"],
+                           description=f"synced {', '.join(sorted(updates))}")
             except Exception as e:
                 log.error(f"backfill: sync {rid}: {e}")
+                _bf_record("jira→lark", "updated", jira_key=jira_key, lark_id=rid,
+                           type=jf["issuetype"]["name"], description="sync fields failed",
+                           error=str(e))
 
     result = {
         "removed_duplicates": removed_duplicates,
@@ -622,6 +658,11 @@ def _backfill(cfg: dict) -> dict:
         "pairs": pairs,
     }
     log.info(f"backfill: done — {result}")
+    history.record(direction="system", event="backfill",
+                   description=(f"Backfill done: {created_lark} Lark created, "
+                                f"{created_jira} Jira created, {matched} linked by title, "
+                                f"{synced} synced, {removed_duplicates} duplicates removed, "
+                                f"{skipped_ambiguous} skipped (ambiguous title)"))
     return result
 
 

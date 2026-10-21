@@ -453,3 +453,29 @@ def test_go_live_failure_does_not_echo_exception(monkeypatch, two_projects):
         assert projects.get(p.id).setup_state == "draft"
     finally:
         field_mappings._by_project.pop(p.id, None)
+
+
+# ── Backfill leaves an Activity trail ───────────────────────────────────────
+
+def test_backfill_records_each_create_and_a_summary(two_projects):
+    with patch("reconcile.lark_api") as ml, patch("reconcile.jira_api") as mj:
+        _reconcile_mocks(ml, mj, [OWN2], [_issue("TWO-5"), _issue("TWO-6")])
+        out = reconcile.backfill(CFG2)
+    assert out["created_lark"] == 1
+    rows = list(history._fallback)
+    created = [r for r in rows if r["event"] == "created"]
+    assert [(r["jira_key"], r["lark_id"], r["direction"], r["project_id"]) for r in created] \
+        == [("TWO-6", "new-TWO-6", "jira→lark", 2)]
+    assert created[0]["description"].startswith("Backfill: created Epic")
+    summary = [r for r in rows if r["event"] == "backfill"]
+    assert len(summary) == 1 and summary[0]["direction"] == "system"
+    assert "1 Lark created" in summary[0]["description"]
+
+
+def test_backfill_failure_is_recorded(two_projects):
+    with patch("reconcile.lark_api") as ml, patch("reconcile.jira_api"):
+        ml.get_token.side_effect = RuntimeError("lark down")
+        with pytest.raises(RuntimeError):
+            reconcile.backfill(CFG2)
+    errs = [r for r in _errors() if r["event"] == "backfill"]
+    assert len(errs) == 1 and "lark down" in errs[0]["error"] and errs[0]["project_id"] == 2

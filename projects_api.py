@@ -196,7 +196,10 @@ def do_backfill(pid: int) -> dict:
         # backfill would create blank records — never run in that state.
         missing = field_mappings.missing_required()
         if missing:
-            return {**empty, "error": "required mapping missing: " + ", ".join(missing)}
+            msg = "required mapping missing: " + ", ".join(missing)
+            history.record(direction="system", event="backfill",
+                           description=f"Backfill not run: {msg}", status="error", error=msg)
+            return {**empty, "error": msg}
         try:
             return reconcile.backfill(config.get_cfg())
         except Exception as e:
